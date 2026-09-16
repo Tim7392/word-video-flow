@@ -253,9 +253,7 @@ def work(db,job):
                     'intro_clip':'PROVIDED' if lesson.intro else 'NOT_PROVIDED',
                     'original_countdown':('REFERENCE_CLIP_EMBEDDED' if lesson.intro
                                           else 'NOT_IMPLEMENTED' if lesson.intro_s else 'OMITTED_BY_REQUEST'),
-                    'intro_sound':('FROM_CLIP' if lesson.intro
-                                   else 'CONFIGURED_NOT_AUDITIONED' if lesson.intro_audio
-                                   else 'NOT_CONFIGURED')}
+                    'intro_sound':_intro_sound_report(lesson)}
             with connect(db) as con:
                 con.execute('UPDATE jobs SET state=?,result=?,updated=? WHERE id=?',
                             ('generated',json.dumps(result,ensure_ascii=False),time.time(),job))
@@ -273,3 +271,29 @@ def work(db,job):
 def _cancel_requested(db,job):
     with connect(db) as con:
         return con.execute('SELECT control FROM jobs WHERE id=?',(job,)).fetchone()['control']!='run'
+
+
+def _intro_sound_report(lesson):
+    """Which file really supplies the intro's sound, from the one resolver.
+
+    The previous report said ``FROM_CLIP`` whenever a clip existed, so a silent
+    clip hiding a configured ``intro_audio`` was reported as the clip's sound,
+    and a clip whose sound came from the fallback file was indistinguishable
+    from one carrying its own countdown.  The resolver answers the same question
+    for the MP4, the draft and this report; when a configured file is not the
+    one used, the value says so instead of implying it was heard.
+    """
+    from .media import resolve_intro_audio
+    clip = dict(lesson.intro or {})
+    if not clip and not lesson.intro_audio:
+        return 'NOT_CONFIGURED'
+    choice = resolve_intro_audio(clip.get('video'), clip.get('audio'),
+                                 lesson.intro_audio)
+    if choice.source == 'FROM_CLIP':
+        return 'FROM_CLIP'
+    if choice.source == 'FROM_INTRO_AUDIO':
+        # A configured file that nothing can audition is not an approval.
+        return 'FROM_INTRO_AUDIO_NOT_AUDITIONED'
+    if lesson.intro_audio:
+        return 'SILENT_CLIP_INTRO_AUDIO_NOT_USED'
+    return 'SILENT_CLIP_NO_INTRO_AUDIO'

@@ -12,14 +12,14 @@ import time
 import types
 import uuid
 
-from .media import atomic_json, executable, run, duration, probe
+from .media import atomic_json, duration, executable, resolve_intro_audio, run
 from .template import default_styles, text_events
 
 
 def _has_audio(path):
     """Whether a clip carries a sound stream, so extraction can be skipped."""
-    return any(stream.get('codec_type') == 'audio'
-               for stream in probe(path).get('streams', []))
+    from .media import has_audio
+    return has_audio(path)
 
 
 def _load_library():
@@ -118,18 +118,18 @@ def export_draft(manifest, output_dir):
                 raise ValueError('Prepared audio duration disagrees with timeline')
             mat.duration = max(mat.duration, planned)
             script.add_segment(lib.audio.AudioSegment(mat, lib.timer.Timerange(start, planned)), refs[item['role']])
-        if manifest.intro_audio:
-            mat = lib.materials.AudioMaterial(material_file(manifest.intro_audio))
-            length = min(mat.duration, us(manifest.intro_frames))
-            script.add_segment(lib.audio.AudioSegment(mat, lib.timer.Timerange(0, length)), refs['片头音效'])
-        elif manifest.intro_video and manifest.intro_frames > 0 and _has_audio(manifest.intro_video):
-            # The clip owns the countdown sound, but a video file cannot be an
-            # audio material, so the sound is extracted beside the other draft
-            # assets and stays editable as its own 片头音效 segment.  A silent
-            # countdown clip simply contributes no segment.
+        # One 片头音效 segment, from the single resolver the renderer uses too.
+        # This branch used to prefer the configured ``intro_audio`` while the
+        # mixer preferred the clip's own soundtrack, so a lesson that set both
+        # produced a draft and an MP4 with different intro sound.  A silent
+        # countdown clip contributes no segment at all (before M0 the extraction
+        # was attempted anyway and failed the whole batch).
+        intro_sound = resolve_intro_audio(manifest.intro_video, None,
+                                          manifest.intro_audio)
+        if not intro_sound.silent and manifest.intro_frames > 0:
             sound = resources / (uuid.uuid4().hex + '.wav')
             run([executable('ffmpeg'), '-v', 'error', '-nostdin', '-n', '-i',
-                 str(Path(manifest.intro_video).resolve(strict=True)), '-vn', '-t',
+                 str(Path(intro_sound.path).resolve(strict=True)), '-vn', '-t',
                  '%.9f' % (manifest.intro_frames / manifest.fps), '-ar', '48000',
                  '-ac', '1', '-c:a', 'pcm_s16le', sound])
             copied[sound] = str(sound)

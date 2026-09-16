@@ -208,6 +208,7 @@ def _render_slices(manifest, stage, slices, background, codec, fonts_ready, prog
 
 def render_video(manifest, output_dir, progress=None, cancel=None, slices=None):
     from .mix import build_mix
+    from ..media import resolve_intro_audio
     target=Path(output_dir).resolve()
     final=target/'video.mp4'
     if final.exists(): raise FileExistsError(final)
@@ -227,7 +228,10 @@ def render_video(manifest, output_dir, progress=None, cancel=None, slices=None):
             raise ValueError('No usable font for a rendered style; run doctor')
         font_paths={Path(s['font']).resolve(strict=True) for s in styles.values()}
         for i,path in enumerate(font_paths): shutil.copy2(path,fonts/(str(i)+path.suffix))
-        mix=stage/'mix.wav';build_mix(manifest,mix,cancel)
+        # Resolved once, before any caption work, so the intro's sound is the
+        # same decision the draft exporter made from the same manifest.
+        intro_sound=resolve_intro_audio(manifest.intro_video,None,manifest.intro_audio)
+        mix=stage/'mix.wav';build_mix(manifest,mix,cancel,intro_audio=intro_sound.path)
         check()
         codec='h264_nvenc'
         try:
