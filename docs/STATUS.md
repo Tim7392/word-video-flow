@@ -89,6 +89,9 @@
 | 套件数字对账（H0 的引用错误） | 我曾在消息里把 **501**（B 分支上的数目）当成 main 的数字引用，QA 测到 516 提出质疑。实测当前 main `--collect-only` = **534/552 collected（18 deselected）**：516（`bb68031`）+ A-6 的 18 项 = 534，双方一致，**无异常**。已向 QA 更正并记录，避免以后再拿分支数字当主干数字 |
 | H0 决定：门禁范围 | 批准把 **QA-2/QA-3 的成片类判据**（归档复现对照、v2/legacy 判定）与 B 那项 **147 秒全归档扫描**一并纳入 `acceptance_media` 门禁（按需跑，换"每次集成重验产出等价性"）；默认套件预计回到 2 分钟出头。要求门禁可**一条命令**跑并在 `tests/acceptance/README.md` 写清实际时长 |
 
+| **真实缺陷（C 发现、H0 独立复现、已派 B 修）** | `word_video/media/streams.py::audio_sample_count` 把 **AAC 的包数当采样数**：片头素材 `4级1500开头_透明通道-1080p.mov` 实测 `nb_frames=88` / `duration=1.856s` / 48000Hz → 函数返回 `{'samples': 88, 'exact': True}`，**真实 89088（少 1024 倍）且标成精确值**。影响面：**已交付批次不受影响**（归档缓存是 ogg，`nb_frames` 为 None → 走 duration×rate 正确路径，这也是 P1 与两批生产一直 PASS 的原因）；风险在 **W08 入库、W07 剪映导入（导出侧常见 m4a/mp4-aac）与未来 AAC 配音**。修法要求：`nb_frames` 仅在语义即采样数（PCM/WAV）时使用，否则 `duration × rate` 且 `exact=False`；**反例测试就用这个 `.mov`** |
+| C 的 W06 进展（编辑器） | A-6 接口已接入（`SplitClip/can_split/SetStyle/ClearStyle/merged_styles`，`@3`）：拆分与"改字号"实测可用；`layer.intro` 拆成两段各 672000 tick、撤销逐对象还原。① **导出前拦截**拆过的图层：`SPLIT_LAYER_NOT_EXPORTABLE`（severity=block、定位到片段、可撤销/定位；工程可保存可继续编辑，只是不静默出片）——H0 认可，B 的多段背景落地后删该处。② **双资产文档桥**：C 作为编辑器唯一写者用同一份 refs 同时写 A 的 `assets.json`（wv-assets@1）与 B 的 `media.json`，并加 `assets_agree()` 守卫 + 测试；B 的导出器改读 `wv-assets@1` 后删桥（`voice` 字段 `AssetRef` 暂缺，需要时找 A 加）。③ 预览按冻结档位记录：画布 **1280×720**，首次 open 7.06s（**含首次代理编码**）、提交编辑到预览就绪 1.07s；H0 已要求区分**冷/热启动**并说明代理缓存位置与失效条件，**目标核显机仍未实测** |
+
 ### 待决/风险（不阻塞当前开发）
 - GitHub owner/repo 仍未提供 → 只本地提交。
 - 预览档位（720p30/540p30）未批准冻结，实测后再请 Tim 确认。
