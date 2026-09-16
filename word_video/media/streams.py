@@ -28,7 +28,7 @@ import wave
 from .core import probe
 
 __all__ = ['audio_stream', 'video_stream', 'audio_sample_count', 'audio_pts',
-           'stream_facts', 'video_stream_seconds']
+           'samples_from_stream', 'stream_facts', 'video_stream_seconds']
 
 
 def _streams(path):
@@ -69,15 +69,69 @@ def _rate(stream):
     return rate
 
 
-def audio_sample_count(path):
-    """Real number of audio samples, preferring the file's own frame count.
+def _duration_samples(stream, rate):
+    """Samples from the stream's own duration: the safe answer for any codec."""
+    if stream.get('duration') in (None, ''):
+        return None
+    seconds = float(stream['duration'])
+    if not math.isfinite(seconds) or seconds <= 0:
+        return None
+    return int(round(seconds * rate))
 
-    A PCM WAV is read straight from its header, which *is* the sample count and
-    needs no subprocess at all.  Otherwise the stream's ``nb_frames`` is used;
-    when the container does not publish it the stream duration is used instead,
-    which is exact for a fixed-rate codec and off by at most one packet
-    otherwise.  ``exact`` says which happened, so a caller that needs the
-    stronger guarantee can tell.
+
+#: Codecs whose ``nb_frames`` really is a *sample* count.
+#:
+#: For a packetised codec (AAC, MP3, Vorbis, Opus, ...) ffprobe's ``nb_frames`` is
+#: the number of **packets**, and one packet holds hundreds or thousands of samples
+#: - AAC in an MP4 reports ``nb_frames=88`` for 1.856 s at 48 kHz, which is 89088
+#: samples.  Trusting it is off by three orders of magnitude *and* was reported as
+#: ``exact``.  Everything not named here is therefore answered from
+#: ``duration x sample_rate`` and flagged as derived.
+SAMPLE_COUNT_CODECS = ('pcm_s16le', 'pcm_s24le', 'pcm_s32le', 'pcm_u8', 'pcm_f32le',
+                       'pcm_f64le', 'pcm_s16be', 'pcm_s24be', 'pcm_s32be', 'flac',
+                       'alac', 'wavpack', 'tta', 'truehd', 'mlp')
+
+
+def samples_from_stream(stream):
+    """``{'samples', 'sample_rate', 'exact'}`` for one probed audio stream.
+
+    Split out from :func:`audio_sample_count` so the rule can be exercised against
+    the stream shapes real files produce - in particular the AAC one, whose
+    ``nb_frames`` is a packet count - without needing a file of every codec.
+    """
+    rate = _rate(stream)
+    codec = str(stream.get('codec_name') or '')
+    frames = stream.get('nb_frames')
+    if codec in SAMPLE_COUNT_CODECS and frames not in (None, ''):
+        count = int(float(frames))
+        if count > 0:
+            return {'samples': count, 'sample_rate': rate, 'exact': True}
+    derived = _duration_samples(stream, rate)
+    if derived is not None:
+        return {'samples': derived, 'sample_rate': rate, 'exact': False}
+    if frames not in (None, ''):
+        # No duration published, and the codec's nb_frames is not a sample count:
+        # refusing beats inventing a number (packets are not samples).
+        raise ValueError(
+            'Audio stream %r publishes %s packets but no duration; the sample count '
+            'cannot be derived without inventing one' % (codec or '?', frames))
+    raise ValueError('Audio stream carries no usable length')
+
+
+def audio_sample_count(path):
+    """How many samples of audio a file really holds.
+
+    Three sources, in order of authority:
+
+    1. a **PCM WAV's header**, which *is* the sample count and needs no subprocess;
+    2. ``nb_frames`` for a codec where that field means samples
+       (:data:`SAMPLE_COUNT_CODECS`);
+    3. ``duration x sample_rate`` for everything else - including the packetised
+       codecs, whose ``nb_frames`` counts packets and must never be read as samples.
+
+    ``exact`` is true only for (1) and (2), so a caller that needs the stronger
+    guarantee can tell a real count from a derived one instead of being handed a
+    packet count labelled as exact.
     """
     try:
         with wave.open(str(path), 'rb') as stream:
@@ -89,19 +143,7 @@ def audio_sample_count(path):
                         'exact': True}
     except (wave.Error, EOFError, ValueError):
         pass
-    stream = audio_stream(path)
-    rate = _rate(stream)
-    frames = stream.get('nb_frames')
-    if frames not in (None, ''):
-        count = int(float(frames))
-        if count > 0:
-            return {'samples': count, 'sample_rate': rate, 'exact': True}
-    if stream.get('duration') not in (None, ''):
-        seconds = float(stream['duration'])
-        if math.isfinite(seconds) and seconds > 0:
-            return {'samples': int(round(seconds * rate)), 'sample_rate': rate,
-                    'exact': False}
-    raise ValueError('Audio stream carries no usable length: %s' % path)
+    return samples_from_stream(audio_stream(path))
 
 
 def audio_pts(path):

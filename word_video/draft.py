@@ -88,6 +88,10 @@ def export_draft(manifest, output_dir):
     for name in default_styles():
         refs[name] = script.append_track(lib.track.TrackSpec(lib.track.TrackType.text, name))
     us = lambda frame: (frame * 1000000 + manifest.fps // 2) // manifest.fps
+    # Plan items are counted in ticks (720000/s); the draft is built in frames, so a
+    # tick value is converted through frames before it becomes microseconds.  Doing
+    # it in one step is what keeps a background piece's segment inside its material.
+    frames_of = lambda ticks: (ticks * manifest.fps + 360000) // 720000
     copied = {}
     resources = stage / 'Resources'
     resources.mkdir()
@@ -121,12 +125,24 @@ def export_draft(manifest, output_dir):
         capacity = math.floor(bg.duration * manifest.fps / 1000000)
         if capacity < 1:
             raise ValueError('Background has no usable frame')
-        start = 0
-        while start < manifest.total_frames:
-            end = min(start + capacity, manifest.total_frames)
-            script.add_segment(lib.video.VideoSegment(bg, lib.timer.Timerange(us(start), us(end)-us(start)),
-                                                       volume=0), refs['背景'])
-            start = end
+        pieces = list(getattr(manifest, 'background_segments', ()) or ())
+        if pieces:
+            # A background the member cut in two: one editable segment per planned
+            # piece, on its own file and its own place on the one background track.
+            # Each piece loops inside itself exactly as the whole background did.
+            for piece in pieces:
+                material = lib.materials.VideoMaterial(material_file(piece['path']))
+                start = us(frames_of(piece['start_ticks']))
+                length = us(frames_of(piece['end_ticks'])) - start
+                script.add_segment(lib.video.VideoSegment(
+                    material, lib.timer.Timerange(start, length), volume=0), refs['背景'])
+        else:
+            start = 0
+            while start < manifest.total_frames:
+                end = min(start + capacity, manifest.total_frames)
+                script.add_segment(lib.video.VideoSegment(bg, lib.timer.Timerange(us(start), us(end)-us(start)),
+                                                           volume=0), refs['背景'])
+                start = end
         for item in manifest.audio:
             start = us(item['start_frame'])
             planned = us(item['start_frame'] + item['duration_frames']) - start

@@ -19,9 +19,12 @@ import unittest
 import wave
 
 from word_video.media import (audio_format, audio_pts, audio_sample_count, duration,
-                              executable, proxy_video, run, stream_facts, video_stream)
+                              executable, probe, proxy_video, run, stream_facts,
+                              video_stream)
 
 RATE = 48000
+REFERENCE_CLIP = Path(r'D:\单词速记自动化_测试归档_0915\_prepared-1080p'
+                      r'\4级1500开头_透明通道-1080p.mov')
 
 
 def _wav(path, seconds, rate=RATE, sample=1000):
@@ -52,22 +55,80 @@ class SampleFactsTests(unittest.TestCase):
                 # The WAV header is the authority, so the two must agree exactly.
                 self.assertEqual(audio_format(path)[3], facts['samples'])
 
-    def test_sample_count_from_a_compressed_container_is_reported_as_such(self):
-        """A compressed source answers from packets or from duration - and says which."""
+    def test_aac_is_never_answered_from_its_packet_count(self):
+        """The defect H0 found: ``nb_frames`` for AAC counts packets, not samples.
+
+        The reference clip reports ``nb_frames=88`` for 1.856 s at 48 kHz, so the
+        answer is 89088 samples.  Reading the packet count gave 88 *and* labelled it
+        ``exact`` - off by three orders of magnitude.  Both a real and a synthetic
+        AAC file are checked, so the rule holds whatever this machine has.
+        """
+        if REFERENCE_CLIP.is_file():
+            stream = next(item for item in probe(REFERENCE_CLIP)['streams']
+                          if item['codec_type'] == 'audio')
+            self.assertEqual('aac', stream['codec_name'])
+            packets = int(stream['nb_frames'])
+            expected = int(round(float(stream['duration'])
+                                 * float(stream['sample_rate'])))
+            facts = audio_sample_count(REFERENCE_CLIP)
+            self.assertEqual(89088, expected)
+            self.assertEqual(expected, facts['samples'])
+            self.assertNotEqual(packets, facts['samples'],
+                                'the packet count was returned as a sample count')
+            self.assertFalse(facts['exact'],
+                             'a derived count must not be labelled exact')
+
         path = self.root / 'tone.m4a'
         run([executable('ffmpeg'), '-v', 'error', '-nostdin', '-n', '-f', 'lavfi',
              '-i', 'sine=frequency=440:duration=1.0:sample_rate=48000',
              '-c:a', 'aac', '-b:a', '128k', str(path)])
+        stream = next(item for item in probe(path)['streams']
+                      if item['codec_type'] == 'audio')
         facts = audio_sample_count(path)
         self.assertEqual(48000, facts['sample_rate'])
-        self.assertIn(facts['exact'], (True, False))
-        if not facts['exact']:
-            # Derived from the stream duration, so an encoder's priming and
-            # padding show up as a small difference; that is exactly why the
-            # flag is reported instead of being hidden.
-            self.assertAlmostEqual(48000, facts['samples'], delta=3000)
-        else:
-            self.assertGreater(facts['samples'], 0)
+        self.assertFalse(facts['exact'])
+        self.assertAlmostEqual(48000, facts['samples'], delta=3000)
+        if stream.get('nb_frames'):
+            self.assertNotEqual(int(stream['nb_frames']), facts['samples'])
+
+    def test_a_lossless_stream_may_still_answer_from_its_frame_count(self):
+        """The exact path stays for a codec whose ``nb_frames`` is samples.
+
+        Real FLAC comes through the duration branch (ffprobe publishes no frame
+        count for it), so the whitelist itself is exercised on the stream shapes
+        that *do* carry one - the same shapes the real clip and a real MP4 produce.
+        """
+        path = self.root / 'lossless.flac'
+        run([executable('ffmpeg'), '-v', 'error', '-nostdin', '-n', '-f', 'lavfi',
+             '-i', 'sine=frequency=440:duration=0.5:sample_rate=48000',
+             '-c:a', 'flac', str(path)])
+        facts = audio_sample_count(path)
+        self.assertEqual(24000, facts['samples'])
+        # 24000 samples of a 0.5 s sine: right either way, and honest about which.
+        stream = next(item for item in probe(path)['streams']
+                      if item['codec_type'] == 'audio')
+        self.assertEqual('flac', stream['codec_name'])
+        self.assertEqual(stream.get('nb_frames') is not None, facts['exact'])
+
+    def test_the_stream_rule_itself_is_exercised_on_real_shapes(self):
+        """A pure check of the rule, on the stream dicts ffprobe really returns."""
+        from word_video.media.streams import samples_from_stream
+
+        # The AAC shape from the reference clip: 88 packets, 1.856 s.
+        aac = {'codec_name': 'aac', 'sample_rate': '48000', 'nb_frames': '88',
+               'duration': '1.856000'}
+        self.assertEqual({'samples': 89088, 'sample_rate': 48000, 'exact': False},
+                         samples_from_stream(aac))
+        # A PCM stream that does publish a frame count: samples, and exact.
+        pcm = {'codec_name': 'pcm_s16le', 'sample_rate': '44100', 'nb_frames': '4410',
+               'duration': '0.100000'}
+        self.assertEqual({'samples': 4410, 'sample_rate': 44100, 'exact': True},
+                         samples_from_stream(pcm))
+        # Packets without a duration cannot be turned into samples: refuse.
+        with self.assertRaises(ValueError) as caught:
+            samples_from_stream({'codec_name': 'mp3', 'sample_rate': '44100',
+                                 'nb_frames': '40'})
+        self.assertIn('packets', str(caught.exception))
 
     def test_pts_is_reported_and_a_wav_starts_at_zero(self):
         path = _wav(self.root / 'plain.wav', 0.3)

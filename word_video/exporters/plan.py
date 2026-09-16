@@ -83,18 +83,30 @@ class TimelineView:
     styles: dict
     words: list = field(default_factory=list)
     audio: list = field(default_factory=list)
+    #: One entry per planned background piece when the layer was cut in two.
+    #: ``background`` stays the single file the renderer loops; these describe the
+    #: pieces so the draft can keep one editable segment per planned item.
+    background_segments: list = field(default_factory=list)
 
     def to_dict(self):
-        return {'schema_version': self.schema_version, 'title': self.title,
-                'subtitle': self.subtitle, 'footer': self.footer,
-                'first_index': self.first_index, 'last_index': self.last_index,
-                'fps': self.fps, 'width': self.width, 'height': self.height,
-                'speed': self.speed, 'intro_frames': self.intro_frames,
-                'total_frames': self.total_frames, 'background': self.background,
-                'intro_audio': self.intro_audio, 'intro_video': self.intro_video,
-                'video_codec': self.video_codec, 'styles': self.styles,
-                'words': [dict(word) for word in self.words],
-                'audio': [dict(item) for item in self.audio]}
+        document = {'schema_version': self.schema_version, 'title': self.title,
+                    'subtitle': self.subtitle, 'footer': self.footer,
+                    'first_index': self.first_index, 'last_index': self.last_index,
+                    'fps': self.fps, 'width': self.width, 'height': self.height,
+                    'speed': self.speed, 'intro_frames': self.intro_frames,
+                    'total_frames': self.total_frames, 'background': self.background,
+                    'intro_audio': self.intro_audio, 'intro_video': self.intro_video,
+                    'video_codec': self.video_codec, 'styles': self.styles,
+                    'words': [dict(word) for word in self.words],
+                    'audio': [dict(item) for item in self.audio]}
+        if self.background_segments:
+            # Only present when the layer was actually cut: a single-piece
+            # background keeps the document byte-identical to what the verified
+            # chain has always published (and a strict reader of the old schema
+            # still accepts it).
+            document['background_segments'] = [dict(piece)
+                                               for piece in self.background_segments]
+        return document
 
 
 def frame_at(ticks, fps_num, fps_den=1):
@@ -172,8 +184,19 @@ def _intro_from_plan(plan, project, fps_num):
     A project without an intro layer keeps the verified engine's own fallback -
     ``project.intro_ticks`` reserved in front of the lesson with no clip - so an
     ``@1`` document still renders exactly as it did.
+
+    A **split** intro is refused instead of half-drawn: the intro is the countdown
+    in front of the lesson, and two of them is not a picture this build knows how
+    to deliver.  The refusal names the second item so the caller can find it.
     """
-    item = plan.intro_item
+    items = [item for item in plan.video if item.is_intro]
+    if len(items) > 1:
+        raise ProjectionError(
+            'the intro layer is split into %d items (%s); this build exports one '
+            'intro - undo the cut on %s or delete %s'
+            % (len(items), ', '.join(item.clip_id for item in items),
+               items[0].clip_id, items[1].clip_id))
+    item = items[0] if items else None
     if item is None:
         return None, None, '', frame_at(project.intro_ticks, fps_num)
     if item.source is None:
@@ -270,17 +293,18 @@ def verify_manifest(view, plan, project):
       which the manifest has no field to express.
     """
     fps = view.fps
-    if plan.intro_item is not None:
+    intro_items = [item for item in plan.video if item.is_intro]
+    if intro_items:
         # The intro's own stage must survive the projection: a caller who passes a
         # different clip or length would move every word in the picture.
-        if frame_at(plan.intro_item.end_ticks, fps) != view.intro_frames:
+        if frame_at(intro_items[0].end_ticks, fps) != view.intro_frames:
             raise ProjectionError('intro stage %d frames != plan %d'
                                   % (view.intro_frames,
-                                     frame_at(plan.intro_item.end_ticks, fps)))
-        if plan.intro_item.source is not None \
-                and view.intro_video != plan.intro_item.source.asset_id:
+                                     frame_at(intro_items[0].end_ticks, fps)))
+        if intro_items[0].source is not None \
+                and view.intro_video != intro_items[0].source.asset_id:
             raise ProjectionError('intro clip %r != plan %r'
-                                  % (view.intro_video, plan.intro_item.source.asset_id))
+                                  % (view.intro_video, intro_items[0].source.asset_id))
     for item in view.audio:
         solved = next((candidate for candidate in plan.audio
                        if candidate.role == item['role']
