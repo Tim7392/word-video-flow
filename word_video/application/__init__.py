@@ -8,11 +8,12 @@ from .commands import (COMMANDS, BindStart, ClearStyle, CommandResult, MoveClip,
 from .instantiate import asset_id_for, expand, instantiate
 from .intro import measure_intro, measure_project_intro
 from .session import (MODE_ADVANCED, MODE_TEMPLATE, MODES, Session)
+from .styles import merged_styles, style_fonts
 
 __all__ = [
     'BindStart', 'COMMANDS', 'ClearStyle', 'CommandResult', 'MODE_ADVANCED',
     'MODE_TEMPLATE', 'MODES', 'MoveClip', 'MoveClips', 'SPLITTABLE_ROLES', 'Session',
     'SetMediaSlice', 'SetStyle', 'SplitCheck', 'SplitClip', 'TrimClip', 'UnbindStart',
     'apply', 'asset_id_for', 'can_split', 'expand', 'instantiate', 'measure_intro',
-    'measure_project_intro',
+    'measure_project_intro', 'merged_styles', 'style_fonts',
 ]

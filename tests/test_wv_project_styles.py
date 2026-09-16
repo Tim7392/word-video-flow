@@ -22,10 +22,10 @@ import pytest
 from unittest.mock import patch
 
 from test_wv_export_project import _ink
-from test_wv_layout_surface import _font_maps
 from test_wv_project_golden import golden_media, golden_project
 
-from word_video.application import ClearStyle, SetStyle, apply, instantiate
+from word_video.application import (ClearStyle, SetStyle, apply, instantiate,
+                                    merged_styles, style_fonts)
 from word_video.contracts import LessonSpec, WordEntry
 from word_video.domain import (DEFAULT_LESSON_TEMPLATE, SCHEMA, SCHEMA_V1, SCHEMA_V2,
                                InvalidTimeError, Project, Record, SchemaError,
@@ -42,10 +42,15 @@ BACKGROUND = ARCHIVE / '_prepared-1080p' / 'background-from-reference-1080p.mp4'
 CANVAS = {'width': 320, 'height': 180}
 FPS = 24
 #: Reference-canvas px; the default is 450.  A bigger jump (900) is refused by the
-#: layout's own safe-area guard on a 180-px canvas, which is that guard working:
-#: the pixel test stays inside it and the document tests use the same value.
-BIGGER = 650
+#: layout's own safe-area guard on a small canvas (0.42 of the height > 0.40), which
+#: is that guard working; 800 stays inside it and still nearly triples the glyph area.
+BIGGER = 800
 OVERRIDE = StyleOverride(role='english', fields=(('size', BIGGER),))
+#: Measured on the rendered pair below: the caption band's mean luma rises from
+#: 0.6343 to 0.6699 when the English face grows from 450 to 800 reference px.  The
+#: floor sits under that and far above the codec noise, so a regression that stopped
+#: painting the bigger face fails here.
+INK_MARGIN = 0.02
 
 
 def styled_project(**fields):
@@ -148,21 +153,29 @@ def test_the_plan_carries_the_override_and_the_renderer_reads_it():
     assert merged['english']['font'] == default_styles()['english']['font']
     assert merged['meaning']['size'] == default_styles()['meaning']['size']
     assert all(paths.values())                          # fonts still resolved
+    # The one merge a canvas and a renderer share, and it agrees with the renderer's
+    # own table field for field (a bare override table would lose every default the
+    # project did not touch, because LayoutSurface merges over its own fallback).
+    assert merged_styles(plan.style_table()) == merged
+    assert set(merged_styles()) == set(default_styles())
+    assert merged_styles({'english': {'size': BIGGER}})['meaning']['size'] == \
+        default_styles()['meaning']['size']
+    assert style_fonts(merged_styles(plan.style_table())) == (paths, names)
     # Without the override the same call gives the template default, so what
     # changed is the wiring, not the default itself.
     assert _styles()[0]['english']['size'] == default_styles()['english']['size']
 
 
 def test_the_layout_really_grows_with_the_override():
-    default_paths, default_names = _font_maps()
-    assert default_paths['english'], 'no usable font resolved on this machine'
+    font_paths, font_names = style_fonts()
+    assert font_paths['english'], 'no usable font resolved on this machine'
     sizes = {}
     for label, project in (('default', golden_project()),
                            ('bigger', styled_project(size=BIGGER))):
         plan = render_plan(project, golden_media())
-        surface = LayoutSurface(plan, width=1920, height=1080,
-                                styles=plan.style_table(), fonts=default_names,
-                                font_paths=default_paths)
+        styles = merged_styles(plan.style_table())      # what a canvas does
+        surface = LayoutSurface(plan, width=1920, height=1080, styles=styles,
+                                fonts=font_names, font_paths=font_paths)
         report = surface.layout()
         assert report.exact_metrics, 'layout fell back to estimated metrics'
         english = next(item for item in report.placements if item.role == 'english')
@@ -221,8 +234,17 @@ def rendered_pair(tmp_path_factory):
         word = manifest['words'][0]
         frame = (word['start_frame'] + word['male_frame']) // 2
         shot = root / ('%s.png' % label)
+        # Measure the English caption band, not the whole frame: the background
+        # dominates a full-frame average and would hide the difference.  The band is
+        # the tight one the acceptance checker uses around the same anchor.
+        band = default_styles()['english']['y']
+        half = 0.045
+        top = max(0, int((band - half) * CANVAS['height']))
+        height = min(CANVAS['height'] - top, int(2 * half * CANVAS['height']))
         subprocess.run([executable('ffmpeg'), '-v', 'error', '-nostdin', '-y', '-i',
-                        result.video, '-vf', 'select=eq(n\\,%d)' % frame,
+                        result.video, '-vf',
+                        'select=eq(n\\,%d),crop=%d:%d:0:%d'
+                        % (frame, CANVAS['width'], height, top),
                         '-frames:v', '1', str(shot)], check=True)
         rendered[label] = {'ink': _ink(shot)}
     return rendered
@@ -231,9 +253,10 @@ def rendered_pair(tmp_path_factory):
 def test_the_rendered_caption_really_gets_bigger(rendered_pair):
     default, bigger = rendered_pair['default'], rendered_pair['bigger']
     assert default['ink'] > 0.005, 'no caption ink at the word midpoint'
-    # Mean luma over the frame: a bigger face paints more bright pixels, and the
-    # layout test above says which geometry produced it.
+    # Mean luma of the English caption band: a bigger face paints more bright pixels
+    # there, and the layout test above says which geometry produced it.
     assert bigger['ink'] > default['ink'], (default['ink'], bigger['ink'])
+    assert bigger['ink'] - default['ink'] >= INK_MARGIN, (default['ink'], bigger['ink'])
 
 
 def test_a_style_change_costs_no_tts_call():

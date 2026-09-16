@@ -125,7 +125,14 @@ class RenderPlan:
         object.__setattr__(self, 'styles', tuple(self.styles))
 
     def style_table(self):
-        """``{role: {field: value}}`` of the overrides this plan was solved with."""
+        """This plan's style **overrides** — what the project changed, not a full table.
+
+        A consumer wants the merged table (defaults + these overrides), which needs
+        the font-resolving template and therefore lives above the domain:
+        ``word_video.application.styles.merged_styles(plan.style_table())``.  Handing
+        a layout the bare overrides would silently drop every default the project
+        did not override.
+        """
         return {override.role: override.values for override in self.styles}
 
     def item(self, clip_id):
