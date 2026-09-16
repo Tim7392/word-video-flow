@@ -11,6 +11,7 @@ import uuid
 
 from .contracts import LessonSpec, WordEntry, SpeechAsset, TimelineManifest
 from .media import atomic_json, sha256
+from . import text_policy
 from .template import default_styles
 
 
@@ -48,14 +49,35 @@ def job_lock(db, job):
 
 def lesson_from_request(request):
     settings=dict(request.get('lesson',{}))
-    if 'entries' in settings:
+    requested=settings.pop('spoken_policy',None)
+    has_entries='entries' in settings
+    if requested is not None:
+        # Any recorded value is accepted here so a stored request replays; which of
+        # them is meaningful for *this* request is decided below.
+        text_policy.check_policy(requested,allow_supplied=True)
+    if has_entries:
+        # The request brings its own reading text, so nothing is re-derived here:
+        # that is also how a stored request is replayed (submit freezes
+        # ``asdict(lesson)``, work reads it back).  The recorded policy is what the
+        # text was produced with, or 'supplied' when the caller did not say.
         settings['entries']=[WordEntry(**x) for x in settings['entries']]
+        settings['spoken_policy']=requested or text_policy.POLICY_SUPPLIED
     else:
+        if requested==text_policy.POLICY_SUPPLIED:
+            raise ValueError("spoken_policy 'supplied' needs lesson.entries: "
+                             "there is no supplied reading text to keep")
+        policy=requested or text_policy.DEFAULT_POLICY
         from subtitle_factory_api import load_words, selection
         rows,_=load_words(request['source'])
         rows,selected=selection(rows,request.get('range',{}))
-        settings['entries']=[WordEntry(i,r['w'],r['p'],r['d_f'],r['d_c'])
+        # Only the derived reading field is cleaned; the display meaning (d_f) and
+        # the protected legacy core are untouched.  Deriving it here - rather than
+        # taking d_c - is what makes the produced batch and the independent
+        # acceptance tool apply one rule.
+        settings['entries']=[WordEntry(i,r['w'],r['p'],r['d_f'],
+                                       text_policy.spoken_from_meaning(r['d_f'],policy))
                              for i,r in enumerate(rows,selected['start'])]
+        settings['spoken_policy']=policy
     settings.setdefault('styles',default_styles())
     # A supplied partial styles map must not skip font resolution, and a font
     # that resolves to a substitute (Jianying purges its effect cache) is
@@ -215,6 +237,9 @@ def work(db,job):
                 spend('speech',speech_started)
                 timeline_started=time.monotonic()
                 manifest=build_timeline(batch,assets)
+                # Provenance in the published timeline.json: which rule produced the
+                # reading text.  The full lesson carries it; a split batch does not.
+                manifest.spoken_policy=lesson.spoken_policy
                 timeline=folder/'timeline.json'
                 atomic_json(timeline,manifest.to_dict())
                 spend('timeline',timeline_started)
@@ -250,6 +275,7 @@ def work(db,job):
                 all_files.extend(records); batches.append(batch_result)
             result={'files':all_files,'batches':batches,'physical_acceptance':'PENDING_USER_OPEN_AND_LISTEN',
                     'stage_seconds':dict(sorted(timing.items(),key=lambda kv:-kv[1])),
+                    'spoken_policy':lesson.spoken_policy,
                     'intro_clip':'PROVIDED' if lesson.intro else 'NOT_PROVIDED',
                     'original_countdown':('REFERENCE_CLIP_EMBEDDED' if lesson.intro
                                           else 'NOT_IMPLEMENTED' if lesson.intro_s else 'OMITTED_BY_REQUEST'),

@@ -33,18 +33,24 @@ def build(archive_batch: Path, output: Path, key: str, fixture: Path):
             missing.append('complete.json: %s' % token)
             continue
         meta = json.loads(complete.read_text(encoding='utf-8'))
-        originals = sorted(token.glob('original.*'))
+        # 时间线用的是哪一路原始音频由 complete.json 的 spec.timeline_route 决定；
+        # 同名 token 目录里可能同时存在 original.jianying.ogg 与 original.volcengine_legacy.ogg，
+        # 取错会让"已加工"的时长与原始时长对不上。
+        route = (meta.get('spec') or {}).get('timeline_route') or ''
+        candidates = list(token.glob('original.%s.*' % route)) if route else []
+        originals = candidates or sorted(token.glob('original.*'))
         if not originals:
             missing.append('original audio: %s' % token)
             continue
+        # 走 provider.kind=local：这是引擎"复用已有音频"的正规入口——
+        # 由引擎自己探测原件真实时长、自己做变速加工，并把时间线指向加工后的 prepared.wav。
+        # （prepared_speech 的语义是"调用方已给加工好的音频"，喂入未变速原件会被正确拒绝。）
         speech.append({
-            'word_index': asset['word_index'],
+            'index': asset['word_index'],
             'role': asset['role'],
             'text': asset['text'],
-            'path': str(originals[0]),
-            'duration_s': meta['raw'],
-            'rendered_duration_s': meta['rendered'],
             'voice': asset.get('voice') or meta.get('spec', {}).get('voice') or '',
+            'path': str(originals[0]),
         })
     request = {
         'idempotency_key': key,
@@ -65,7 +71,8 @@ def build(archive_batch: Path, output: Path, key: str, fixture: Path):
             'video_codec': timeline.get('video_codec', 'h265'),
             'styles': timeline.get('styles', {}),
         },
-        'prepared_speech': speech,
+        'prepared_speech': None,
+        'provider': {'kind': 'local', 'items': speech, 'concurrency': 4},
     }
     if timeline.get('intro_video'):
         request['lesson']['intro'] = {'video': timeline['intro_video']}

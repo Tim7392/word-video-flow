@@ -12,13 +12,32 @@ before failing.  Two things now prevent a repeat:
 Service integration tests are opt-in: set ``WORD_VIDEO_ALLOW_NETWORK=1``.
 Nothing here touches user-level or system environment; the block lives in the
 test process only.
+
+QA addition (task QA-1): the tests directory is put on ``sys.path`` so
+``from acceptance import ...`` works no matter what pytest was pointed at, and
+the ``acceptance_media`` marker is registered here as well as in the acceptance
+package (pytest only reads conftest files it walks, and a run may name a single
+test file).
 """
 import os
 import socket
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
 
 ALLOWED = os.environ.get('WORD_VIDEO_ALLOW_NETWORK') == '1'
 BLOCKED_MESSAGE = 'OFFLINE_TEST_NETWORK_BLOCKED'
 LOOPBACK = {'127.0.0.1', '::1', 'localhost', '', None}
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        'markers',
+        'acceptance_media: needs the real delivered batch and the fault tree; '
+        'runs the full validator over real media, not a mock')
 
 
 def _is_external(address):
