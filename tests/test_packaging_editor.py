@@ -249,6 +249,15 @@ def test_only_the_interactive_path_gives_up_its_console():
     assert call > entry_source.index('if args.export:', entry_source.index('def _run('))
 
 
+def test_the_startup_number_is_taken_before_the_import():
+    """Otherwise "how long until the member sees a window" silently becomes "window
+    plus import plus first preview", which is how a slow render gets reported as a
+    slow editor."""
+    run = entry_source[entry_source.index('def _run('):]
+    assert run.index('window_shown_seconds = ') < run.index('run_import(window, args)')
+    assert 'seconds_to_window=window_shown_seconds' in run
+
+
 # -------------------------------------------------------------- the two builds
 def test_the_editor_build_is_windowed_and_names_its_own_folder():
     command = builder.editor_pyinstaller_command(ROOT, ROOT / 'jyd', ROOT / 'media',

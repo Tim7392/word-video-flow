@@ -150,7 +150,13 @@ def environment_facts():
 
 
 def window_facts(window, *, seconds_to_window):
-    """The window's own state, read from the window - not a re-derived opinion of it."""
+    """The window's own state, read from the window - not a re-derived opinion of it.
+
+    ``seconds_to_window`` is measured immediately after ``show()`` returns and Qt has
+    processed its events, so it is *the member's* startup cost and nothing else.  The
+    import, the first preview and the delivery are timed separately: averaging them
+    into "startup" is how a slow first render gets reported as a slow editor.
+    """
     diagnostics = window.diagnostics()
     session = window.showing.session
     return {'entry_to_window_seconds': round(seconds_to_window, 3),
@@ -250,13 +256,15 @@ def _run(args, payload, report_path):
     window.resize(*WINDOW_SIZE)
     window.show()
     application.processEvents()
+    # Taken here, before anything is imported or rendered: this is the number that
+    # answers "how long until the member sees a window".
+    window_shown_seconds = time.perf_counter() - ENTRY_START
     payload['qt'] = {'platform': application.platformName(),
                      'qt': QtCore.qVersion(), 'pyside': QtCore.__version__,
                      'device_pixel_ratio': window.devicePixelRatioF()}
 
     payload['import'] = run_import(window, args)
-    payload.update(window_facts(window,
-                                seconds_to_window=time.perf_counter() - ENTRY_START))
+    payload.update(window_facts(window, seconds_to_window=window_shown_seconds))
     if args.request or args.open_dir:
         payload['ok'] = bool(payload['import'].get('ok'))
         if not payload['ok']:
