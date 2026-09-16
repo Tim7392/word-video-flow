@@ -27,8 +27,10 @@ cd D:\1\1-AI_workflow\word_video_flow\worktrees\QA
 | 协调器端到端（A 提供） | `tests/test_wv_coordinator_e2e.py`（1 项） | 真实批次走协调器并发布 | 约 4 s |
 | **发布目录** | `tests/test_gate_published.py`（1 项） | **两个工程**：① 带 `delivery.json` → 不传 `--background` 也 `ready=true`，且计划继承的那条与文件一致；② 无交付设置 → `ready=false` + `BACKGROUND_MISSING`、submit `NEEDS_INPUT` 且不留收据；再有背景 submit→run，在 `runs\<job>` 上判三份文档路径、无 staging、`timing.complete=true` | 约 38 s |
 | **导入闭环** | `tests/test_gate_import_voices.py`（1 项） | 没有音色的工程 → `import audio --roots <cache> --voices … --apply` 真把 voice 写进 `assets.json`、再导一次字节不变、`plan` 里那条 fix 消失且 `ready=true`、随后能 submit | 约 6 s |
+| **交付继承（headless）** | `tests/test_gate_delivery_inheritance.py`（1 项） | **真子进程**跑 `python -m word_video.exporters`：① 带 `delivery.json` 且不给 `--background` → exit 0，且草稿 `word_video_manifest.json` 的 `background`/`video_codec` 等于工程里那条；② 无 `delivery.json` 且**保留草稿**（只加 `--no-video`）→ exit 2、stdout 单个 JSON、`code=BACKGROUND_MISSING`、`object_path=profile.background`、`fixes` 非空、**out/run 目录没建**、cwd 条目不变、无 `PermissionError`；并记录 `stage_seconds` | 约 10 s |
 
-**门禁共 32 项**（另有一项 	est_wv_media_streams.py 由 B 新加，同属该标记）。 实测一次完整门禁（**不含**发布目录/导入闭环两步）：**30 passed / 墙钟 2056 s（约 34 分钟）**，
+**门禁共 33 项**（另有 `test_wv_media_streams.py` 1 项由 B 新加，同属该标记）。
+实测一次完整门禁（**不含**发布目录/导入闭环/交付继承三步）：**30 passed / 墙钟 2056 s（约 34 分钟）**，
 但那次是**与 A、B、C 三个 Agent 并行**跑的（16 逻辑核，负载 71%），媒体矩阵被拖到 25 分钟；
 同一台机器空闲时媒体矩阵 13 分钟。所以**独占槽位预期 20–21 分钟，拥挤时 34 分钟是上界**——
 报这个数字时请连负载一起报。默认套件不受影响（`pytest.ini` 是 `-m "not acceptance_media"`）。
@@ -72,6 +74,7 @@ D:\1\1-AI_workflow\word_video_flow\out\reports\
     gate-published-<日期>.json            发布目录判定（继承 / 拒绝面 / 三份文档 / 运行状态）
     gate-published-accept-<日期>.json     在该发布目录上的八面判定
     gate-import-<日期>.json               导入闭环（voice 落盘 / 幂等 / blocker 消失）
+    gate-delivery-<日期>.json              headless 交付继承与拒绝面（+ stage_seconds）
     stamp-*.json                          指纹：哪次运行的源码/输入与这份证据对应
 ```
 
