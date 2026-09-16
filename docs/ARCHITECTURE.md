@@ -24,10 +24,12 @@
 4. **任务提交固定工程/输入意图**，媒体就绪再固定实际音频/计划；
    同一素材入库一次后以资产 id 引用，批次不反复复制；
    新任务不读取编辑中的工程或仍可变的外部路径。
-5. **连续预览**首选源素材低清代理/按需解码 + 独立文字层 + 统一 PCM 时钟；
-   缓存有界、版本和 seek 代际明确。首次验证不搭建通用共享内存总线，
-   不以多播放器各播一轨代替同步。主路线核心指标实测不达标时提交最小反例和替代方案，
-   先找顶层裁决，不并行养两套媒体引擎。
+5. **预览只做"模板效果预览"**（Tim 2026-09-17 裁剪，取代原"连续预览=低清代理+按需解码+统一 PCM 时钟"）：
+   画布 = **背景一张静帧 + 文字层**，文字层必须来自与成片同一套 `LayoutSurface` 排版；
+   **不解码视频、不建低清代理、不做后台分段编码、不出声（无音频设备、无 PCM 时钟）、不做软件内时间线编辑**；
+   重绘按需（位置/样式/尺寸变化）并可低频播放，不做 20/60Hz 定时器、不每帧新建 Qt 对象。
+   静帧按「源路径+尺寸+mtime」缓存，抽帧失败要给出说明而不是白屏。
+   将来若要恢复视频预览，先提交最小反例与替代方案，并先在顶层裁决，不并行养两套媒体引擎。
 6. **预览与 MP4 共用文字排版/计划**；剪映单向导出，保留独立可编辑对象；
    MP4 由自有渲染完成，不依赖剪映 GUI 才能批量出片。
 7. **Agent 自动化是首版能力**：稳定本地 CLI（capabilities、doctor、project/voice/template、
@@ -73,7 +75,7 @@ repo/
 | 排版 | `word_video.layout.LayoutSurface` | 预览与 MP4**唯一**排版；坐标 0..1、字号按 `height/2160` 缩放、溢出是数据不是异常；**消费必须经 `application/styles.py::merged_styles`**（否则会静默丢掉未覆盖角色） |
 | 三产物入口 | `python -m word_video.exporters` | `project.json` + 目录 → MP4 / 五轨 SRT / 可编辑剪映草稿；**只读计划**，不依赖剪映 GUI；多段背景按计划 item 顺序落段，**多段片头明确拒绝** |
 | 朗读文本策略 | `word_video.text_policy` | 默认 `v2`（去词性标记与其连接符、去内嵌音标）；`legacy` 仅用于复现历史批次 |
-| 编辑器 | `python -m desktop`（窗口 + `--import/--open/--export` 脚本化驱动） | 编辑只经 application 命令；画布复用 W04 预览与 `LayoutSurface`；工程文件夹含 `project.json`/`assets.json`/`media.json`（后者在 `voice` 迁移完成后删）/`delivery.json`/`.preview`（代理缓存，跨重启保留） |
+| 编辑器 | `python -m desktop`（窗口 + `--import/--open/--export` 脚本化驱动） | 编辑只经 application 命令；画布 = 背景静帧 + `LayoutSurface` 文字层（**模板效果预览**，见不变量 5）；工程文件夹含 `project.json`/`assets.json`/`media.json`（后者在 `voice` 迁移完成后删）/`delivery.json`/`.preview`（**静帧缓存**，跨重启保留） |
 | 成员包 | `out\packages\word-video-member-<ver>` | 双 onedir（CLI console + 编辑器 windowed）+ 包内 ffmpeg + 启动器（无参数进编辑器）+ 清洗环境验收脚本 |
 | 旧线 | `word_video_cli.py`、旧字幕工厂 | 保持可用；旧核心 6 文件逐字节未改，W10 只做子进程适配 |
 
