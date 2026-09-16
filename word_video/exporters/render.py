@@ -32,6 +32,7 @@ from pathlib import Path
 import shutil
 import time
 
+from ..domain.errors import ProjectError
 from ..domain.model import MediaSlice
 from ..domain.plan import CUE_TRACKS
 from ..domain.timebase import TICKS_PER_SECOND
@@ -54,6 +55,26 @@ PREPARE_WORKERS = min(8, os.cpu_count() or 4)
 
 class ExportError(Exception):
     """The export cannot proceed without changing what the user approved."""
+
+
+class DeliveryError(ProjectError):
+    """The delivery has no usable picture: A's own check, worded once.
+
+    The background is a *delivery* setting, so this exporter cannot invent one.
+    Rather than let ``Path('')`` - which is the current working directory - reach
+    the draft's ``shutil.copy2`` and come back as ``PermissionError`` on a folder,
+    the run refuses with the code, message, hint and fixes A's
+    ``application.batches.check_delivery`` already produces, so the CLI, the batch
+    planner and the coordinator all say the same thing about the same input.
+    """
+
+    code = 'BACKGROUND_MISSING'
+
+    def __init__(self, check):
+        problem = check.problems[0]
+        super().__init__(problem.message, path=problem.path, hint=problem.hint)
+        self.code = problem.code
+        self.fixes = tuple(check.fixes)
 
 
 @dataclass
@@ -184,12 +205,24 @@ class _CatalogEntry:
 
 
 def export_run(project_path, *, output=None, run_name='', background=None,
-               intro_video='', intro_audio='', video_codec='h264',
+               intro_video='', intro_audio='', video_codec=None,
                slices=None, render=True, draft=True, progress=None):
     """Produce all three deliverables for one project revision.
 
-    ``background`` is a delivery setting, not project content: the document owns the
-    editable lesson and the caller owns which background this delivery uses.
+    ``background`` and ``video_codec`` are *delivery* settings, not project content,
+    and the project folder owns them in ``delivery.json`` (A's ``storage/delivery.py``,
+    which the editor writes).  A parameter given here **overrides** that sidecar - the
+    caller knows what this particular delivery is - and an omitted one follows the
+    project, so the headless entry produces what the editor would.  Before this, the
+    CLI rendered h264 with no background while the editor rendered h265 with the
+    project's background: two entries, one project, two different pictures (H0's
+    reproduction).
+
+    A run that has to draw a picture (``render`` or ``draft``) refuses **before the
+    run folder exists** when the delivery still has no usable background, using A's
+    :func:`~word_video.application.batches.check_delivery` wording: an empty path is
+    the working directory, and the old failure arrived as a ``PermissionError`` on a
+    folder - about the cwd, days after its cause.
 
     ``intro_video``/``intro_audio`` are the **legacy fallback** for a project that
     has no intro layer of its own (the "seconds without media" case, and the old
@@ -202,6 +235,22 @@ def export_run(project_path, *, output=None, run_name='', background=None,
     base = base if base.is_dir() else base.parent
     if output is None:
         output = base / 'out'
+    # The delivery sidecar is the project's own answer; an explicit parameter wins
+    # over it, and the codec still falls back to h264 when neither says anything.
+    from ..storage.delivery import delivery_settings
+
+    settings = delivery_settings(base)
+    background = str(background or '').strip() or settings['background']
+    video_codec = str(video_codec or '').strip() or settings['video_codec'] or 'h264'
+    if render or draft:
+        from ..application.batches import ExportProfile, check_delivery
+
+        check = check_delivery(ExportProfile(background=background))
+        if not check.ready:
+            # Covers "no background at all" (BACKGROUND_MISSING) and a path that is
+            # not a readable file (BACKGROUND_FILE_MISSING/UNREADABLE), before the run
+            # folder is created.
+            raise DeliveryError(check)
     # Stage timing, so "the export took four minutes" can be answered with where they
     # went instead of a guess.  The names are the verified chain's (`jobs.py` writes
     # `stage_seconds` for speech / timeline / draft / srt / render); a stage that is
