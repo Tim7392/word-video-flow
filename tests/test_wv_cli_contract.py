@@ -132,6 +132,32 @@ def test_stdout_is_utf8_even_where_the_console_code_page_cannot_hold_it(tmp_path
     assert payload['result']['records'][0]['word'] == 'ˈæpl'
 
 
+def test_stdout_is_readable_by_a_caller_that_decodes_with_its_own_locale(tmp_path):
+    """The other half of "one JSON object": a plain ``text=True`` caller must get it.
+
+    ``subprocess.run(..., text=True)`` decodes with the *caller's* locale encoding —
+    cp936 on this machine — and UTF-8 Chinese is not decodable there.  The read then
+    fails inside the reader thread, the caller silently gets ``stdout is None`` and
+    "not JSON" instead of a structured refusal, which is exactly how H0's contract tool
+    reported every Chinese-bearing action as a failure.  ASCII-safe output decodes
+    identically under every code page and parses to the same object.
+    """
+    prepare(tmp_path)
+    result = subprocess.run(
+        [sys.executable, '-m', 'word_video.cli', '--root', str(tmp_path),
+         'batch', 'plan', '--project', 'golden', '--batch', '151-151'],
+        capture_output=True, text=True,            # no encoding: the locale decides
+        cwd=str(Path(__file__).resolve().parents[1]))
+    assert result.stdout is not None, 'the caller could not decode stdout at all'
+    payload = json.loads(result.stdout)            # one object, nothing else
+    assert payload['ok'] is True
+    assert payload['result']['ready'] is False
+    # The Chinese the answer carries survived the round trip; only its *bytes* are
+    # escaped, so the object a caller parses is the same one.
+    assert '--background' in ' '.join(payload['result']['delivery_fixes'])
+    assert result.stdout.isascii()
+
+
 # ---------------------------------------------------------------------------
 # Plan writes nothing; submit freezes; receipts are checkable
 # ---------------------------------------------------------------------------

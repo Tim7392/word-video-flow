@@ -5,18 +5,24 @@ The contract W05 promises an Agent, implemented here:
 * stdout carries **one** JSON object for every outcome — success, bad arguments,
   unknown action, or a failure deep in a run — and the exit code says which
   (0 ok, 2 needs input / bad usage, 1 failed).  Logs and tracebacks go to stderr;
-  ``watch`` is the one action that streams NDJSON instead.
+  ``watch`` is the one action that streams NDJSON instead.  The object is written
+  **ASCII-safe** (``ensure_ascii=True``): a caller that reads it through
+  ``subprocess.run(..., text=True)`` decodes with its *own* locale encoding, and UTF-8
+  Chinese is not decodable under cp936 at all — the read fails inside the reader thread
+  and the caller gets ``None`` instead of the answer.  Escapes decode identically under
+  every code page and parse to the same object; see :func:`_json`.
 * nothing opens a dialog: information that is missing comes back as
   ``NEEDS_INPUT`` with a ``fixes`` list the caller can act on.
 * ``batch plan`` preflights (solve, estimate, list problems) and writes nothing;
   ``batch submit`` freezes the plan and needs an idempotency key, so a retry can
-  never spend twice.
+  never spend twice.  Both read **one** readiness verdict
+  (``BatchDocument.readiness()``), so ``plan.ready`` cannot disagree with a refusal.
 * writes go through the coordinator (one writer per root), never straight to disk.
 
 Run it as ``python -m word_video.cli <action> ...``.
 """
 import argparse
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import json
 import os
 from pathlib import Path
@@ -309,7 +315,14 @@ def action_capabilities(args, coordinator):
                       'batch redo changes nothing without --apply, and re-does only the'
                       ' packages that failed or changed; batch upgrade keeps member'
                       ' edits (conflicts are reported) and --undo puts back the state'
-                      ' it replaced']}
+                      ' it replaced',
+                      'readiness is one verdict: plan prints it and submit obeys it, so'
+                      ' `ready`/`blocking`/`checks.ready` never disagree; `fixes` are'
+                      ' the blockers\' fixes (running them clears the refusal) and'
+                      ' `warnings` are facts that do not block, such as an unrecorded'
+                      ' voice',
+                      'stdout is ASCII-safe JSON, so a caller decoding it with its own'
+                      ' code page reads the same object (stderr keeps the readable text)']}
 
 
 def action_doctor(args, coordinator):
@@ -423,22 +436,28 @@ def action_batch(args, coordinator):
     if args.sub == 'upgrade':
         return _batch_upgrade(args, coordinator)
     project, index, document, intro = _document(args, coordinator)
+    verdict = document.readiness()
     if args.sub == 'plan':
         # The preflight prints what the batch still needs (delivery included) and
-        # writes nothing: an Agent can act on `delivery.fixes` before submitting.
+        # writes nothing: an Agent can act on `fixes` (the blockers) before submitting,
+        # and reads `warnings` for what is only unrecorded.  `ready`, `blocking` and
+        # `checks.ready`/`checks.blocking` are the same verdict a submit obeys, because
+        # they all come from BatchDocument.readiness().
         return {'batch': document.batch_id, 'plan': _plan_view(document, project),
                 'wrote_files': False, 'ready': document.ready,
+                'blocking': list(verdict.names()),
                 'checks': document.checks.to_dict(),
-                'fixes': document.fixes(),
+                'fixes': list(verdict.fixes),
+                'warnings': list(verdict.warning_names()),
+                'warning_fixes': list(verdict.warning_fixes),
                 'delivery_fixes': list(document.delivery.fixes)}
     # submit
     if not args.key:
         raise NeedsInput('submit needs an idempotency key', path='submit',
                          fixes=['加 --key <stable-name>；同一批活重试时复用同一个键'])
     if not document.ready:
-        raise NeedsInput('the batch is not ready: %d problem(s)'
-                         % (len(document.problems) + len(document.checks.blocking)),
-                         path='plan', fixes=list(document.fixes()) or
+        raise NeedsInput('the batch is not ready: %d problem(s)' % len(verdict.blocking),
+                         path='plan', fixes=list(verdict.fixes) or
                                ['修好工程或素材后重新 plan'])
     result = _submit_document(args, coordinator, document, index, key=args.key,
                               template=_template(args, coordinator), intro=intro,
@@ -871,7 +890,7 @@ def action_watch(args, coordinator, stream):
             stream.write(json.dumps({'job': job['id'], 'state': job['state'],
                                      'phase': job['phase'], 'control': job['control'],
                                      'artifacts': len(job['artifacts'])},
-                                    ensure_ascii=False) + '\n')
+                                    ensure_ascii=True) + '\n')
             stream.flush()
         if job['state'] in ('succeeded', 'partial_failed', 'failed', 'cancelled'):
             return {'job': job['id'], 'state': job['state'], 'final': True}
@@ -923,12 +942,147 @@ def action_import(args, coordinator):
                               for item in list(plan.ambiguous)[:3]))]
         raise NeedsInput('the import is not ready', path='import', fixes=fixes)
     if not args.apply:
+        rows, unmatched = _voice_targets(project, records, plan)
+        # Read-only: the mapping is shown, nothing is published and nothing is written.
         return {**report, 'ready': True, 'applied': False,
-                'note': '计划就绪；加 --apply 才会把原件发布到资产目录'}
+                'voices': VoiceRecord(entries=tuple(rows),
+                                      unmatched=tuple(unmatched)).to_dict(),
+                'note': '计划就绪；加 --apply 才会把原件发布到资产目录，'
+                        '并把每条录音的音色写进 assets.json'}
     asset_dir = Path(args.asset_dir) if args.asset_dir else \
         coordinator.project_folder(args.project)
     result = materialize(plan, asset_dir)
-    return {**report, 'ready': True, 'applied': True, **result.to_dict()}
+    voices = _record_voices(Path(asset_dir), project, records, plan)
+    return {**report, 'ready': True, 'applied': True, **result.to_dict(),
+            'voices': voices.to_dict()}
+
+
+@dataclass(frozen=True)
+class VoiceRecord:
+    """Which asset each imported recording belongs to, and what happened to its voice.
+
+    ``entries`` is the whole mapping, one row per imported recording, so a caller can
+    see *which* asset id the voice went to instead of having to trust a count.
+    ``unmatched`` names every recording this import could not attach to the project:
+    a row is never dropped silently — an unattached voice is exactly the state the
+    delivery preflight keeps reporting (``VOICE_UNRECORDED``).
+    """
+
+    entries: tuple = ()
+    unmatched: tuple = ()
+    written: tuple = ()
+    unchanged: tuple = ()
+    saved: bool = False
+    path: str = ''
+    #: Whether the project has an ``assets.json`` to record into at all.  A bare
+    #: project can still receive the published originals (that is this command's
+    #: documented job), but a voice has nowhere to go — and that is *said*, not
+    #: silently skipped, because a caller that believes the voices were recorded is
+    #: exactly the caller H0 watched go round in circles.
+    registry: bool = True
+    note: str = ''
+
+    @property
+    def recorded(self):
+        """Every asset the import left with a voice, in order."""
+        return tuple(sorted(set(self.written) | set(self.unchanged)))
+
+    def to_dict(self):
+        return {'recorded': list(self.recorded), 'written': list(self.written),
+                'unchanged': list(self.unchanged),
+                'unmatched': [dict(row) for row in self.unmatched],
+                'saved': self.saved, 'registry': self.registry, 'path': self.path,
+                'note': self.note,
+                'entries': [dict(row) for row in self.entries]}
+
+
+def _voice_targets(project, records, plan):
+    """``(rows, unmatched)``: which asset id each planned recording's voice belongs to.
+
+    The id is computed with the **same** rule the delivery preflight uses to name a
+    batch's assets (``asset_id_for`` over the ids the project's clips already carry),
+    because a voice written under any other id would leave ``checks.voices`` exactly as
+    it was: the command would report success and the blocker would stay.
+    """
+    from ..application.instantiate import asset_id_for
+
+    by_index = {record.index: record for record in records}
+    asset_ids = {(clip.record_id, clip.role): clip.source.asset_id
+                 for clip in project.clips
+                 if clip.source is not None and clip.record_id}
+    rows, unmatched = [], []
+    for item in plan.items:
+        record = by_index.get(item.get('index'))
+        row = {'index': item.get('index'), 'role': item.get('role'),
+               'asset_id': (asset_id_for(record.id, item['role'], asset_ids)
+                            if record is not None else ''),
+               'voice': str(item.get('voice') or ''),
+               'path': str(item.get('source') or '')}
+        if record is None:
+            unmatched.append({**row, 'reason': '这个序号不在所选范围里'})
+        else:
+            rows.append(row)
+    return rows, unmatched
+
+
+def _record_voices(folder, project, records, plan):
+    """Write the voice of every imported recording into the project's ``assets.json``.
+
+    Idempotent by construction: the file is rewritten only when a ``voice`` value
+    actually changes, and only that field is touched, so importing the same recordings
+    twice leaves the document byte for byte as it was.  A recording that cannot be
+    attached to a registered asset is **named**, never skipped quietly: the caller
+    would otherwise keep a blocker the command claimed to fix.
+    """
+    from dataclasses import replace as _replace
+
+    from ..storage.assets import AssetIndex, assets_path
+
+    rows, unmatched = _voice_targets(project, records, plan)
+    target = Path(assets_path(folder))
+    if not target.is_file():
+        # Publishing the originals is still this command's job (and the editor is what
+        # writes a registry), but there is nothing to record a voice into — say so.
+        return VoiceRecord(entries=tuple(rows), registry=False, path=str(target),
+                           note='工程里没有 assets.json：录音已经发布到资产目录，'
+                                '但音色没有地方记（交付预检也会因为同一件事拒绝这个工程；'
+                                '让编辑器保存一次工程，它会写出 assets.json）')
+    index = AssetIndex.load(folder)
+    written, unchanged, wanted = [], [], {}
+    for row in rows:
+        asset_id, voice = row['asset_id'], row['voice']
+        if not index.has(asset_id):
+            unmatched.append({**row, 'reason':
+                              'assets.json 里没有这个资产 id（换过工程或改过 id？）'})
+        elif not voice:
+            unmatched.append({**row, 'reason': '录音本身没有音色，也没有用 --voices 指定'})
+        elif index.ref(asset_id).voice == voice:
+            unchanged.append(asset_id)
+        else:
+            wanted[asset_id] = voice
+            written.append(asset_id)
+    if unmatched:
+        raise NeedsInput('%d 条录音没法写进工程的 assets.json' % len(unmatched),
+                         path='assets',
+                         fixes=['这些录音对应的资产 id 不在工程里：%s'
+                                % ', '.join(sorted({str(row.get('asset_id') or '?')
+                                                    for row in unmatched})[:5]),
+                                '确认 --project 与 --batch/--records 是同一个工程、同一批词',
+                                '录音没有音色时用 --voices <角色=音色,...> 指定再 --apply'])
+    saved = False
+    if wanted:
+        updated = _replace(index, refs=tuple(
+            _replace(ref, voice=wanted[ref.asset_id]) if ref.asset_id in wanted else ref
+            for ref in index.refs))
+        # Only a real change is written, so a second import of the same recordings
+        # leaves the file byte for byte as it was.
+        saved = updated.to_dict() != index.to_dict()
+        if saved:
+            updated.save(folder)
+    return VoiceRecord(entries=tuple(rows), unmatched=tuple(unmatched),
+                       written=tuple(sorted(written)),
+                       unchanged=tuple(sorted(unchanged)), saved=saved,
+                       path=str(assets_path(folder)))
 
 
 def _select(project, selection):
@@ -1119,24 +1273,39 @@ def main(argv=None, *, stdout=None, stderr=None):
         return 1
     except Exception as error:                    # noqa: BLE001 - one JSON, always
         print('%s: %s' % (type(error).__name__, error), file=stderr)
-        stdout.write(json.dumps({'ok': False, 'error': {
+        stdout.write(_json({'ok': False, 'error': {
             'type': type(error).__name__, 'code': 'INTERNAL',
-            'message': str(error)[:1000]}}, ensure_ascii=False) + '\n')
+            'message': str(error)[:1000]}}))
         return 1
     if args.action != 'watch':
-        stdout.write(json.dumps({'ok': True, 'action': args.action, 'result': result},
-                                ensure_ascii=False, allow_nan=False) + '\n')
+        stdout.write(_json({'ok': True, 'action': args.action, 'result': result}))
     return 0
 
 
+def _json(payload):
+    """The one JSON object, **ASCII-safe**, as a line.
+
+    ``ensure_ascii=True`` is not cosmetic.  stdout is UTF-8, but a caller that reads it
+    through ``subprocess.run(..., text=True)`` decodes with *its* locale encoding — on a
+    GBK machine that is cp936, and UTF-8 Chinese is not decodable there at all (the read
+    raises inside the reader thread and the caller silently gets ``None`` instead of the
+    answer).  ASCII escapes decode identically under every code page and still parse to
+    the same object, so the contract "one JSON object on stdout" holds whatever the
+    caller's code page is; ``\\uXXXX`` inside a JSON string is the same string.
+    """
+    return json.dumps(payload, ensure_ascii=True, allow_nan=False) + '\n'
+
+
 def _utf8(stream):
-    """Make the one JSON object UTF-8 whatever the console code page says.
+    """Let the one JSON object be written whatever the console code page says.
 
     A code page that cannot hold a character the answer contains (phonetics, a
     member's own words) would otherwise raise *while writing* — after the action
     succeeded — and the caller would get a traceback instead of the JSON the
     contract promises.  Best effort: a stream that cannot be reconfigured is used
-    as it is.
+    as it is.  What is *written* is ASCII (see :func:`_json`), so the encoding only
+    has to accept ASCII for the machine contract; the human-readable message on
+    stderr keeps the literal characters.
     """
     reconfigure = getattr(stream, 'reconfigure', None)
     if reconfigure is not None:
@@ -1150,8 +1319,7 @@ def _utf8(stream):
 def _print_error(stdout, stderr, action, error, *, extra=False):
     document = {'type': type(error).__name__, **error.to_dict()}
     print('%s: %s' % (error.code, error), file=stderr)
-    stdout.write(json.dumps({'ok': False, 'action': action, 'error': document},
-                            ensure_ascii=False) + '\n')
+    stdout.write(_json({'ok': False, 'action': action, 'error': document}))
 
 
 if __name__ == '__main__':

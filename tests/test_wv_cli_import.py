@@ -144,6 +144,13 @@ def test_applying_publishes_the_existing_recordings(tmp_path, root):
     published = set(files_under(folder)) - set(before)
     assert len(published) == 3
     assert all(str(folder) in item['path'] for item in result['provider']['items'])
+    # This project has no assets.json, so there is nowhere to record a voice: the
+    # import still publishes (its documented job) and says the voices were not
+    # recorded instead of reporting a success a caller would misread.
+    assert result['voices']['registry'] is False
+    assert result['voices']['recorded'] == [] and result['voices']['saved'] is False
+    assert 'assets.json' in result['voices']['note']
+    assert not (folder / 'assets.json').exists()       # and it did not invent one
 
 
 def test_an_ambiguous_voice_is_a_question_not_a_guess(tmp_path, root):

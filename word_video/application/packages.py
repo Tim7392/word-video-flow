@@ -20,6 +20,11 @@ Costs are counted from what already exists: a recording that is registered and o
 disk is a **hit** (no synthesis, no request), anything else is a **miss** and costs
 one synthesis request.  That is the number a member is really being asked to approve,
 so it is in the plan document rather than discovered at run time.
+
+Whether a batch may be submitted is decided in exactly one place — :func:`readiness`
+— and both ``batch plan`` and ``batch submit`` read it; the rule it implements is
+written out under :data:`SCHEMA` (``wv-batch@1``), including why an unrecorded voice is
+a warning rather than a blocker.
 """
 from dataclasses import dataclass, field, replace
 import datetime
@@ -29,7 +34,7 @@ from pathlib import Path
 import shutil
 
 from ..domain.errors import ProjectError, SchemaError
-from ..domain.lesson import LessonTemplate
+from ..domain.lesson import DEFAULT_LESSON_TEMPLATE, LessonTemplate
 from ..domain.model import TEACHING_STAGES, Project
 from ..domain.plan import Conflict
 from .batches import (BatchSelection, DeliveryCheck, ExportProfile, check_delivery,
@@ -42,6 +47,29 @@ SCHEMA = 'wv-batch@1'
 BATCH_KEYS = ('schema', 'batch_id', 'source_project', 'source_folder', 'template_id',
               'template_version', 'selection', 'rule', 'profile', 'packages', 'usage',
               'disk', 'checks', 'created', 'notes')
+
+#: The readiness rule of ``wv-batch@1``, in one paragraph, because "is this batch
+#: ready?" used to be answered in two places: the preflight's own aggregate said
+#: "nothing blocks" while ``submit`` counted a package problem and refused, so an
+#: Agent could read ``blocking: []``, run the fixes it was handed, and be refused by
+#: the very same command again.  From here on there is **one** function —
+#: :func:`readiness` — and both ``batch plan`` and ``batch submit`` read it:
+#:
+#: * **blocking** (a submit is refused) means *this delivery cannot be produced the
+#:   way the caller asked for it*: a package that cannot be solved or expanded, a
+#:   delivery input that is not there (the background), an area the preflight marks
+#:   ``blocking`` (missing media, unusable fonts, disk, target), or no package at all.
+#: * **warning** (a submit is accepted, and the plan names it) means *the delivery can
+#:   be produced, but a fact about it is not recorded*.  Today that is exactly one
+#:   area, ``voices``: this build reuses audio it already has and never synthesises
+#:   on this path, so an unrecorded voice does not stop a delivery — it means the
+#:   delivery cannot *say* whose voice it reused.  Refusing it here would be a second,
+#:   stricter rule than the verified engine's, and the fix (``import audio --voices``)
+#:   is only possible for recordings the importer can find.
+#: * ``fixes`` lists **only** the fixes of the blockers, so "run what the refusal
+#:   tells you and the refusal goes away" is checkable (see
+#:   ``tests/test_wv_blocker_fix_closure.py``); the warnings' fixes are reported
+#:   separately (``warning_fixes``) instead of being mixed into ``fixes``.
 
 #: Codecs a delivery may ask for; anything else is refused before a run starts.
 DELIVERY_CODECS = ('h264', 'h265')
@@ -371,8 +399,15 @@ FONT_FIXES = (
     '模板与工程都不写字体路径：字体由本机解析链决定，缺字体时必须显式处理',
 )
 
+#: What a caller can do about a recording whose voice is not recorded.  Kept beside
+#: the check that produces it, and written as the command the product really accepts:
+#: the fix has to be runnable, because a caller that runs it must end up with the
+#: voices in ``assets.json`` (that is the defect this text used to state backwards —
+#: "--voices ... 记录音色后 --apply" read like a command but recorded nothing).
 VOICE_FIXES = (
-    'import audio --voices female=BV503_streaming,male=BV504_streaming 记录音色后 --apply',
+    'import audio --project <工程> --roots <含 audio-cache 的目录> --batch <范围> '
+    '--voices <角色=音色,...> --apply：把已有录音发布进工程，并把每条的音色写进 assets.json',
+    '不加 --voices 时会用录音自带的音色（缓存里的 spec.voice），加 --voices 只覆盖指定角色',
     '或在 assets.json 的 voice 字段写出这条配音的音色（复用已有音频不会因此获得合成能力）',
 )
 
@@ -454,10 +489,14 @@ def check_fonts(styles):
 def check_voices(packages, registry=None):
     """Which speech recordings have no *recorded* voice.
 
-    Not blocking on purpose: this build reuses audio it already has and never
-    synthesises, so an unrecorded voice does not stop a delivery — it means the
-    delivery cannot say whose voice it reused, which is a fact the caller wants
-    before a batch is published, not a reason to refuse it.
+    A **warning**, not a blocker, and the rule is the one in the module docstring: this
+    build reuses audio it already has and never synthesises on this path, so an
+    unrecorded voice does not stop a delivery — it means the delivery cannot say whose
+    voice it reused, which is a fact the caller wants before a batch is published, not
+    a reason to refuse it.  ``batch submit`` therefore accepts it (the plan says so
+    under ``warnings``), while the fix that records the voices is a real command that
+    really records them (see ``VOICE_FIXES`` and
+    ``tests/test_wv_blocker_fix_closure.py``).
     """
     unrecorded, recorded = [], 0
     for package in packages:
@@ -552,29 +591,140 @@ def check_template(source, template):
 
     A template supplies the arrangement: the layers it declares and the styles it
     carries.  A source project supplies the media (including its intro layer, which the
-    template has to declare to keep — see :func:`intro_from`).  A plan that does not say
-    which of the two decided what leaves an Agent unable to explain the delivery it is
-    about to freeze, so the plan says it.
+    template has to declare to keep — see :func:`intro_arrangement`).  A plan that does
+    not say which of the two decided what leaves an Agent unable to explain the
+    delivery it is about to freeze, so the plan says it.
     """
-    intro = source.intro_clip() is not None
+    intro, _from_template, problem = intro_arrangement(source, template)
     from_template = bool(template.styles)
+    if problem is not None:
+        intro_from = 'refused'
+    elif not intro:
+        intro_from = 'none'
+    elif template.intro:
+        intro_from = 'template'
+    else:
+        intro_from = 'source'
     detail = {'template': '%s@%d' % (template.template_id, template.version),
               'styles_from': 'template' if from_template else 'source',
               'styles': sorted((template.style_table() if from_template
                                 else source.style_table())),
-              'intro_in_source': intro, 'intro_in_template': bool(template.intro),
-              'intro_used': bool(intro and template.intro)}
-    if intro and not template.intro:
-        detail['note'] = ('源工程有片头图层，但模板没有声明：这一批不会画片头'
-                          '（要保留就先用 template save --from-project 记录含片头的模板）')
+              'intro_in_source': source.intro_clip() is not None,
+              'intro_in_template': bool(template.intro),
+              'intro_from': intro_from,
+              'intro_used': bool(intro and problem is None)}
+    if problem is None and intro and not template.intro:
+        detail['note'] = ('参考版式（%s@%d）不声明片头图层，这一批保留工程自带的片头；'
+                          '要固定成模板就用 template save --from-project 记下来'
+                          % (template.template_id, template.version))
+    elif problem is not None and intro:
+        detail['note'] = ('模板没有声明源工程的片头图层，这一批不会画片头：'
+                          '先用 template save --from-project 记录含片头的模板')
     return Check(name='template', ok=True, blocking=False, detail=detail)
 
 
 @dataclass(frozen=True)
+class Readiness:
+    """The one verdict: may this batch be submitted, and what stops it.
+
+    Built by :func:`readiness` only.  ``blocking`` holds the problems that make a
+    submit impossible, ``warnings`` the areas that are not ok but do not stop a
+    delivery (each with its own fixes), and ``fixes`` is derived from ``blocking``
+    alone — never from the warnings, which is what used to hand a caller the
+    command it had already run as the fix for a refusal it did not cause.
+    """
+
+    ready: bool = True
+    blocking: tuple = ()
+    warnings: tuple = ()
+    fixes: tuple = ()
+    warning_fixes: tuple = ()
+
+    def names(self):
+        """Short labels for the blockers: the problem codes / the blocking areas."""
+        return _labels(self.blocking)
+
+    def warning_names(self):
+        return tuple(item.name for item in self.warnings)
+
+    def to_dict(self):
+        return {'ready': self.ready, 'blocking': list(self.names()),
+                'blocking_problems': [problem.to_dict() for problem in self.blocking],
+                'fixes': list(self.fixes),
+                'warnings': list(self.warning_names()),
+                'warning_fixes': list(self.warning_fixes)}
+
+
+def _labels(problems):
+    """One readable label per blocker, in order, without duplicates."""
+    found = []
+    for problem in problems:
+        label = problem.code or 'BATCH_PROBLEM'
+        if label not in found:
+            found.append(label)
+    return tuple(found)
+
+
+def package_blockers(packages):
+    """``(problem, fixes)`` for every reason a package cannot run, in order.
+
+    A package that cannot be solved or expanded is one blocker per problem; a package
+    that solves but has no delivery input (the background) is one blocker per delivery
+    problem.  Kept as pairs so the *fix* a caller is handed travels with the problem it
+    belongs to — that is what lets a regression test assert "this fix clears this
+    blocker" (``tests/test_wv_blocker_fix_closure.py``).
+    """
+    found = []
+    for package in packages:
+        if package.problems:
+            for problem in package.problems:
+                found.append((problem, (problem.hint or problem.message
+                                        or '先解决这个包的问题再提交',)))
+            continue
+        if not package.delivery.ready:
+            for problem in package.delivery.problems:
+                found.append((problem, tuple(package.delivery.fixes)))
+    return tuple(found)
+
+
+def readiness(blockers, checks):
+    """**The** readiness verdict of a batch — plan prints it, submit obeys it.
+
+    One function, so the two commands cannot disagree (see the module docstring for
+    the rule: blocking = the delivery cannot be produced; warning = it can, but a
+    fact about it is unrecorded).  ``blockers`` are ``(problem, fixes)`` pairs (see
+    :func:`package_blockers`) and ``checks`` are the preflight areas.
+    """
+    blocking, fixes, warnings, warning_fixes = [], [], [], []
+    for problem, problem_fixes in blockers:
+        blocking.append(problem)
+        fixes.extend(problem_fixes)
+    for item in checks:
+        if item.ok:
+            continue
+        if item.blocking:
+            blocking.extend(item.problems or (Conflict(code=item.name,
+                                                       message='%s 未通过' % item.name),))
+            fixes.extend(item.fixes)
+        else:
+            warnings.append(item)
+            warning_fixes.extend(item.fixes)
+    return Readiness(ready=not blocking, blocking=tuple(blocking), warnings=tuple(warnings),
+                     fixes=tuple(fixes), warning_fixes=tuple(warning_fixes))
+
+
+@dataclass(frozen=True)
 class Preflight:
-    """The preflight as a whole: every area, and whether the batch may be submitted."""
+    """The preflight as a whole: every area, and whether the batch may be submitted.
+
+    ``blockers`` are the batch's own (its packages'), carried here so this report and
+    a submit are the *same* verdict: :attr:`ready`, :attr:`blocking` and :attr:`fixes`
+    all come from :func:`readiness` and not from a second opinion computed over the
+    areas alone.
+    """
 
     checks: tuple = ()
+    blockers: tuple = ()
 
     def check(self, name):
         for item in self.checks:
@@ -583,26 +733,40 @@ class Preflight:
         return None
 
     @property
+    def verdict(self):
+        """The one verdict (see :func:`readiness`)."""
+        return readiness(self.blockers, self.checks)
+
+    @property
     def blocking(self):
-        return tuple(item for item in self.checks if item.blocking and not item.ok)
+        """The blocker labels.  Empty means "a submit would be accepted"."""
+        return self.verdict.names()
 
     @property
     def ready(self):
-        return not self.blocking
+        return self.verdict.ready
+
+    @property
+    def warnings(self):
+        return self.verdict.warnings
 
     @property
     def fixes(self):
-        found = []
-        for item in self.checks:
-            if not item.ok:
-                found.extend(item.fixes)
-        return found
+        """Only the blockers' fixes: running them must clear the refusal."""
+        return self.verdict.fixes
+
+    @property
+    def warning_fixes(self):
+        return self.verdict.warning_fixes
 
     def to_dict(self):
-        return {'ready': self.ready,
-                'blocking': [item.name for item in self.blocking],
+        return {'ready': self.ready, 'blocking': list(self.blocking),
                 'checks': [item.to_dict() for item in self.checks],
-                'fixes': self.fixes}
+                'blockers': [{'problem': problem.to_dict(), 'fixes': list(fixes)}
+                             for problem, fixes in self.blockers],
+                'fixes': list(self.fixes),
+                'warnings': list(self.verdict.warning_names()),
+                'warning_fixes': list(self.warning_fixes)}
 
     @classmethod
     def from_dict(cls, document, path='batch'):
@@ -619,7 +783,29 @@ class Preflight:
                                 problems=tuple(_conflict(problem)
                                                for problem in item.get('problems') or ()),
                                 fixes=tuple(item.get('fixes') or ()), detail=rest))
-        return cls(checks=tuple(checks))
+        return cls(checks=tuple(checks), blockers=_blockers_from(document))
+
+    @classmethod
+    def with_blockers(cls, checks, blockers):
+        """A preflight of areas plus the batch's own blockers (plan time)."""
+        return cls(checks=tuple(checks), blockers=tuple(blockers))
+
+
+def _blockers_from(document):
+    """Read the blockers of a stored preflight.
+
+    A document written before this field existed has no ``blockers``; it is not a
+    problem, because the batch's own problems were always stored on its *packages*
+    (``packages[].problems``) and :meth:`BatchDocument.__post_init__` rebuilds the
+    blockers from them — a stored blocked batch still reads back as blocked.
+    """
+    found = []
+    for item in document.get('blockers') or ():
+        if not isinstance(item, dict) or 'problem' not in item:
+            raise SchemaError('every blocker needs a problem',
+                              path='batch.checks.blockers')
+        found.append((_conflict(item['problem']), tuple(item.get('fixes') or ())))
+    return tuple(found)
 
 
 @dataclass(frozen=True)
@@ -641,6 +827,13 @@ class BatchDocument:
     checks: Preflight = Preflight()
     schema: str = SCHEMA
 
+    def __post_init__(self):
+        # One verdict, one source: the preflight is handed the batch's own blockers,
+        # so `checks.ready`/`checks.blocking` and a submit can never disagree — not
+        # even for a document read back from disk (see readiness()).
+        object.__setattr__(self, 'checks',
+                           replace(self.checks, blockers=package_blockers(self.packages)))
+
     @property
     def usage(self):
         total = UsageReport()
@@ -648,10 +841,13 @@ class BatchDocument:
             total = total.merge(package.usage)
         return total
 
+    def readiness(self):
+        """The one verdict a `batch plan` prints and a `batch submit` obeys."""
+        return self.checks.verdict
+
     @property
     def ready(self):
-        return bool(self.packages) and self.checks.ready \
-            and all(package.ready for package in self.packages)
+        return bool(self.packages) and self.readiness().ready
 
     @property
     def plan_identity(self):
@@ -700,16 +896,18 @@ class BatchDocument:
         return None
 
     def fixes(self):
-        """What to do about everything that is not ready, in one flat list."""
-        fixes = []
-        for package in self.packages:
-            if not package.ok:
-                fixes.extend(problem.hint or problem.message
-                             for problem in package.problems)
-            elif not package.delivery.ready:
-                fixes.extend(package.delivery.fixes)
-        fixes.extend(self.checks.fixes)
-        return fixes
+        """The **blockers'** fixes, in one flat list: running them clears the refusal.
+
+        The advice of the areas that do not block (today: recording a voice) is *not*
+        mixed in here — that is what used to hand a caller the command it had already
+        run as the "fix" for a refusal caused by something else.  It is reported
+        separately, as ``warning_fixes()``.
+        """
+        return list(self.checks.fixes)
+
+    def warning_fixes(self):
+        """What to do about the areas that are not ok but do not stop a delivery."""
+        return list(self.checks.warning_fixes)
 
     def to_dict(self):
         return {'schema': self.schema, 'batch_id': self.batch_id,
@@ -786,28 +984,42 @@ class TemplateIntroMismatch(ProjectError):
     code = 'TEMPLATE_INTRO_MISMATCH'
 
 
-def intro_from(source, template, measured=None):
-    """``(slice, audio, measurement)`` for the intro the expansion will build.
+def is_reference_layout(template):
+    """Whether this document *is* the built-in reference layout (``lesson-default@1``).
+
+    The reference layout is not a member's arrangement choice: it is the layout the
+    verified engine draws, and that engine draws the intro layer a project has.  So
+    the reference is allowed to *follow* the source project's intro (see
+    :func:`intro_arrangement`), while every other template version has to declare it.
+    """
+    return (template.template_id == DEFAULT_LESSON_TEMPLATE.template_id
+            and template.version == DEFAULT_LESSON_TEMPLATE.version)
+
+
+def intro_arrangement(source, template):
+    """``(has_intro, from_template, problem)`` — the one rule about the intro layer.
 
     A batch must not change the lesson the member built without saying so, and it must
-    not invent a layer either.  Both directions are therefore explicit:
+    not invent a layer either, so the three cases are stated once, here, and read by
+    both the expansion (:func:`intro_from`) and the report
+    (:func:`check_template`):
 
-    * source has an intro layer and the template declares one → the layer is kept, with
-      the measurement the caller already took (``measured``) so the same file is not
-      probed once per package;
-    * source has one and the template does not declare one → **refused** by name.  The
-      template is the arrangement, so the member is asked to record the arrangement they
-      actually have (``template save --from-project``) rather than getting a delivery
-      without the countdown they placed;
-    * source has none and the template declares one → refused: an intro cannot be
+    * the source has an intro layer and the template declares one → it is kept;
+    * the source has one and the template does not declare one → **refused by name**,
+      unless the template *is* the reference layout: the reference follows the
+      project, because the verified engine it stands for draws the member's own
+      countdown.  Refusing there was a false alarm with no way out that a caller of
+      ``batch plan``/``batch submit`` could take: the default path would reject every
+      real project that has an intro until someone re-recorded the arrangement;
+    * the source has none and the template declares one → refused: an intro cannot be
       invented from a recipe.
     """
-    if not isinstance(template, TemplateDocument):
-        raise SchemaError('a batch needs a TemplateDocument', path='batch')
     clip = source.intro_clip()
     has_intro = clip is not None and clip.source is not None
     if has_intro and not template.intro:
-        raise TemplateIntroMismatch(
+        if is_reference_layout(template):
+            return True, False, None
+        return True, False, TemplateIntroMismatch(
             '模板 %s@%d 没有片头图层，但源工程 %s 有：这一批不会画片头'
             % (template.template_id, template.version, source.project_id),
             path='template',
@@ -815,14 +1027,48 @@ def intro_from(source, template, measured=None):
                  '--template <新模板 id>，再用 --template 指定它；'
                  '确实不要片头就换一个不含片头的模板')
     if template.intro and not has_intro:
-        raise TemplateIntroMismatch(
+        return False, True, TemplateIntroMismatch(
             '模板 %s@%d 有片头图层，但源工程 %s 没有片头素材'
             % (template.template_id, template.version, source.project_id),
             path='template', hint='给源工程加片头图层，或用不含片头的模板')
+    return has_intro, bool(template.intro), None
+
+
+def intro_from(source, template, measured=None):
+    """``(slice, audio, measurement)`` for the intro the expansion will build.
+
+    The decision is :func:`intro_arrangement`'s; this function only turns it into the
+    three values the expansion takes, with the measurement the caller already took
+    (``measured``) so the same file is not probed once per package.
+    """
+    if not isinstance(template, TemplateDocument):
+        raise SchemaError('a batch needs a TemplateDocument', path='batch')
+    has_intro, _from_template, problem = intro_arrangement(source, template)
+    if problem is not None:
+        raise problem
     if not has_intro:
         return None, '', None
+    clip = source.intro_clip()
     return clip.source, str(clip.audio_asset or ''), \
         (measured if measured is not None else measure_project_intro(source))
+
+
+def lesson_for(source, template):
+    """The lesson the expansion builds: the template's, with the reference's one borrow.
+
+    ``LessonTemplate.intro`` is what :func:`word_video.application.instantiate.expand`
+    reads to decide whether it may create the intro clip at all, so the reference
+    layout's "follow the source project's own intro" (see :func:`intro_arrangement`)
+    has to be expressed here too — otherwise the plan would agree to keep the layer and
+    the expansion would refuse it one step later.
+    """
+    lesson = template.lesson
+    if lesson.intro or not is_reference_layout(template):
+        return lesson
+    clip = source.intro_clip()
+    if clip is None or clip.source is None:
+        return lesson
+    return replace(lesson, intro=True)
 
 
 def instance_for(source, records, template, media, instance_id, *, intro_slice=None,
@@ -848,7 +1094,7 @@ def instance_for(source, records, template, media, instance_id, *, intro_slice=N
     # leaves the source project's own overrides alone rather than wiping them.
     if template.styles:
         base = replace(base, styles=template.styles)
-    lesson = template.lesson
+    lesson = lesson_for(source, template)
     if not isinstance(lesson, LessonTemplate):
         raise SchemaError('the template document carries no lesson', path='batch')
     return instantiate(lesson, records, media, base, intro=intro_slice,
@@ -951,15 +1197,19 @@ def preflight(source, template, profile, packages, registry=None, *, free_bytes=
 
     The order is the order a caller can act in: media (what the words need), fonts
     (what the picture needs), voices (what the delivery should record), disk and the
-    target.  Nothing here writes, renders or synthesises.
+    target.  Nothing here writes, renders or synthesises.  The packages' own problems
+    travel with the areas (``blockers``) so this report *is* the submit's verdict and
+    not a second opinion about it — see :func:`readiness`.
     """
     styles = template.style_table() or source.style_table()
-    return Preflight(checks=(check_media(packages, registry),
-                             check_fonts(styles),
-                             check_voices(packages, registry),
-                             check_disk(free_bytes, reference_bytes, packages),
-                             check_target(profile, source),
-                             check_template(source, template)))
+    return Preflight(
+        checks=(check_media(packages, registry),
+                check_fonts(styles),
+                check_voices(packages, registry),
+                check_disk(free_bytes, reference_bytes, packages),
+                check_target(profile, source),
+                check_template(source, template)),
+        blockers=package_blockers(packages))
 
 
 def _now():
