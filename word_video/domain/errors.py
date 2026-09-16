@@ -71,6 +71,12 @@ class SourceRangeError(ProjectError):
     code = 'SOURCE_RANGE'
 
 
+class IntroMediaError(ProjectError):
+    """The intro layer's media is missing, unusable, or not the one measured."""
+
+    code = 'INTRO_MEDIA'
+
+
 class MissingRoleError(ProjectError):
     code = 'MISSING_ROLE'
 

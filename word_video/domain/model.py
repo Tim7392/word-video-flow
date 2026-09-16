@@ -24,19 +24,27 @@ from .rhythm import (DEFAULT_EXTRA, DEFAULT_FIRST_SIX, DEFAULT_FOOTER,
 from .timebase import (TICKS_PER_SECOND, TimeExpr, finite_number, frame_seconds,
                        frame_ticks, half_up, positive_int, rational)
 
-SCHEMA = 'wv-project@1'
+SCHEMA = 'wv-project@2'
+#: The first document revision.  It has no intro layer and no clip audio asset, so
+#: it still loads unchanged; anything that carries an intro is @2 and an older
+#: reader refuses it instead of silently dropping the countdown.
+SCHEMA_V1 = 'wv-project@1'
+SCHEMAS = (SCHEMA_V1, SCHEMA)
 
 #: Speech stages in teaching order; the same tuple the verified engine renders.
 TEACHING_STAGES = tuple(ROLES)
 #: On-screen text layers of one record.
 DISPLAY_LAYERS = tuple(DISPLAY_TRACKS)
-#: Whole-project layers.
-PROJECT_LAYERS = ('title', 'subtitle', 'footer', 'background')
+#: Whole-project layers.  ``intro`` is the reference countdown clip: it is picture,
+#: not a reading stage, so it belongs to the project rather than to a record.
+PROJECT_LAYERS = ('title', 'subtitle', 'footer', 'background', 'intro')
 CLIP_ROLES = TEACHING_STAGES + DISPLAY_LAYERS + PROJECT_LAYERS
 #: Roles whose media is speech and must therefore have a measured length.
 AUDIO_ROLES = TEACHING_STAGES
-#: Paint order for the video list: background first, text on top of it.
-VIDEO_ORDER = ('background',) + PROJECT_LAYERS[:3] + DISPLAY_LAYERS
+#: Paint order for the video list: background, then the intro over it, text on top.
+VIDEO_ORDER = ('background', 'intro', 'title', 'subtitle', 'footer') + DISPLAY_LAYERS
+#: Role of the reference intro clip; the only role that may carry ``audio_asset``.
+INTRO_ROLE = 'intro'
 
 
 def _text(value, name, *, path='', allow_empty=True):
@@ -47,11 +55,15 @@ def _text(value, name, *, path='', allow_empty=True):
     return value
 
 
-def _strict(value, name, required, path):
-    """A stored object must carry exactly the declared fields."""
+def _strict(value, name, required, path, optional=()):
+    """A stored object must carry the declared fields and no others.
+
+    ``optional`` names fields a newer revision added: a document written before
+    them still loads, and an unknown field is still refused.
+    """
     if not isinstance(value, dict):
         raise SchemaError('%s must be an object' % name, path=path)
-    unknown = sorted(set(value) - set(required))
+    unknown = sorted(set(value) - set(required) - set(optional))
     missing = sorted(set(required) - set(value))
     if unknown:
         raise SchemaError('%s has unknown field(s): %s' % (name, ', '.join(unknown)),
@@ -224,6 +236,11 @@ class Clip:
     duration_ticks: int | None = None
     text: str = ''
     source: MediaSlice | None = None
+    #: A standalone sound that can carry this layer when its own media has none.
+    #: Only the intro layer uses it (the legacy ``lesson.intro_audio``); which of
+    #: the two actually sounds is decided by ``word_video.media.resolve_intro_audio``
+    #: and never here.
+    audio_asset: str = ''
 
     def __post_init__(self):
         path = 'clip:%s' % self.id if isinstance(self.id, str) else 'clip'
@@ -253,26 +270,45 @@ class Clip:
         if self.source is None and self.role in AUDIO_ROLES:
             raise SchemaError('speech clip %s needs a media source' % self.id,
                               path=path)
+        _text(self.audio_asset, 'clip audio_asset', path=path)
+        if self.audio_asset and self.role != INTRO_ROLE:
+            # A second, standalone sound belongs to the intro layer; a reading
+            # stage speaks the media in its own slice.
+            raise SchemaError('only the %s layer carries a separate audio asset'
+                              % INTRO_ROLE, path=path)
+        if self.role == INTRO_ROLE and self.source is None:
+            raise SchemaError('the intro layer needs its video source', path=path,
+                              hint='没有片头素材时用 project.intro_s 兜底，不要建空的片头片段')
 
     @property
     def is_speech(self):
         return self.role in AUDIO_ROLES
 
+    @property
+    def is_intro(self):
+        return self.role == INTRO_ROLE
+
     def to_dict(self):
-        return {'id': self.id, 'role': self.role, 'record_id': self.record_id,
-                'start': self.start.to_dict(), 'duration_ticks': self.duration_ticks,
-                'text': self.text,
-                'source': self.source.to_dict() if self.source else None}
+        document = {'id': self.id, 'role': self.role, 'record_id': self.record_id,
+                    'start': self.start.to_dict(),
+                    'duration_ticks': self.duration_ticks, 'text': self.text,
+                    'source': self.source.to_dict() if self.source else None}
+        if self.audio_asset:
+            # Written only when it is used: a document with no intro layer keeps
+            # exactly the fields it had before the intro existed.
+            document['audio_asset'] = self.audio_asset
+        return document
 
     @classmethod
     def from_dict(cls, value, path='clip'):
         keys = ('id', 'role', 'record_id', 'start', 'duration_ticks', 'text', 'source')
-        _strict(value, 'clip', keys, path)
+        _strict(value, 'clip', keys, path, optional=('audio_asset',))
         source = value['source']
         return cls(id=value['id'], role=value['role'], record_id=value['record_id'],
                    start=TimeExpr.from_dict(value['start']),
                    duration_ticks=value['duration_ticks'], text=value['text'],
-                   source=MediaSlice.from_dict(source, path=path) if source is not None else None)
+                   source=MediaSlice.from_dict(source, path=path) if source is not None else None,
+                   audio_asset=value.get('audio_asset', ''))
 
 
 @dataclass(frozen=True)
@@ -299,10 +335,10 @@ class Project:
     schema: str = SCHEMA
 
     def __post_init__(self):
-        if self.schema != SCHEMA:
+        if self.schema not in SCHEMAS:
             raise SchemaError('unsupported project schema %r' % (self.schema,),
                               path='project',
-                              hint='本版本只读写 %s' % SCHEMA)
+                              hint='本版本只读写 %s' % '、'.join(SCHEMAS))
         _text(self.project_id, 'project_id', path='project', allow_empty=False)
         object.__setattr__(self, 'records', tuple(self.records))
         object.__setattr__(self, 'clips', tuple(self.clips))
@@ -312,6 +348,13 @@ class Project:
                 if not isinstance(item, expected):
                     raise SchemaError('%s must contain %s objects'
                                       % (name, expected.__name__), path='project')
+        if self.schema == SCHEMA_V1:
+            for clip in self.clips:
+                if clip.is_intro:
+                    raise SchemaError(
+                        'schema %s cannot carry an intro layer' % SCHEMA_V1,
+                        path='clip:%s' % clip.id,
+                        hint='把工程升到 %s（Project.with_schema）后再加片头素材' % SCHEMA)
         for name in ('width', 'height', 'sample_rate', 'channels'):
             positive_int(getattr(self, name), name, path='project')
         positive_int(self.fps_num, 'fps numerator', path='project')
@@ -343,6 +386,13 @@ class Project:
     def clips_of(self, record_id):
         return tuple(clip for clip in self.clips if clip.record_id == record_id)
 
+    def intro_clip(self):
+        """The project's intro layer, or ``None`` when the lesson has none."""
+        for clip in self.clips:
+            if clip.is_intro:
+                return clip
+        return None
+
     # -- derived settings ------------------------------------------------
     @property
     def frame_ticks(self):
@@ -354,8 +404,19 @@ class Project:
 
     @property
     def intro_ticks(self):
-        """Frames reserved in front of the lesson body (unaccelerated)."""
+        """Fallback length of the intro slot, from ``intro_s`` *only*.
+
+        This is what a project without an intro layer reserves in front of the
+        lesson body, and it is all the legacy engine ever knew.  When the project
+        *has* an intro layer its length comes from that media (see
+        :mod:`word_video.domain.compile`), so a template that says 2.0 s and a
+        clip that runs 1.867 s can never both be true: the media wins.
+        """
         return intro_ticks(self.intro_s, self.fps_num, self.fps_den)
+
+    def with_schema(self, schema, *, revision=None):
+        """State the document revision explicitly (never silently on save)."""
+        return Project(**self._replaced('schema', schema, revision))
 
     # -- new revisions ---------------------------------------------------
     def with_clips(self, clips, *, revision=None):
