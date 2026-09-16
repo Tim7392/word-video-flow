@@ -59,19 +59,21 @@ def build_request(args):
     # instead of being copied into the request.
     published = {int(w['index']): w for w in timeline['words']}
     missing = [w['index'] for w in entries if w['index'] not in published]
-    if missing:
-        raise SystemExit('归档 timeline 里没有这些词：%s' % missing)
-    for want in entries:
-        got = published[want['index']]
-        if (got['word'], got['phonetic'], got['meaning'],
-                got.get('spoken_meaning')) != (want['word'], want['phonetic'],
-                                               want['meaning'], want['spoken_meaning']):
-            raise SystemExit('归档 timeline 第 %d 个词与只读词表不一致：%r'
-                             % (want['index'], got))
+    if not args.source_mode:
+        if missing:
+            raise SystemExit('归档 timeline 里没有这些词：%s' % missing)
+        for want in entries:
+            got = published[want['index']]
+            if (got['word'], got['phonetic'], got['meaning'],
+                    got.get('spoken_meaning')) != (want['word'], want['phonetic'],
+                                                   want['meaning'], want['spoken_meaning']):
+                raise SystemExit('归档 timeline 第 %d 个词与只读词表不一致：%r'
+                                 % (want['index'], got))
+    spoken = {}
+    if args.spoken_file:
+        raw = json.loads(Path(args.spoken_file).read_text(encoding='utf-8'))
+        spoken = {int(key): value for key, value in raw.items()}
     lesson = {
-        'entries': [{'index': w['index'], 'word': w['word'], 'phonetic': w['phonetic'],
-                     'meaning': w['meaning'], 'spoken_meaning': w['spoken_meaning']}
-                    for w in entries],
         'title': timeline.get('title', '四级1500高频词'),
         'footer': timeline.get('footer', '不积小流 无以成江海'),
         'batch_size': max(1, len(entries)),
@@ -85,17 +87,40 @@ def build_request(args):
         'video_codec': args.video_codec or timeline.get('video_codec', 'h264'),
         'styles': styles_from(timeline),
     }
+    if args.source_mode:
+        # The reading text is derived by the job from the read-only word list
+        # under this policy, so the request deliberately carries no
+        # lesson.entries: an independent table is then used to judge the result.
+        if not args.policy:
+            raise SystemExit('source 模式需要 --policy，让作业自己推导朗读文本')
+        lesson['spoken_policy'] = args.policy
+    else:
+        lesson['entries'] = [{'index': w['index'], 'word': w['word'],
+                              'phonetic': w['phonetic'], 'meaning': w['meaning'],
+                              'spoken_meaning': w['spoken_meaning']}
+                             for w in entries]
     intro = args.intro if args.intro is not None else (timeline.get('intro_video') or '')
     if intro:
         lesson['intro'] = {'video': intro}
-    return {
+    items = stage_items(timeline, args.first, args.last)
+    if spoken:
+        # A local item carries the text of the recording it points at.  Only the
+        # Chinese stage reads the meaning, so only it follows the spoken policy;
+        # the two English stages read the word itself.
+        for item in items:
+            if item['role'] == 'chinese' and item['index'] in spoken:
+                item['text'] = spoken[item['index']]
+    request = {
         'idempotency_key': args.key,
         'output': str(Path(args.output).resolve()),
         'lesson': lesson,
-        'provider': {'kind': 'local',
-                     'items': stage_items(timeline, args.first, args.last),
+        'provider': {'kind': 'local', 'items': items,
                      'concurrency': int(args.concurrency)},
     }
+    if args.source_mode:
+        request['source'] = {'path': str(Path(args.wordlist).resolve())}
+        request['range'] = {'start': args.first, 'end': args.last}
+    return request
 
 
 def main(argv=None):
@@ -117,6 +142,12 @@ def main(argv=None):
     parser.add_argument('--speed', type=float, default=1.25)
     parser.add_argument('--video-codec', dest='video_codec', default=None)
     parser.add_argument('--concurrency', type=int, default=1)
+    parser.add_argument('--policy', default=None, choices=['v2', 'legacy'],
+                        help='source 模式：作业按该政策从只读词表推导朗读文本')
+    parser.add_argument('--source-mode', dest='source_mode', action='store_true',
+                        help='发 source+range 请求（不携带 lesson.entries）')
+    parser.add_argument('--spoken-file', dest='spoken_file', default=None,
+                        help='{index: 朗读文本} JSON，用来给本地 provider 的 chinese 条目正名')
     args = parser.parse_args(argv)
     first, last = args.range.split('-')
     args.first = args.first if args.first is not None else int(first)
@@ -125,7 +156,11 @@ def main(argv=None):
     target = Path(args.out)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(request, ensure_ascii=False, indent=1), encoding='utf-8')
-    print(json.dumps({'request': str(target), 'words': len(request['lesson']['entries']),
+    print(json.dumps({'request': str(target),
+                      'words': len(request['lesson'].get('entries', ())) or
+                      args.last - args.first + 1,
+                      'mode': 'source+range' if args.source_mode else 'entries',
+                      'spoken_policy': request['lesson'].get('spoken_policy', ''),
                       'items': len(request['provider']['items']),
                       'output': request['output'],
                       'background': request['lesson']['background'],
