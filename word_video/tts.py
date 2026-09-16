@@ -14,7 +14,7 @@ import urllib.error
 import uuid
 
 from .contracts import SpeechAsset, ROLES
-from .media import atomic_json, duration, prepare_audio, sha256
+from .media import atomic_json, duration, prepare_audio, sha256, wav_duration
 
 ENDPOINT = 'https://openspeech.bytedance.com/api/v3/tts/unidirectional/sse'
 
@@ -210,6 +210,38 @@ class _Gates:
             yield
 
 
+def identity_spec(kind, role, text, voice, resource=None, source_digest=None,
+                  routes=None, timeline_route=None):
+    """What decides the *original* audio - everything except speed and fps.
+
+    A cache folder is named after this, so the same utterance spoken at 1.25x
+    and at 1.0x is one synthesis and two local Tempo passes.  Hashing speed and
+    fps into the folder name, which is what this used to do, means that asking
+    for a different speed calls the paid service again for audio that is already
+    on disk: the exact "改速度 = 重复调用 TTS" defect this layout removes.
+
+    ``routes``/``timeline_route`` stay part of the identity because they decide
+    which ``original.<route>`` files exist, and which one is the timeline's.
+    """
+    spec = {'kind': kind, 'role': role, 'text': text, 'voice': voice}
+    if kind == 'local':
+        # A local item's own audio decides the result, so its bytes are the key.
+        spec['source_digest'] = source_digest
+    elif kind == 'volcengine_original':
+        spec['resource'] = 'volcengine_legacy_original_v1'
+    elif kind == 'jianying_original':
+        spec['resource'] = 'jianying_sami_original_v1'
+    else:
+        spec['resource'] = resource
+    if kind == 'parallel':
+        # Naming the routes is what makes the folder a complete specification:
+        # anything added after the token was computed landed on the same folder
+        # while disagreeing with the stored spec.
+        spec['routes'] = list(routes or ())
+        spec['timeline_route'] = timeline_route
+    return spec
+
+
 def _speech_plan(lesson, kind, voices, routes, timeline_route, resource, local, cache):
     """One work unit per distinct utterance, plus the item -> unit mapping.
 
@@ -222,31 +254,18 @@ def _speech_plan(lesson, kind, voices, routes, timeline_route, resource, local, 
     for word in lesson.entries:
         for role in ROLES:
             text = word.spoken_meaning if role == 'chinese' else word.word
-            spec = {'kind': kind, 'role': role, 'text': text, 'speed': lesson.speed,
-                    'fps': lesson.fps}
+            item = local.get((word.index, role))
             if kind == 'local':
-                item = local.get((word.index, role))
                 if not item or item['text'] != text:
                     raise ValueError('Missing or mismatched local speech: %d/%s'
                                      % (word.index, role))
+                source_digest = sha256(Path(item['path']).resolve(strict=True))
                 voice = item['voice']
-                spec['source_digest'] = sha256(Path(item['path']).resolve(strict=True))
             else:
-                voice = voices[role]
-                if kind == 'volcengine_original':
-                    spec['resource'] = 'volcengine_legacy_original_v1'
-                elif kind == 'jianying_original':
-                    spec['resource'] = 'jianying_sami_original_v1'
-                else:
-                    spec['resource'] = resource
-            spec['voice'] = voice
-            if kind == 'parallel':
-                # Part of the spec *before* the token is computed: the token is
-                # the hash of this dict, so anything added afterwards would make
-                # a later run hash a different (clean) dict, land on the same
-                # folder and then disagree with the stored spec.
-                spec['routes'] = list(routes)
-                spec['timeline_route'] = timeline_route
+                source_digest, voice = None, voices[role]
+            spec = identity_spec(kind, role, text, voice, resource=resource,
+                                 source_digest=source_digest, routes=routes,
+                                 timeline_route=timeline_route)
             token = hashlib.sha256(json.dumps(spec, sort_keys=True,
                                               ensure_ascii=False).encode()).hexdigest()
             if token in seen:
@@ -257,34 +276,51 @@ def _speech_plan(lesson, kind, voices, routes, timeline_route, resource, local, 
                           'text': text, 'role': role, 'voice': voice,
                           'routes': list(routes) if kind == 'parallel' else None,
                           'timeline_route': timeline_route, 'source_kind': kind,
-                          'local': local.get((word.index, role))})
+                          'local': item})
             plan.append(seen[token])
     return units, plan
 
 
-def _run_unit(unit, lesson, gates, checkpoint):
-    """Synthesise one utterance (or reuse its committed cache record)."""
-    checkpoint()
-    folder = unit['folder']
-    prepared = folder / 'prepared.wav'
-    record = folder / 'complete.json'
-    if record.exists():
-        saved = json.loads(record.read_text(encoding='utf-8'))
-        if saved['spec'] != unit['spec']:
-            raise ValueError('Cached speech changed; preserve cache and inspect')
-        if sha256(prepared) != saved['audio_digest']:
-            raise ValueError('Cached speech changed; preserve cache and inspect')
-        return {'raw': saved['raw'], 'rendered': saved['rendered']}
-    folder.mkdir(parents=True, exist_ok=True)
-    if prepared.exists():
-        # A file without a committed record is never reused as complete.
-        prepared.rename(folder / ('uncommitted-' + uuid.uuid4().hex + '.wav'))
+def _prepared_key(speed, rate):
+    """Cache slot for one processed variant of an original.
+
+    Only what really changes the processing is in the key.  ``fps`` is not: it
+    only pads the WAV to a whole frame for identical draft/video durations, and
+    the recording keeps whichever frame grid it was made for so a later render
+    at another frame rate can see that it is coarser than it needs.
+    """
+    return hashlib.sha256(json.dumps({'speed': speed, 'rate': rate},
+                                     sort_keys=True).encode()).hexdigest()[:16]
+
+
+def _raw_duration(path, saved, speed):
+    """Duration of the *original* the timeline has to reserve room for.
+
+    A record written before the two caches were separated stored the
+    post-Tempo duration as ``raw`` (a long-standing metadata defect recorded in
+    word_video_work), so a recorded value that contradicts the file on disk is
+    re-measured instead of being trusted.
+    """
+    recorded = saved.get('raw')
+    if isinstance(recorded, (int, float)) and recorded > 0:
+        file_duration = duration(path)
+        if abs(recorded - file_duration) <= max(0.05, 1.5 / max(speed, .5) / 50):
+            return float(recorded)
+    return duration(path)
+
+
+def _resolve_source(unit, folder, gates):
+    """The original audio for this unit, synthesised only when it is absent.
+
+    This is the *only* place a service call happens, and it is skipped as soon
+    as the file is there, whatever speed or frame rate the caller now wants.
+    """
     kind = unit['source_kind']
     if kind == 'local':
         # The caller already supplied the raw audio; it is never synthesised
         # here, only converted.
-        source = Path(unit['local']['path']).resolve(strict=True)
-    elif kind == 'parallel':
+        return Path(unit['local']['path']).resolve(strict=True)
+    if kind == 'parallel':
         source = None
         for route in unit['routes']:
             audio = folder / ('original.%s.ogg' % route)
@@ -293,21 +329,111 @@ def _run_unit(unit, lesson, gates, checkpoint):
                     synthesize_role(route, unit['text'], unit['role'], audio, unit['voice'])
             if route == unit['timeline_route']:
                 source = audio
-    else:
-        # Route-specific file name: two routes synthesise the same word with
-        # different containers, so a shared name made them overwrite each other
-        # and trip the cache check.
-        route = {'volcengine_original': 'volcengine_legacy',
-                 'jianying_original': 'jianying'}.get(kind, 'volcengine_sse')
-        source = folder / ('original.%s' % route)
-        if not source.exists():
-            with gates.gate(route):
-                synthesize_role(route, unit['text'], unit['role'], source,
-                                unit['voice'], unit['spec'].get('resource'))
+        return source
+    # Route-specific file name: two routes synthesise the same word with
+    # different containers, so a shared name made them overwrite each other
+    # and trip the cache check.
+    route = {'volcengine_original': 'volcengine_legacy',
+             'jianying_original': 'jianying'}.get(kind, 'volcengine_sse')
+    source = folder / ('original.%s' % route)
+    if not source.exists():
+        with gates.gate(route):
+            synthesize_role(route, unit['text'], unit['role'], source,
+                            unit['voice'], unit['spec'].get('resource'))
+    return source
+
+
+def _prepared_wav(unit, lesson, folder, gates, spec_key):
+    """Prepare (or reuse) the Tempo-adjusted WAV for one run, and note how.
+
+    ``folder/prepared.wav`` is the canonical file the manifest points at.  It is
+    rewritten only when the run asks for a different *processing*: the note
+    records which speed and frame grid produced it, and what it held before moves
+    under ``prepared/`` instead of being deleted.  The frame rate alone does not
+    rewrite it - the padding only has to be at least one frame on the coarser of
+    the two grids, which the two-frame margin already covers - but the note is
+    always refreshed, so it describes the run that last used the file.
+
+    Only the local Tempo pass runs here.  The service is never called from this
+    function, which is what makes a speed change free of TTS calls.
+    """
+    prepared = folder / 'prepared.wav'
+    note = folder / 'prepared.json'
+    current = {}
+    if note.exists():
+        try:
+            current = json.loads(note.read_text(encoding='utf-8'))
+        except ValueError:
+            current = {}
+    wanted = {'speed': lesson.speed, 'rate': 48000, 'fps': lesson.fps,
+              'spec_key': spec_key}
+    if prepared.exists() and current.get('spec_key') == spec_key:
+        atomic_json(note, dict(current, **wanted))
+        return {'speed': current.get('speed'), 'reused': True}
+    if prepared.exists():
+        previous = current.get('speed')
+        if isinstance(previous, (int, float)) and previous != lesson.speed:
+            keep = folder / 'prepared'
+            keep.mkdir(exist_ok=True)
+            prepared.rename(keep / ('%s.wav' % _prepared_key(previous, 48000)))
+        else:
+            # No usable note, so what the file holds is unknown: park it where
+            # nothing will read it as complete rather than deleting it.
+            prepared.rename(folder / ('uncommitted-' + uuid.uuid4().hex + '.wav'))
+    source = _resolve_source(unit, folder, gates)
     with gates.gate('local'):
-        raw, rendered = prepare_audio(source, prepared, lesson.speed, lesson.fps)
+        prepare_audio(source, prepared, lesson.speed, lesson.fps)
+    # The note is written after the audio, so a note always describes a file that
+    # is really there; an interrupted run leaves the audio uncommitted.
+    atomic_json(note, dict(wanted, prepared_digest=sha256(prepared)))
+    return {'speed': lesson.speed, 'reused': False}
+
+
+def _original_duration(unit, folder, gates, saved):
+    """Duration of the *original* audio, which is what the timeline reserves.
+
+    A record written before the two caches were separated stored the post-Tempo
+    duration as ``raw``, so a recorded value that contradicts the file on disk
+    is re-measured rather than trusted.  Only local items are re-checked: their
+    original is the caller's own file, already on disk and cheap to read, and
+    the recorded value would otherwise grow every stage in the manifest.
+    """
+    if unit['source_kind'] == 'local':
+        return duration(Path(unit['local']['path']).resolve(strict=True))
+    recorded = saved.get('raw')
+    if isinstance(recorded, (int, float)) and recorded > 0:
+        return float(recorded)
+    return duration(_resolve_source(unit, folder, gates))
+
+
+def _run_unit(unit, lesson, gates, checkpoint):
+    """Synthesise one utterance once, then prepare the requested variant.
+
+    The service call and the Tempo pass have separate caches on purpose: after
+    this, changing the speed finds the original on disk and only re-runs the
+    local pass, and changing a font or a size touches neither.
+    """
+    checkpoint()
+    folder = unit['folder']
+    prepared = folder / 'prepared.wav'
+    record = folder / 'complete.json'
+    spec_key = _prepared_key(lesson.speed, 48000)
+    saved = {}
+    if record.exists():
+        saved = json.loads(record.read_text(encoding='utf-8'))
+        if saved.get('spec') != unit['spec']:
+            raise ValueError('Cached speech changed; preserve cache and inspect')
+    folder.mkdir(parents=True, exist_ok=True)
+    if not record.exists() and prepared.exists():
+        # A file without a committed record is never reused as complete.
+        prepared.rename(folder / ('uncommitted-' + uuid.uuid4().hex + '.wav'))
+    raw = _original_duration(unit, folder, gates, saved)
+    _prepared_wav(unit, lesson, folder, gates, spec_key)
+    rendered = wav_duration(prepared)
     atomic_json(record, {'spec': unit['spec'], 'raw': raw, 'rendered': rendered,
-                         'audio_digest': sha256(prepared)})
+                         'audio_digest': sha256(prepared),
+                         'prepared': json.loads(
+                             (folder / 'prepared.json').read_text(encoding='utf-8'))})
     return {'raw': raw, 'rendered': rendered}
 
 
