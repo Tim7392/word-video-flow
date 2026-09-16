@@ -1,14 +1,14 @@
-"""The editor window: canvas, timeline, property panel, notices, delivery, export.
+"""The editor window: text preview, property panel, notices, delivery, export.
 
 Layout, and why
 ---------------
-* the **canvas** is W04's independent :class:`~desktop.preview_canvas.PreviewCanvas`
-  over one :class:`~preview.session.PreviewSession`.  Exactly one preview session
-  exists at a time: an edit rebuilds it (close, then open) at the position the
-  member was looking at, so a committed edit costs one open (~1 s measured in W04)
-  and never a re-encode of the lesson;
-* the **timeline** is :class:`~desktop.timeline_widget.TimelineWidget`, fed the
-  solved plan - the same ranges the canvas and the exporter use;
+* the **preview** is :class:`~desktop.text_preview.TextPreview`: one cached still of the
+  delivery's background plus the placements B's ``LayoutSurface`` publishes.  Tim's
+  direction (2026-09-17) is that the editor previews the **template's text effect**, not
+  the delivery: no video decode, no segment proxies, no audio device, no mixer, and
+  repaints only when something can actually differ.  The video canvas of W04
+  (:mod:`desktop.preview_canvas`) and the continuous session (:mod:`preview.session`)
+  are kept in the tree and still tested, but the window no longer builds them;
 * the **property panel** edits the selected clip through
   :class:`~desktop.editor_model.EditorState`, which goes to A's commands.  A field
   the member cannot change yet (the font size of a role, say) is *shown read-only*
@@ -18,6 +18,11 @@ Layout, and why
 * the **delivery panel** holds what is not document content: background, intro
   clip, codec.  B's exporter takes exactly these as parameters, so the panel and
   the delivery cannot drift apart.
+
+The editable timeline ("模拟剪映" drag/trim/split/bind) is **offlined**: A's commands
+still exist and are still tested, and editing proper happens in 剪映 on the delivered
+draft, which is the requirement that matters.  ``desktop/timeline_widget.py`` is kept in
+the tree, unused by the window.
 
 The window owns no edit logic.  Everything it does to the project it does by
 calling one method on the state, and every message it shows comes from
@@ -36,8 +41,6 @@ from .editor_export import blocking_notices, export_folder
 from .editor_model import MODE_ADVANCED, MODE_TEMPLATE, EditorState
 from .editor_project import ProjectFolder
 from .legacy_dialog import LegacyDialog
-from .preview_canvas import PreviewCanvas
-from .timeline_widget import TimelineWidget
 
 __all__ = ['EditorWindow', 'ExportWorker']
 
@@ -76,6 +79,8 @@ class WindowState:
     folder: object = None
     state: object = None
     session: object = None
+    #: The background-still cache behind the text preview (``None`` when no preview).
+    still_frames: object = None
     position_ticks: int = 0
     preview_error: str = ''
     preview_builds: int = 0
@@ -153,18 +158,16 @@ class EditorWindow(QtWidgets.QMainWindow):
         top.setSizes([900, 320])
 
         bottom = QtWidgets.QSplitter(QtCore.Qt.Vertical)
-        self.timeline = TimelineWidget()
-        self.timeline.clipSelected.connect(self.on_clip_selected)
-        self.timeline.selectionCleared.connect(self.on_selection_cleared)
-        self.timeline.clipsMoved.connect(self.on_clips_moved)
-        self.timeline.clipTrimmed.connect(self.on_clip_trimmed)
-        self.timeline.splitRequested.connect(self.on_split_requested)
-        self.timeline.playheadMoved.connect(self.on_playhead_moved)
-        bottom.addWidget(self.timeline)
+        # The editable timeline is offlined (Tim 2026-09-17: 不做可编辑的时间线模拟剪映,
+        # 只做模板/文字效果预览).  ``desktop/timeline_widget.py`` and its tests are kept
+        # in the tree, but the window no longer builds one: drag/trim/split/bind are not
+        # offered, and nothing repaints a few hundred bars at 20-60 Hz while a delivery
+        # is being encoded.
+        self.timeline = None
         bottom.addWidget(self._build_notice_panel())
-        bottom.setSizes([260, 200])
+        bottom.setSizes([200])
         self.splitter.addWidget(bottom)
-        self.splitter.setSizes([420, 420])
+        self.splitter.setSizes([520, 200])
 
         self.status = self.statusBar()
         self.status.showMessage('就绪')
@@ -300,8 +303,7 @@ class EditorWindow(QtWidgets.QMainWindow):
         edit_menu.addSeparator()
         self.action_reload = edit_menu.addAction('放弃改动并重新读取', self.reload)
         view_menu = self.menuBar().addMenu('视图')
-        view_menu.addAction('时间线适应窗口', self.timeline.fit)
-        view_menu.addAction('重新构建预览', lambda: self.refresh(rebuild_preview=True))
+        view_menu.addAction('重新构建文字预览', lambda: self.refresh(rebuild_preview=True))
         self._update_actions()
 
     # ------------------------------------------------------------- binding
@@ -333,16 +335,12 @@ class EditorWindow(QtWidgets.QMainWindow):
 
     # -------------------------------------------------------------- refresh
     def refresh(self, *, rebuild_preview=True, keep_position=True, reason=''):
-        """Re-solve, redraw the timeline, rebuild the preview, re-list the notices."""
+        """Re-solve, rebuild the text preview, re-list the notices."""
         if not self._require_state():
             return
         position = self.showing.position_ticks if keep_position else 0
         self.state.set_media_table(self.folder.media_table())
         self.state.set_intro(self.folder.intro_measurement())
-        plan = self.state.plan()
-        self.timeline.frame_ticks = self.state.project.frame_ticks
-        self.timeline.set_plan(plan, selection=self.state.selection,
-                               playhead=position)
         self._update_property_panel()
         self.refresh_notices()
         if rebuild_preview:
@@ -353,48 +351,54 @@ class EditorWindow(QtWidgets.QMainWindow):
             self.status.showMessage(reason)
 
     def _rebuild_preview(self, position):
-        """One session at a time: close the old one, open the new revision."""
+        """Build the **text** preview: one background still, the layout's placements.
+
+        Tim 2026-09-17 downlined the video preview (and with it the crash that lived on
+        "wrap every decoded frame into a QImage and paint it"): what a member needs to
+        approve is the template's *text effect*, not a replay of the delivery.  So this
+        builds no session, no decoder, no segment proxy, no audio output and no mixer -
+        the picture is a cached still and the clock is wall time.
+
+        The placements still come from B's ``LayoutSurface`` through the same
+        :meth:`_build_display` the export's geometry comes from: the preview exists to
+        show what the delivery draws, so it is not allowed a layout of its own.
+        """
         self.close_preview()
         plan = self.state.plan()
         if plan is None:
             self.showing.preview_error = self.state.plan_error and str(self.state.plan_error) or ''
             self.state_label.setText('时间线无法求解：%s' % self.showing.preview_error)
             return
+        from preview.session import DEFAULT_CANVAS_HEIGHT, canvas_size_for
+
         from .editor_project import with_background
+        from .text_preview import TextPreview
+        from preview.still import StillFrames
+
         background = self.folder.background_slice(self.state.project)
         preview_plan = with_background(plan, self.state.project, background)
-        assets = self.folder.preview_assets(self.state.project)
-        if background is not None:
-            assets['layer:background'] = self.folder.delivery.background
-        try:
-            from desktop.audio_qt import QtAudioOutput
-            from preview.clock import NullAudioOutput
-            from preview.session import DEFAULT_CANVAS_HEIGHT, PreviewSession, canvas_size_for
-            output = (QtAudioOutput(rate=plan.sample_rate) if QtAudioOutput.available()
-                      else NullAudioOutput(rate=plan.sample_rate))
-            display = self._build_display(preview_plan, canvas_size_for(
-                preview_plan, DEFAULT_CANVAS_HEIGHT))
-            session = PreviewSession(preview_plan, assets, output=output, display=display,
-                                     temp_root=self.folder.preview_dir,
-                                     canvas_height=DEFAULT_CANVAS_HEIGHT)
-            session.open()
-        except Exception as error:                      # noqa: BLE001 - shown, not raised
-            self.showing.preview_error = '%s: %s' % (type(error).__name__, error)
-            self.state_label.setText('预览不可用：%s' % self.showing.preview_error)
+        canvas = canvas_size_for(preview_plan, DEFAULT_CANVAS_HEIGHT)
+        display = self._build_display(preview_plan, canvas)
+        if display is None:
+            self.state_label.setText('文字预览不可用：%s' % self.showing.preview_error)
             return
-        self.showing.session = session
+        stills = StillFrames(self.folder.preview_dir, canvas[0], canvas[1])
+        widget = TextPreview(display=display, plan=preview_plan, stills=stills)
+        widget.background_paths = ({'layer:background': self.folder.delivery.background}
+                                   if background is not None else {})
+        widget.on_ready = widget.update
+        stills._on_ready = widget.on_still_ready
+        self.showing.session = None
+        self.showing.still_frames = stills
         self.showing.preview_error = ''
         self.showing.preview_builds += 1
-        self.canvas = PreviewCanvas(session)
+        self.canvas = widget
         self.canvas.set_selection(self.state.selection)
         self.canvas_layout.addWidget(self.canvas)
-        if position:
-            session.seek(position)
-        self.canvas.start()
+        self.canvas.set_position(position or 0)
         self._timer.start()
-        self.state_label.setText('预览已就绪 · %s · 画布 %dx%d'
-                                 % (plan.project_id, session.canvas_width,
-                                    session.canvas_height))
+        self.state_label.setText('文字预览已就绪 · %s · 画布 %dx%d'
+                                 % (plan.project_id, canvas[0], canvas[1]))
 
     def close_preview(self):
         self._timer.stop()
@@ -403,12 +407,7 @@ class EditorWindow(QtWidgets.QMainWindow):
             self.canvas_layout.removeWidget(self.canvas)
             self.canvas.deleteLater()
             self.canvas = None
-        if self.showing.session is not None:
-            try:
-                self.showing.session.close()
-            except Exception:                           # noqa: BLE001 - teardown must finish
-                pass
-            self.showing.session = None
+        self.showing.session = None
 
     def _build_display(self, plan, canvas):
         """The layout port the canvas draws through, at the *canvas*'s own size.
@@ -438,22 +437,20 @@ class EditorWindow(QtWidgets.QMainWindow):
             return None
 
     def _tick(self):
-        """Read the canvas's last snapshot for the label and the playhead.
+        """Read the preview's own numbers for the label and the playhead.
 
-        The canvas pulls at 60 Hz on its own timer; this only *reads*, so the
-        preview is not asked for two snapshots per frame and the window cannot
-        make the preview drop a frame by being busy.
+        The window's 20 Hz timer only *reads*: the text preview advances its clock and
+        repaints on its own low-frequency timer while playing, and does nothing at all
+        while paused.
         """
-        if self.showing.session is None or self.canvas is None:
+        if self.canvas is None:
             return
         presentation = self.canvas.presentation()
         if presentation is None:
             return
         self.showing.position_ticks = presentation.position_ticks
-        self.position_label.setText('%.3fs · gen %d · %s'
-                                    % (presentation.position_seconds,
-                                       presentation.generation, presentation.state))
-        self.timeline.set_playhead(presentation.position_ticks)
+        self.position_label.setText('%.3fs · %s' % (presentation.position_seconds,
+                                                    presentation.state))
         # The canvas draws "preparing" itself; the label repeats it because a member
         # who is looking at the status bar must not have to guess either.
         if presentation.preparing and self.state_label.text() != presentation.preparing:
@@ -480,22 +477,16 @@ class EditorWindow(QtWidgets.QMainWindow):
 
     # ------------------------------------------------------------ transport
     def toggle_play(self):
-        if self.showing.session is None:
+        if self.canvas is None:
             self.refresh(rebuild_preview=True)
             return
-        from preview.clock import PlaybackState
-        if self.showing.session.clock.state == PlaybackState.PLAYING:
-            self.showing.session.pause()
-            self.play_button.setText('播放')
-        else:
-            self.showing.session.play()
-            self.play_button.setText('暂停')
+        self.canvas.toggle()
+        self.play_button.setText('播放' if not self.canvas.playing else '暂停')
 
     def on_playhead_moved(self, ticks):
-        if self.showing.session is not None:
-            self.showing.session.seek(ticks)
+        if self.canvas is not None:
+            self.canvas.seek(int(ticks))
         self.showing.position_ticks = int(ticks)
-        self.timeline.set_playhead(ticks)
 
     def seek(self, ticks):
         self.on_playhead_moved(ticks)
@@ -604,11 +595,15 @@ class EditorWindow(QtWidgets.QMainWindow):
         self.after_edit(reason=self._describe(outcome, '绑定'))
 
     def on_split_at_playhead(self):
+        """Split the selected layer at the playhead.
+
+        The timeline is offlined, so there is no snapping grid to consult; the playhead
+        the text preview reports is the instant the member is looking at.
+        """
         clip_id = self._selected_id()
         if not clip_id:
             return
-        ticks = self.timeline.snap(self.showing.position_ticks, exclude=(clip_id,))
-        outcome = self.state.split_at_ticks(clip_id, ticks)
+        outcome = self.state.split_at_ticks(clip_id, self.showing.position_ticks)
         self.after_edit(reason=self._describe(outcome, '拆分'))
 
     def on_mode_changed(self, index):
@@ -648,9 +643,6 @@ class EditorWindow(QtWidgets.QMainWindow):
         """Redraw everything after an edit, without rebuilding the preview if unneeded."""
         self.state.set_media_table(self.folder.media_table())
         self.state.set_intro(self.folder.intro_measurement())
-        plan = self.state.plan()
-        self.timeline.set_plan(plan, selection=self.state.selection,
-                               playhead=self.showing.position_ticks)
         self.canvas_selection()
         self._update_property_panel()
         self.refresh_notices()
@@ -1115,6 +1107,9 @@ class EditorWindow(QtWidgets.QMainWindow):
 
     def diagnostics(self):
         """The window's own state, for a test or a support call - not pixels."""
+        preview = None
+        if self.canvas is not None and hasattr(self.canvas, 'diagnostics'):
+            preview = self.canvas.diagnostics()
         return {'folder': None if self.folder is None else str(self.folder.path),
                 'revision': None if self.state is None else self.state.revision,
                 'dirty': None if self.state is None else self.state.dirty,
@@ -1122,8 +1117,11 @@ class EditorWindow(QtWidgets.QMainWindow):
                 'mode': None if self.state is None else self.state.mode,
                 'preview_builds': self.showing.preview_builds,
                 'preview_error': self.showing.preview_error,
-                'has_session': self.showing.session is not None,
-                'timeline': self.timeline.diagnostics(),
+                'has_session': False,
+                'preview': preview,
+                'still_error': None if self.showing.still_frames is None
+                               else self.showing.still_frames.error(),
+                'timeline': None,
                 'notices': [notice.code for notice in getattr(self, '_last_notices', ())],
                 'exporting': self._exporting,
                 'legacy': self.legacy_diagnostics(),

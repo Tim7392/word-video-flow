@@ -292,13 +292,15 @@ def step_new_entry_missing_media(area):
 
 
 def step_new_entry_cli_raw(area):
-    """The same broken project through the engine's own CLI: the raw, unpolished fact.
+    """The same broken project through the engine's own CLI: the raw fact, no editor.
 
-    ``word_video.exporters`` catches ``ValueError``/``OSError``/``RuntimeError``; a
-    ``ProjectError`` (this refusal) is not one of them, so the standalone CLI answers
-    with a traceback instead of its documented ``{"ok": false}`` object.  The editor
-    path turns the same error into a structured notice, so members are not affected -
-    the gap is recorded here rather than hidden, and it is B's file, not this task's.
+    The three checks below are deliberately about **behaviour anybody can observe
+    without the editor**: a non-zero exit code, no claim of success, and no SRT
+    published.  They held while the CLI answered a missing asset with a traceback, and
+    they still hold now that it answers with its documented ``{"ok": false}`` object
+    and ``ASSET_FILE_MISSING`` (B's fix, verified by H0 2026-09-17: exit 2, one JSON):
+    what the step asks for is that a broken project cannot look like a good one, not
+    which shape the refusal takes today.
     """
     probe_area = Path(area) / 'new-broken'
     project_dir = probe_area / 'project'
@@ -319,9 +321,9 @@ def step_new_entry_cli_raw(area):
             check('CLI 没有宣称成功', True, (payload or {}).get('ok') is not True),
             check('没有产出任何 SRT', 0, len(published(probe_area / 'cli-out'))),
         ],
-        'note': '已知缺口（B 的 word_video/exporters/__main__.py，本任务不改）：'
-                'ProjectError 不在它的 except 元组里，所以 headless CLI 会吐 traceback、'
-                '退出码 1、stdout 为空；编辑器入口 desktop/editor_export.py 会把它变成结构化通知。',
+        'note': 'headless CLI 的拒绝形态由 B 拥有：B 已修好（95ca962，H0 复验：缺素材 → '
+                'exit 2 + 单 JSON ASSET_FILE_MISSING）。本步骤只断言"坏工程不能看起来像好工程"，'
+                '不看它今天是 traceback 还是结构化 JSON。',
     }
 
 
