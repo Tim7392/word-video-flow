@@ -103,4 +103,36 @@ class DraftTests(unittest.TestCase):
             self.assertEqual('PLAIN_JSON',report['state'])
             self.assertTrue(report['relocatable'])
 
+    def test_a_prepared_file_is_measured_without_spawning_ffprobe(self):
+        """The draft asks 150 times "is this file longer than its window?".
+
+        Prepared speech is a PCM WAV this package wrote, so the answer is in the
+        header: ffprobe was spawned once per audio item for it, measured at 22 s of a
+        44 s draft stage on a 50-word lesson.  A file that is not a readable WAV still
+        goes to ffprobe, so nothing else changes.
+        """
+        from unittest.mock import patch
+
+        from word_video.draft import prepared_seconds
+        from word_video.media import run, executable, duration
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            wav = root / 'prepared.wav'
+            run([executable('ffmpeg'), '-v', 'error', '-nostdin', '-n', '-f', 'lavfi',
+                 '-i', 'sine=frequency=440:duration=0.5:sample_rate=48000',
+                 '-ac', '1', '-c:a', 'pcm_s16le', str(wav)])
+            with patch('word_video.media.core.run') as spawned:
+                seconds = prepared_seconds(wav)
+            self.assertEqual(0.5, seconds)
+            spawned.assert_not_called()
+            self.assertAlmostEqual(duration(wav), seconds, places=6)
+
+            # Not a WAV: the header cannot answer, so ffprobe still does.
+            other = root / 'tone.mp3'
+            run([executable('ffmpeg'), '-v', 'error', '-nostdin', '-n', '-f', 'lavfi',
+                 '-i', 'sine=frequency=440:duration=0.5:sample_rate=44100',
+                 '-c:a', 'libmp3lame', '-b:a', '64k', str(other)])
+            self.assertAlmostEqual(duration(other), prepared_seconds(other), delta=0.05)
+
 if __name__=='__main__':unittest.main()

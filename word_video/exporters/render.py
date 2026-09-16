@@ -24,10 +24,13 @@ acceptance checker and a human both find what they expect.
 """
 from dataclasses import dataclass, field
 from fractions import Fraction
+from concurrent.futures import ThreadPoolExecutor
 import json
 import math
+import os
 from pathlib import Path
 import shutil
+import time
 
 from ..domain.model import MediaSlice
 from ..domain.plan import CUE_TRACKS
@@ -44,6 +47,9 @@ RENDER_SCHEMA = 'wv-export@1'
 #: The per-asset speech record published with every run (see `write_speech_record`).
 SPEECH_SCHEMA = 'wv-speech@1'
 SPEECH_FILENAME = 'speech.json'
+#: How many speech assets are prepared at once.  Each is one ffmpeg writing a short
+#: mono PCM file, so the cost is the process rather than the work.
+PREPARE_WORKERS = min(8, os.cpu_count() or 4)
 
 
 class ExportError(Exception):
@@ -196,6 +202,19 @@ def export_run(project_path, *, output=None, run_name='', background=None,
     base = base if base.is_dir() else base.parent
     if output is None:
         output = base / 'out'
+    # Stage timing, so "the export took four minutes" can be answered with where they
+    # went instead of a guess.  The names are the verified chain's (`jobs.py` writes
+    # `stage_seconds` for speech / timeline / draft / srt / render); a stage that is
+    # not run is absent rather than zero, which tells a reader whether a number is
+    # small or was never measured.
+    stage_seconds = {}
+    wall_started = time.monotonic()
+
+    def spend(name, started):
+        stage_seconds[name] = round(time.monotonic() - started, 3)
+        return time.monotonic()
+
+    started = wall_started
     assets, media, from_registry = _asset_source(base)
     from ..application.intro import measure_project_intro
     from ..domain import solve
@@ -206,6 +225,7 @@ def export_run(project_path, *, output=None, run_name='', background=None,
     # Style overrides travel with the plan, so the renderer and the canvas read the
     # same table (a role the project does not override still follows the default).
     styles, font_paths, font_names = _styles(solution.render.style_table())
+    started = spend('plan', started)
     run_dir = Path(output) / (run_name or ('rev%d' % project.revision))
     # A published batch may be checked by an independent reader that treats every
     # file under the run folder as part of the delivery, so an existing folder is
@@ -216,6 +236,7 @@ def export_run(project_path, *, output=None, run_name='', background=None,
     speech_dir = run_dir / '.speech'
     sources = {}
     prepared_facts = {}
+    speech_jobs = []
     for clip in project.clips:
         if clip.source is None:
             continue
@@ -224,17 +245,7 @@ def export_run(project_path, *, output=None, run_name='', background=None,
             if asset is None:
                 raise CatalogError('clip %s needs asset %r, which the catalogue lacks'
                                    % (clip.id, clip.source.asset_id))
-            path, raw_seconds, rendered_seconds, digest = _prepared(
-                clip.source.asset_id, asset.path, clip.source, speech_dir)
-            sources[clip.source.asset_id] = SourceMedia(path=str(path),
-                                                        voice=asset.voice)
-            prepared_facts[clip.source.asset_id] = {
-                'asset_id': clip.source.asset_id, 'role': clip.role,
-                'record_id': clip.record_id, 'text': clip.text,
-                'voice': asset.voice, 'path': str(path),
-                'raw_seconds': round(raw_seconds, 6),
-                'rendered_seconds': round(rendered_seconds, 6),
-                'source_seconds': round(raw_seconds, 6), 'sha256': digest}
+            speech_jobs.append((clip, asset))
             continue
         if clip.is_intro:
             # The intro layer's measurement already resolved its media to a real
@@ -246,6 +257,28 @@ def export_run(project_path, *, output=None, run_name='', background=None,
         # A picture layer (the background): carried through unchanged, because the
         # background is looped by whoever renders it and needs no tempo pass.
         sources.setdefault(clip.source.asset_id, SourceMedia(path=clip.source.asset_id))
+    # One ffmpeg per speech asset, at tempo, into the run's own `.speech/`.  They are
+    # independent passes, and 150 of them in a row measured 27-32 s of the export;
+    # run together it is the same commands, in the same order, with the same output.
+    if speech_jobs:
+        with ThreadPoolExecutor(max_workers=PREPARE_WORKERS) as pool:
+            prepared = list(pool.map(
+                lambda job: _prepared(job[0].source.asset_id, job[1].path,
+                                      job[0].source, speech_dir),
+                speech_jobs))
+    else:
+        prepared = []
+    for (clip, asset), facts in zip(speech_jobs, prepared):
+        path, raw_seconds, rendered_seconds, digest = facts
+        sources[clip.source.asset_id] = SourceMedia(path=str(path), voice=asset.voice)
+        prepared_facts[clip.source.asset_id] = {
+            'asset_id': clip.source.asset_id, 'role': clip.role,
+            'record_id': clip.record_id, 'text': clip.text,
+            'voice': asset.voice, 'path': str(path),
+            'raw_seconds': round(raw_seconds, 6),
+            'rendered_seconds': round(rendered_seconds, 6),
+            'source_seconds': round(raw_seconds, 6), 'sha256': digest}
+    started = spend('speech', started)
     view = build_manifest(solution.render, project, sources, background=background or '',
                           intro_video=intro_video, intro_audio=intro_audio,
                           video_codec=video_codec, styles=styles)
@@ -265,6 +298,7 @@ def export_run(project_path, *, output=None, run_name='', background=None,
     # so a failure later leaves no record claiming a complete run.
     speech_record = write_speech_record(run_dir, view, prepared_facts,
                                         solution.render)
+    started = spend('timeline', started)
 
     # One layout for every product: computed here, read by the captions below and
     # (W04) by the preview.
@@ -272,24 +306,36 @@ def export_run(project_path, *, output=None, run_name='', background=None,
     ass_text = ass_export.build_layout_ass(solution.render, report, styles=styles,
                                            fps=view.fps)
     ass_path = ass_export.write_ass(ass_text, run_dir / 'captions.ass')
+    started = spend('layout', started)
 
     srts = srt_export.export_srts(solution.cues, run_dir / 'srt',
                                   '%04d-%04d' % (view.first_index, view.last_index))
+    started = spend('srt', started)
     draft_dir = ''
     if draft:
         from ..draft import export_draft
         draft_target = run_dir / 'editable-draft'
         export_draft(view, draft_target)
         draft_dir = str(draft_target)
+        started = spend('draft', started)
     video = ''
+    slices_used = 0
     if render:
         from ..render import render_video
         from ..validate import validate_video
         video_path = run_dir / 'video' / 'video.mp4'
+        # ``timings`` is filled by the renderer with what happened *inside* the call:
+        # the mix pass and the picture pass are separate costs and the old chain only
+        # ever reported their sum as "render".
+        inner = {}
         render_video(view, video_path.parent, slices=slices,
-                     progress=progress)
+                     progress=progress, timings=inner)
         validate_video(video_path, view)
         video = str(video_path)
+        slices_used = inner.pop('slices', 0)
+        stage_seconds.update(inner)
+        started = spend('render', started)
+    stage_seconds['total'] = round(time.monotonic() - wall_started, 3)
     result = ExportResult(run_dir=str(run_dir), video=video, srts=tuple(srts),
                           draft=draft_dir, ass=str(ass_path),
                           timeline=str(timeline),
@@ -304,6 +350,11 @@ def export_run(project_path, *, output=None, run_name='', background=None,
                                   'total_frames': view.total_frames,
                                   'fps': view.fps, 'width': view.width,
                                   'height': view.height,
+                                  'stage_seconds': dict(sorted(
+                                      stage_seconds.items(),
+                                      key=lambda item: -item[1])),
+                                  'seconds_wall': stage_seconds['total'],
+                                  'slices': slices_used,
                                   'conflicts': [item.to_dict()
                                                 for item in solution.render.conflicts],
                                   'layout': {'exact_metrics': report.exact_metrics,
