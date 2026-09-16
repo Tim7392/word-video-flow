@@ -18,6 +18,7 @@ so what is asserted here is the set of invariants the speed must not be bought w
 * a source that segmentation does not apply to keeps the single-file proxy it had.
 """
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -399,6 +400,77 @@ def test_the_same_question_about_one_file_is_answered_once(tall_source):
     finally:
         sources_module.video_stream = real
         clear_resolution_cache()
+
+
+def test_playing_across_a_segment_boundary_keeps_the_picture_moving(tall_source):
+    """Crossing a boundary is a decoder restart, not a seek: the picture keeps coming.
+
+    The clock is moved by hand (``ManualAudioOutput``), so this runs in milliseconds
+    and gives the same answer every time.  What it asserts is what can be asserted from
+    a hand-driven clock: the picture advances past the boundary, its timestamps never go
+    backwards or run ahead of the clock, the session never falls into "preparing" while
+    playing (the prefetcher stayed ahead of the playhead), and the decoder reports no
+    stall or failure.  *Which* source frame sits at the join is checked exactly, frame
+    by frame, by ``test_the_frame_at_a_segment_boundary_is_the_right_source_frame``.
+    """
+    from preview.clock import ManualAudioOutput
+
+    with scratch('segments-play-') as folder:
+        output = ManualAudioOutput(rate=RATE)
+        assets = three_tone_assets(folder)
+        video = background_item('layer:background', COVERAGE_SECONDS)
+        plan = plan_of([], video=(video,), total_seconds=COVERAGE_SECONDS, fps=FPS,
+                       width=1920, height=1080)
+        paths = dict(assets)
+        paths['layer:background'] = str(tall_source)
+        session = PreviewSession(plan, paths, output=output,
+                                 temp_root=folder / '.preview', canvas_height=CANVAS,
+                                 segment_seconds=1.0, first_segment_seconds=1.0,
+                                 prefetch_ahead=1)
+        session.open()
+        try:
+            assert session.segment_plan is not None
+            plan = session.segment_plan
+            # Every segment is made ready *before* playback starts, and the background
+            # thread is stopped so nothing competes with the clock.  The subject here is
+            # the boundary switch, not the prefetcher (which has its own tests): on a
+            # loaded machine a prefetcher that is one segment behind would make this
+            # test say "the picture stalled" about something that is not the switch.
+            assert session.preparer.stop(timeout=10.0) is True
+            for index in range(len(plan.segments)):
+                plan.ensure(index)
+            session.play(0)
+            delivered = []
+            step = int(0.02 * RATE)
+            deadline = time.monotonic() + 120.0
+            # Real-time pacing: 20 ms of clock per 20 ms of wall time.
+            while len(delivered) < 2 * FPS and time.monotonic() < deadline:
+                output.advance(step)
+                presentation = session.snapshot()
+                frame = presentation.frame
+                # ``snapshot`` returns the picture *due now*, which stays the same frame
+                # until a newer one arrives; the sequence under test is the changes.
+                if frame is not None and (not delivered
+                                          or delivered[-1].pts_ticks != frame.pts_ticks):
+                    delivered.append(frame)
+                assert presentation.preparing == '', '播放中不该停在"准备中"：%r' % presentation.preparing
+                time.sleep(0.02)
+            assert len(delivered) >= 2 * FPS, '播放跨段时画面停了：只拿到 %d 帧' % len(delivered)
+            stamps = [frame.pts_ticks for frame in delivered]
+            assert stamps == sorted(stamps), stamps[:10]      # 换段不会回放更早的时刻
+            # And the picture never ran ahead of the clock it is drawn against.
+            assert stamps[-1] <= session.position_ticks() + 2 * (TICKS_PER_SECOND // FPS)
+            # Frames arrived from more than one segment: the switch really happened.
+            groups = {session.segment_plan.index_of(stamp // (TICKS_PER_SECOND // FPS))
+                      for stamp in stamps}
+            assert len(groups) >= 2 and 0 in groups, groups
+            assert session.segment_index >= 1
+            decode = session.report()['decode']
+            assert decode['failures'] == 0 and decode['stalls'] == 0, decode
+        finally:
+            report = session.close()
+        assert report['preparer_stopped'] is True
+        assert report['children_left'] == 0 and report['threads_left'] == 0
 
 
 def test_the_preview_audio_cache_is_prepared_for_every_speech_asset(area=None):

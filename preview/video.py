@@ -167,11 +167,22 @@ class FfmpegFrameDecoder:
         self.max_recoveries = int(max_recoveries)
         self.spawn_timeout = float(spawn_timeout)
         self.stats = DecodeStats()
+        #: Newest presentation timestamp this decoder has *handed to the queue*.
+        #: "Produced" and "shown" are different questions, and this is the first one:
+        #: a caller that is about to change which file is being decoded (the segmented
+        #: preview switching source files) has to resume after everything already
+        #: queued, or those frames are produced twice and the picture jumps backwards.
+        self.newest_pts = None
         self._condition = threading.Condition()
         self._request = None
         self._running = False
         self._thread = None
         self._process = None
+
+    def forget_produced(self):
+        """Nothing is 'already produced': the consumer has discarded the queue (a seek)."""
+        with self._condition:
+            self.newest_pts = None
 
     # -- command ---------------------------------------------------------
     def command(self, spec, offset_frames):
@@ -334,14 +345,17 @@ class FfmpegFrameDecoder:
                     return item, True
                 if spec.ticks_of(item) >= spec.end_ticks:
                     return item, False
-                if not self._deliver(VideoFrame(
-                        generation=generation, index=item, pts_ticks=spec.ticks_of(item),
-                        width=spec.width, height=spec.height, buffer=block)):
+                frame = VideoFrame(generation=generation, index=item,
+                                   pts_ticks=spec.ticks_of(item), width=spec.width,
+                                   height=spec.height, buffer=block)
+                if not self._deliver(frame):
                     # The consumer stopped taking frames (a long UI stall, or a
                     # paused session): stop decoding rather than racing ahead and
                     # throwing away the frames the clock has not reached yet.
                     return item, False
                 self.stats.frames += 1
+                if self.newest_pts is None or frame.pts_ticks > self.newest_pts:
+                    self.newest_pts = frame.pts_ticks
                 item += 1
                 source = item % spec.source_frames if spec.source_frames else item
                 if spec.source_frames and not spec.loop and item >= spec.source_frames:

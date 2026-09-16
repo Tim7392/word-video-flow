@@ -179,6 +179,12 @@ class PreviewSession:
         self._write_frame = 0
         self._frame = None
         self._pending = None
+        #: Newest presentation timestamp this session has *seen* from the decoder -
+        #: including frames decoded ahead of the clock that have not been shown yet.
+        #: Switching segments mid-playback resumes after it, or the picture would jump
+        #: backwards by however far the decoder had run ahead (measured at ~200 ms, and
+        #: caught by the boundary playback test rather than by eye).
+        self._newest_pts = None
         self._opened = False
         self._closed = False
         self.open_seconds = None
@@ -381,6 +387,9 @@ class PreviewSession:
             self.frames.clear()
             self._pending = None
             self._frame = None
+            self._newest_pts = None
+            if self.decoder is not None:
+                self.decoder.forget_produced()
         self._request_decode(generation, ticks)
         if playing:
             self.clock.set_state(PlaybackState.PLAYING)
@@ -418,6 +427,13 @@ class PreviewSession:
         self.decoder.request(generation, replace(spec, offset_frames=offset_frames))
 
     # -- segmented picture ------------------------------------------------
+    def _note_newest(self, frame):
+        """Remember the newest frame timestamp seen, shown or merely decoded ahead."""
+        if frame is None:
+            return
+        if self._newest_pts is None or frame.pts_ticks > self._newest_pts:
+            self._newest_pts = frame.pts_ticks
+
     def _use_segment(self, index, generation, at_ticks):
         """Point the decoder at one segment, keeping the timeline's own stamps.
 
@@ -429,11 +445,27 @@ class PreviewSession:
         already queued from the previous segment are therefore still correct and are
         kept: crossing a boundary is a decoder restart, not a seek, and the sound
         never notices it.
+
+        The new run starts after **everything the decoder has already produced**, not
+        after the clock and not after the last frame shown: frames decoded ahead sit in
+        the queue and are shown as the clock reaches them, so asking the new segment to
+        produce them again would show each of them twice - a visible jump backwards by
+        however far the decoder had run ahead (measured: one to three frames, and caught
+        by the boundary playback test rather than by eye).  A seek clears both
+        watermarks (the queue is discarded), so a seek still starts exactly where the
+        member clicked.
         """
         segment = self.segment_plan.segment(index)
         frame_ticks = self._item_frame_ticks()
         start_ticks = self.picture_start_ticks + segment.file_base_frame * frame_ticks
-        offset = max(0, (int(at_ticks) - start_ticks) // frame_ticks)
+        resume = int(at_ticks)
+        produced = None
+        if self.decoder is not None:
+            produced = self.decoder.newest_pts
+        for watermark in (self._newest_pts, produced):
+            if watermark is not None:
+                resume = max(resume, watermark + frame_ticks)
+        offset = max(0, (resume - start_ticks) // frame_ticks)
         self.decode_spec = replace(self.decode_spec, path=str(segment.path),
                                    source_frames=0, loop=False,
                                    start_ticks=start_ticks, offset_frames=offset)
@@ -596,6 +628,7 @@ class PreviewSession:
                 self._pending = self.frames.get(timeout=0)
                 if self._pending is None:
                     break
+                self._note_newest(self._pending)
             if self._pending.generation != generation:
                 self.stale_dropped += 1
                 self._pending = None

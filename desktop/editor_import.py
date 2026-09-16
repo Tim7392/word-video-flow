@@ -231,9 +231,13 @@ def registry_for(assets, timings=None, workers=None):
     refs, media = [], {}
     for asset_id, (path, voice) in ordered:
         info = measured[asset_id]
+        # ``voice`` travels with the ref: it is the asset's own record of which voice
+        # the file was made with, and the delivery pre-check reads it from the registry.
+        # H0's finding: without it an imported project recorded no voice at all, so
+        # "复用已有音频" could never satisfy the check that a reading stage is labelled.
         refs.append(AssetRef(asset_id=asset_id, path=path, units=info.units,
                              unit_num=info.unit_num, unit_den=info.unit_den,
-                             kind='audio'))
+                             kind='audio', voice=voice))
         media[asset_id] = info
     _record(timings, '③ 逐资产探测', started,
             {'assets': len(ordered), 'workers': workers})

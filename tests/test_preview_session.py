@@ -346,6 +346,9 @@ def test_a_seek_asks_the_decoder_for_a_video_frame_offset_not_an_audio_sample():
         requests = []
 
         class FakeDecoder:
+            #: The real decoder publishes how far it has produced; a seek clears it.
+            newest_pts = None
+
             def request(self, generation, spec):
                 requests.append((generation, spec.offset_frames))
 
@@ -354,6 +357,9 @@ def test_a_seek_asks_the_decoder_for_a_video_frame_offset_not_an_audio_sample():
 
             def stop(self, timeout=5.0):
                 return True
+
+            def forget_produced(self):
+                self.newest_pts = None
 
             alive_threads = staticmethod(lambda: 0)
             alive_children = staticmethod(lambda: 0)
