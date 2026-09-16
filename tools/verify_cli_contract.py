@@ -31,6 +31,10 @@ def main():
     parser.add_argument('--root', required=True)
     parser.add_argument('--fixture', required=True)
     parser.add_argument('--batch', default='151-153')
+    parser.add_argument('--background', required=True,
+                        help='交付背景文件；W08 起交付预检要求它存在，缺失应返回 NEEDS_INPUT')
+    parser.add_argument('--roots', required=True,
+                        help='旧缓存根（import audio 用它把已有录音与音色记进工程）')
     parser.add_argument('--json')
     args = parser.parse_args()
     root = Path(args.root)
@@ -41,6 +45,13 @@ def main():
     import_request(Path(args.fixture), project)
 
     checks = []
+    # W08 起交付预检要求"每个资产记录了音色"，否则 batch submit 正确拒绝（NEEDS_INPUT）。
+    # 这里走产品自己的路径把三条配音的音色记下来，然后再验证幂等/冲突/取消等契约面。
+    voices = run(['import', 'audio', '--project', str(project),
+                  '--roots', args.roots, '--batch', args.batch,
+                  '--voices', 'female=BV503_streaming,male=BV504_streaming,chinese=BV406_streaming',
+                  '--apply'], root)
+    checks.append({'name': 'A0 record voices (import audio --apply)', **voices})
     checks.append({'name': 'A1 capabilities', **run(['capabilities'], root)})
     checks.append({'name': 'A1 doctor', **run(['doctor'], root)})
     checks.append({'name': 'A1 project show', **run(['project', 'show', '--project', str(project)], root)})
@@ -53,11 +64,11 @@ def main():
 
     key = 'h0-cli-check-1'
     first = run(['batch', 'submit', '--project', str(project), '--batch', args.batch,
-                 '--key', key, '--codec', 'h265'], root)
+                 '--key', key, '--codec', 'h265', '--background', args.background], root)
     again = run(['batch', 'submit', '--project', str(project), '--batch', args.batch,
-                 '--key', key, '--codec', 'h265'], root)
+                 '--key', key, '--codec', 'h265', '--background', args.background], root)
     conflict = run(['batch', 'submit', '--project', str(project), '--batch', args.batch,
-                    '--key', key, '--codec', 'h264'], root)
+                    '--key', key, '--codec', 'h264', '--background', args.background], root)
     job = (first.get('json') or {}).get('result', {}).get('job')
     same_job = job is not None and job == (again.get('json') or {}).get('result', {}).get('job')
     checks.append({'name': 'A3 same key same request -> same job', 'job': job,
