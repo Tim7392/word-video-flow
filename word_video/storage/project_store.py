@@ -23,14 +23,17 @@ def project_path(path):
     return target / PROJECT_FILENAME if target.is_dir() else target
 
 
-def save_project(project, path):
-    """Write one project revision atomically and return the document path."""
-    if not isinstance(project, Project):
-        raise SchemaError('save needs a Project document', path='project')
-    target = project_path(path)
+def write_document(document, target):
+    """Write one JSON document atomically and return the path it was written to.
+
+    The one place the staging rule lives: a unique temporary file beside the
+    target, fsync, then :func:`os.replace`, so a crash leaves either the previous
+    revision or the new one.  ``allow_nan=False`` keeps a non-finite number out of
+    every document this package writes.
+    """
+    target = Path(target)
     target.parent.mkdir(parents=True, exist_ok=True)
-    # allow_nan=False: a non-finite number can never reach the document on disk.
-    text = json.dumps(project.to_dict(), ensure_ascii=False, sort_keys=True,
+    text = json.dumps(document, ensure_ascii=False, sort_keys=True,
                       indent=2, allow_nan=False) + '\n'
     temporary = target.with_name('.%s.%s.tmp' % (target.name, uuid.uuid4().hex))
     try:
@@ -47,18 +50,30 @@ def save_project(project, path):
     return target
 
 
-def load_project(path):
-    """Read and validate one project document."""
-    source = project_path(path)
+def read_document(source, name):
+    """Read one JSON object document, refusing anything unusable."""
+    source = Path(source)
     try:
         text = source.read_text(encoding='utf-8')
     except FileNotFoundError:
-        raise SchemaError('no project document at %s' % source, path='project') from None
+        raise SchemaError('no %s at %s' % (name, source), path=name) from None
     try:
         value = json.loads(text)
     except ValueError as error:
-        raise SchemaError('project document is not valid JSON: %s' % error,
-                          path='project') from None
+        raise SchemaError('%s is not valid JSON: %s' % (name, error),
+                          path=name) from None
     if not isinstance(value, dict):
-        raise SchemaError('project document must be a JSON object', path='project')
-    return Project.from_dict(value)
+        raise SchemaError('%s must be a JSON object' % name, path=name)
+    return value
+
+
+def save_project(project, path):
+    """Write one project revision atomically and return the document path."""
+    if not isinstance(project, Project):
+        raise SchemaError('save needs a Project document', path='project')
+    return write_document(project.to_dict(), project_path(path))
+
+
+def load_project(path):
+    """Read and validate one project document."""
+    return Project.from_dict(read_document(project_path(path), 'project'))
