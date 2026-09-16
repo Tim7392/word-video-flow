@@ -59,6 +59,11 @@ class LessonTemplate:
     version: int = 1
     stages: tuple = ()
     displays: tuple = ()
+    #: Whether the template contains the reference intro layer.  The layer itself is
+    #: project data, so expansion creates it only when the caller supplies the intro
+    #: media (``application.instantiate``); once created it is edited like any other
+    #: clip and is never re-derived from the template.
+    intro: bool = False
 
     def __post_init__(self):
         if not isinstance(self.template_id, str) or not self.template_id:
@@ -66,6 +71,8 @@ class LessonTemplate:
         if isinstance(self.version, bool) or not isinstance(self.version, int) or self.version <= 0:
             raise SchemaError('template version must be a positive integer',
                               path='template')
+        if not isinstance(self.intro, bool):
+            raise SchemaError('template intro must be a boolean', path='template')
         object.__setattr__(self, 'stages', tuple(self.stages))
         object.__setattr__(self, 'displays', tuple(self.displays))
         for node in self.stages:
