@@ -158,7 +158,11 @@ def main(argv=None):
                      'exit_code': result.returncode,
                      'report': str(target)})
         if result.returncode != 0 or report.get('verdict') != 'PASS':
-            failures.setdefault('batch', {})[key] = report.get('failures')
+            failures.setdefault('batch', {})[key] = (
+                {'verdict': report.get('verdict'), 'failures': report.get('failures'),
+                 'partial_faces': report.get('partial_faces')}
+                if report.get('verdict') not in (None, 'PASS')
+                else report.get('failures'))
 
     seen = {key for key in by_range}
     extra = [key for key in seen if key not in set(expected)]
