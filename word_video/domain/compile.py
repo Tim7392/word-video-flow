@@ -306,7 +306,8 @@ def render_plan(project, media, intro=None):
         fps_num=project.fps_num, fps_den=project.fps_den, width=project.width,
         height=project.height, sample_rate=project.sample_rate,
         channels=project.channels, total_ticks=total, video=video, audio=audio,
-        conflicts=_conflicts(sounding_items(video, audio), audio))
+        conflicts=_conflicts(sounding_items(video, audio), audio),
+        styles=project.styles)
 
 
 def _record_items(project, ranges):
@@ -417,7 +418,8 @@ def solve(project, media, intro=None):
         fps_num=project.fps_num, fps_den=project.fps_den, width=project.width,
         height=project.height, sample_rate=project.sample_rate,
         channels=project.channels, total_ticks=total, video=video, audio=audio,
-        conflicts=_conflicts(sounding_items(video, audio), audio))
+        conflicts=_conflicts(sounding_items(video, audio), audio),
+        styles=project.styles)
     cues = CuePlan(project_id=project.project_id, project_revision=project.revision,
                    fps_num=project.fps_num, fps_den=project.fps_den,
                    total_ticks=total, cues=_cues(project, ranges))

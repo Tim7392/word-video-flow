@@ -1,8 +1,9 @@
-"""The editable project document (``wv-project@1``).
+"""The editable project document (``wv-project@3``).
 
 One editable truth (top-level architecture §4): the project owns the frozen
-input snapshot (``records``), the expanded editable units (``clips``) and the
-lesson settings.  Solved time — :class:`~word_video.domain.plan.RenderPlan` and
+input snapshot (``records``), the expanded editable units (``clips``), the lesson
+settings and the per-role style overrides.  Solved time —
+:class:`~word_video.domain.plan.RenderPlan` and
 :class:`~word_video.domain.plan.CuePlan` — is derived from this document by
 :mod:`word_video.domain.compile` and is never written back.
 
@@ -11,8 +12,9 @@ order (English female voice → English male voice → Chinese meaning) and
 ``contracts.DISPLAY_TRACKS`` the on-screen text layers.  Clips carry their own
 text so the document stays editable without a second content table.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from fractions import Fraction
+import re
 
 from ..contracts import DISPLAY_TRACKS, ROLES
 from .errors import (DuplicateIdError, InvalidTimeError, SchemaError,
@@ -24,12 +26,13 @@ from .rhythm import (DEFAULT_EXTRA, DEFAULT_FIRST_SIX, DEFAULT_FOOTER,
 from .timebase import (TICKS_PER_SECOND, TimeExpr, finite_number, frame_seconds,
                        frame_ticks, half_up, positive_int, rational)
 
-SCHEMA = 'wv-project@2'
-#: The first document revision.  It has no intro layer and no clip audio asset, so
-#: it still loads unchanged; anything that carries an intro is @2 and an older
-#: reader refuses it instead of silently dropping the countdown.
+SCHEMA = 'wv-project@3'
+#: @2 added the intro layer, @3 the per-role style overrides.  Older revisions keep
+#: loading unchanged; every revision refuses content it cannot express, so a reader
+#: that does not know a capability never opens a document that uses it.
 SCHEMA_V1 = 'wv-project@1'
-SCHEMAS = (SCHEMA_V1, SCHEMA)
+SCHEMA_V2 = 'wv-project@2'
+SCHEMAS = (SCHEMA_V1, SCHEMA_V2, SCHEMA)
 
 #: Speech stages in teaching order; the same tuple the verified engine renders.
 TEACHING_STAGES = tuple(ROLES)
@@ -45,6 +48,17 @@ AUDIO_ROLES = TEACHING_STAGES
 VIDEO_ORDER = ('background', 'intro', 'title', 'subtitle', 'footer') + DISPLAY_LAYERS
 #: Role of the reference intro clip; the only role that may carry ``audio_asset``.
 INTRO_ROLE = 'intro'
+#: Style roles a project may override: the keys of ``template.default_styles()``.
+#: Kept as data here because the domain may not import the font-resolving module;
+#: ``tests/test_wv_project_styles.py`` guards the list against that function.
+STYLE_ROLES = ('english', 'phonetic', 'meaning', 'title', 'subtitle', 'footer',
+               'countdown')
+#: The knobs an override may set: what a member edits on the canvas.
+STYLE_KEYS = ('animation', 'bold', 'color', 'draft_size', 'size', 'x', 'y')
+#: Style fields a project override may not set.  The face stays on the existing
+#: resolution chain, so nothing here can substitute a font silently.
+STYLE_FONT_KEYS = ('font', 'font_name')
+_COLOR = re.compile(r'^#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$')
 
 
 def _text(value, name, *, path='', allow_empty=True):
@@ -72,6 +86,111 @@ def _strict(value, name, required, path, optional=()):
         raise SchemaError('%s is missing field(s): %s' % (name, ', '.join(missing)),
                           path=path)
     return value
+
+
+def _style_value(key, value, path):
+    """One style field, validated where it is written and never at render time."""
+    if key == 'bold':
+        if not isinstance(value, bool):
+            raise SchemaError('style bold must be true or false', path=path)
+        return value
+    if key in ('size', 'draft_size'):
+        number = finite_number(value, 'style %s' % key, path=path, positive=True)
+        return number
+    if key in ('x', 'y'):
+        return finite_number(value, 'style %s' % key, path=path)
+    if key == 'color':
+        text = _text(value, 'style color', path=path, allow_empty=False)
+        if not _COLOR.match(text):
+            raise SchemaError('style color must be #RRGGBB or #AARRGGBB, not %r'
+                              % (text,), path=path)
+        return text
+    return _text(value, 'style %s' % key, path=path)
+
+
+@dataclass(frozen=True)
+class StyleOverride:
+    """One style role's project-level override: exactly what the member changed.
+
+    Fields are the editable keys of ``word_video.template.default_styles()``
+    (``STYLE_KEYS``); anything not named here falls back to the default, so an
+    override says "bigger English text" rather than repeating a whole style table.
+    ``font``/``font_name`` are refused on purpose: a face keeps coming from the
+    resolution chain, so a project can never substitute a font silently.
+    """
+
+    role: str
+    fields: tuple = ()
+
+    def __post_init__(self):
+        path = 'style:%s' % self.role if isinstance(self.role, str) else 'style'
+        if self.role not in STYLE_ROLES:
+            raise SchemaError('unknown style role %r' % (self.role,), path=path,
+                              hint='可用样式角色：%s' % '、'.join(STYLE_ROLES))
+        if not isinstance(self.fields, (tuple, list)):
+            raise SchemaError('style fields must be pairs', path=path)
+        normalized = {}
+        for pair in self.fields:
+            try:
+                key, value = pair
+            except (TypeError, ValueError):
+                raise SchemaError('style fields must be (key, value) pairs',
+                                  path=path) from None
+            if key in STYLE_FONT_KEYS:
+                raise SchemaError(
+                    'style %s cannot be set per project' % key, path=path,
+                    hint='字体仍走既有解析链（template.resolve_fonts），不在这里替换')
+            if key not in STYLE_KEYS:
+                raise SchemaError('unknown style field %r' % (key,), path=path,
+                                  hint='可用字段：%s' % '、'.join(STYLE_KEYS))
+            normalized[key] = _style_value(key, value, path)
+        object.__setattr__(self, 'fields',
+                           tuple((key, normalized[key]) for key in sorted(normalized)))
+
+    @property
+    def values(self):
+        return dict(self.fields)
+
+    def get(self, key, default=None):
+        for name, value in self.fields:
+            if name == key:
+                return value
+        return default
+
+    def to_dict(self):
+        return {'role': self.role, 'fields': self.values}
+
+    @classmethod
+    def from_dict(cls, value, path='styles'):
+        if not isinstance(value, dict):
+            raise SchemaError('style override must be an object', path=path)
+        unknown = sorted(set(value) - {'role', 'fields'})
+        if unknown:
+            raise SchemaError('style override has unknown field(s): %s'
+                              % ', '.join(unknown), path=path)
+        if 'role' not in value or 'fields' not in value:
+            raise SchemaError('style override needs role and fields', path=path)
+        fields = value['fields']
+        if not isinstance(fields, dict):
+            raise SchemaError('style fields must be an object', path=path)
+        return cls(role=value['role'], fields=tuple(fields.items()))
+
+
+def style_overrides(styles):
+    """Normalize a ``{role: {field: value}}`` map into sorted overrides."""
+    if styles is None:
+        return ()
+    if hasattr(styles, 'items'):
+        items = styles.items()
+    else:
+        return tuple(sorted(styles, key=lambda item: item.role))
+    return tuple(StyleOverride(role=role, fields=tuple((fields or {}).items()))
+                 for role, fields in sorted(items))
+
+
+def style_table(styles):
+    """``{role: {field: value}}`` for consumers that want a plain mapping."""
+    return {override.role: override.values for override in styles or ()}
 
 
 @dataclass(frozen=True)
@@ -331,6 +450,9 @@ class Project:
     gap_s: float = DEFAULT_GAP_S
     first_six: float = DEFAULT_FIRST_SIX
     extra: float = DEFAULT_EXTRA
+    #: Per-role style overrides (``StyleOverride`` tuples, sorted by role).  Empty
+    #: means "the template defaults", which is what every older document says.
+    styles: tuple = ()
     revision: int = 0
     schema: str = SCHEMA
 
@@ -342,12 +464,17 @@ class Project:
         _text(self.project_id, 'project_id', path='project', allow_empty=False)
         object.__setattr__(self, 'records', tuple(self.records))
         object.__setattr__(self, 'clips', tuple(self.clips))
+        object.__setattr__(self, 'styles', style_overrides(self.styles))
         for name, value in (('records', self.records), ('clips', self.clips)):
             for item in value:
                 expected = Record if name == 'records' else Clip
                 if not isinstance(item, expected):
                     raise SchemaError('%s must contain %s objects'
                                       % (name, expected.__name__), path='project')
+        for override in self.styles:
+            if not isinstance(override, StyleOverride):
+                raise SchemaError('styles must contain StyleOverride objects',
+                                  path='project')
         if self.schema == SCHEMA_V1:
             for clip in self.clips:
                 if clip.is_intro:
@@ -355,6 +482,13 @@ class Project:
                         'schema %s cannot carry an intro layer' % SCHEMA_V1,
                         path='clip:%s' % clip.id,
                         hint='把工程升到 %s（Project.with_schema）后再加片头素材' % SCHEMA)
+        if self.styles and self.schema != SCHEMA:
+            # Same rule as the intro layer: a document states the revision it needs,
+            # and a reader that only knows @2 refuses instead of dropping the styles.
+            raise SchemaError('schema %s cannot carry style overrides' % self.schema,
+                              path='style:%s' % self.styles[0].role,
+                              hint='把工程升到 %s（Project.with_styles 会自动升级）'
+                                   % SCHEMA)
         for name in ('width', 'height', 'sample_rate', 'channels'):
             positive_int(getattr(self, name), name, path='project')
         positive_int(self.fps_num, 'fps numerator', path='project')
@@ -393,6 +527,17 @@ class Project:
                 return clip
         return None
 
+    def style(self, role):
+        """The override for one style role, or ``None`` when it uses the default."""
+        for override in self.styles:
+            if override.role == role:
+                return override
+        return None
+
+    def style_table(self):
+        """``{role: {field: value}}``: what a renderer or a canvas consumes."""
+        return style_table(self.styles)
+
     # -- derived settings ------------------------------------------------
     @property
     def frame_ticks(self):
@@ -418,6 +563,17 @@ class Project:
         """State the document revision explicitly (never silently on save)."""
         return Project(**self._replaced('schema', schema, revision))
 
+    def with_styles(self, styles, *, revision=None):
+        """Replace the style overrides, promoting the document when they appear.
+
+        Same rule as adding an intro layer: a document states the revision its
+        content needs, so no reader ever has to guess what it dropped.
+        """
+        schema = SCHEMA if style_overrides(styles) else self.schema
+        values = self._replaced('styles', style_overrides(styles), revision)
+        values['schema'] = schema
+        return Project(**values)
+
     # -- new revisions ---------------------------------------------------
     def with_clips(self, clips, *, revision=None):
         return Project(**self._replaced('clips', tuple(clips), revision))
@@ -429,7 +585,10 @@ class Project:
         return Project(**self._replaced('clips', self.clips, self.revision + 1))
 
     def _replaced(self, name, value, revision):
-        values = {field: getattr(self, field) for field in self.to_dict()}
+        # Field names, not ``to_dict()`` keys: an optional key that is absent from
+        # the document (styles, for a project that has none) must still be carried
+        # over instead of silently dropped by an edit.
+        values = {field.name: getattr(self, field.name) for field in fields(self)}
         values[name] = value
         values['revision'] = self.revision if revision is None else revision
         return values
@@ -440,7 +599,7 @@ class Project:
                'gap_s', 'first_six', 'extra', 'records', 'clips')
 
     def to_dict(self):
-        return {
+        document = {
             'schema': self.schema,
             'project_id': self.project_id,
             'revision': self.revision,
@@ -460,14 +619,22 @@ class Project:
             'records': [record.to_dict() for record in self.records],
             'clips': [clip.to_dict() for clip in self.clips],
         }
+        if self.styles:
+            # Written only when used: a document without overrides keeps exactly the
+            # fields it had before styles existed, so older ones round-trip byte for
+            # byte and an older reader sees nothing new to refuse.
+            document['styles'] = [override.to_dict() for override in self.styles]
+        return document
 
     @classmethod
     def from_dict(cls, value):
-        _strict(value, 'project', cls._FIELDS, 'project')
+        _strict(value, 'project', cls._FIELDS, 'project', optional=('styles',))
         return cls(
             project_id=value['project_id'],
             records=tuple(Record.from_dict(item, path='project') for item in value['records']),
             clips=tuple(Clip.from_dict(item, path='project') for item in value['clips']),
+            styles=tuple(StyleOverride.from_dict(item)
+                         for item in value.get('styles', ())),
             title=value['title'], footer=value['footer'], width=value['width'],
             height=value['height'], fps_num=value['fps_num'], fps_den=value['fps_den'],
             sample_rate=value['sample_rate'], channels=value['channels'],

@@ -101,7 +101,7 @@ def test_a_v1_document_still_loads_and_solves_identically():
     assert steps(render_plan(loaded, media)) == steps(render_plan(v2, media))
     assert solve(loaded, media).render.total_ticks == solve(v2, media).render.total_ticks
     # A revision we do not know is still refused instead of half-read.
-    document['schema'] = 'wv-project@3'
+    document['schema'] = 'wv-project@4'
     with pytest.raises(SchemaError):
         Project.from_dict(document)
 

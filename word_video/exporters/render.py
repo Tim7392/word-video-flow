@@ -150,7 +150,9 @@ def export_run(project_path, *, output=None, run_name='', background=None,
     # without one keeps the verified engine's reserved-seconds fallback.
     intro_measure = measure_project_intro(project) if project.intro_clip() else None
     solution = solve(project, media, intro_measure)
-    styles, font_paths, font_names = _styles()
+    # Style overrides travel with the plan, so the renderer and the canvas read the
+    # same table (a role the project does not override still follows the default).
+    styles, font_paths, font_names = _styles(solution.render.style_table())
     run_dir = Path(output) / (run_name or ('rev%d' % project.revision))
     # A published batch may be checked by an independent reader that treats every
     # file under the run folder as part of the delivery, so an existing folder is
