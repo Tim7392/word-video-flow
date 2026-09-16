@@ -1,7 +1,10 @@
-"""Application services: edit commands, sessions, template expansion.
+"""Application services: edit commands, sessions, template expansion, batches.
 
-UI (W06) and CLI (W05) both drive these; neither owns a business rule of its own.
+UI (W06), the CLI (W05) and the batch/template work (W08) all drive these; none of
+them owns a business rule of its own.
 """
+from .batches import (BatchPlan, BatchSelection, ExportProfile, Submission,
+                      plan_batch, select_records, submission_for)
 from .commands import (COMMANDS, BindStart, ClearStyle, CommandResult, MoveClip,
                        MoveClips, SPLITTABLE_ROLES, SetMediaSlice, SetStyle,
                        SplitCheck, SplitClip, TrimClip, UnbindStart, apply, can_split)
@@ -11,9 +14,11 @@ from .session import (MODE_ADVANCED, MODE_TEMPLATE, MODES, Session)
 from .styles import merged_styles, style_fonts
 
 __all__ = [
-    'BindStart', 'COMMANDS', 'ClearStyle', 'CommandResult', 'MODE_ADVANCED',
+    'BatchPlan', 'BatchSelection', 'BindStart', 'COMMANDS', 'ClearStyle',
+    'CommandResult', 'ExportProfile', 'MODE_ADVANCED',
     'MODE_TEMPLATE', 'MODES', 'MoveClip', 'MoveClips', 'SPLITTABLE_ROLES', 'Session',
-    'SetMediaSlice', 'SetStyle', 'SplitCheck', 'SplitClip', 'TrimClip', 'UnbindStart',
-    'apply', 'asset_id_for', 'can_split', 'expand', 'instantiate', 'measure_intro',
-    'measure_project_intro', 'merged_styles', 'style_fonts',
+    'SetMediaSlice', 'SetStyle', 'SplitCheck', 'SplitClip', 'Submission', 'TrimClip',
+    'UnbindStart', 'apply', 'asset_id_for', 'can_split', 'expand', 'instantiate',
+    'measure_intro', 'measure_project_intro', 'merged_styles', 'plan_batch',
+    'select_records', 'style_fonts', 'submission_for',
 ]
