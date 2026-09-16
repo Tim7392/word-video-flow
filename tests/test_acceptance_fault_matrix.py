@@ -31,13 +31,23 @@ pytestmark = pytest.mark.acceptance_media
 
 
 @pytest.fixture(scope='session')
-def matrix(good_batch, wordlist, fault_tree, tmp_path_factory):
-    """Run the whole fault matrix once and hand every test the same evidence."""
-    out = tmp_path_factory.mktemp('acceptance-matrix')
-    summary = out / 'matrix.json'
+def matrix(good_batch, wordlist, fault_tree):
+    """Run the whole fault matrix once and hand every test the same evidence.
+
+    The evidence goes to the **stable** directory (``out/reports``), never to
+    pytest's temporary directory: that one is pruned when the session ends, and
+    evidence that disappears cannot be cited in a report.
+    """
+    import time as _time
+
+    from acceptance import gate
+
+    out, warning = gate.evidence_dir()
+    today = _time.strftime('%Y%m%d')
+    summary = out / ('gate-matrix-%s.json' % today)
     command = [sys.executable, str(ACCEPTANCE / 'run_fault_matrix.py'),
                '--good-batch', str(good_batch), '--faults', str(fault_tree),
-               '--wordlist', str(wordlist), '--out', str(out),
+               '--wordlist', str(wordlist), '--out', str(out / ('gate-matrix-out-%s' % today)),
                '--range', '151-200', '--pixels', 'all', '--json', str(summary)]
     result = subprocess.run(command, capture_output=True, cwd=str(ACCEPTANCE))
     text = result.stdout.decode('utf-8', 'replace')
@@ -47,6 +57,8 @@ def matrix(good_batch, wordlist, fault_tree, tmp_path_factory):
     data = json.loads(summary.read_text(encoding='utf-8'))
     data['_stdout'] = text
     data['_runner_exit'] = result.returncode
+    data['_evidence'] = str(summary)
+    data['_warning'] = warning
     return data
 
 

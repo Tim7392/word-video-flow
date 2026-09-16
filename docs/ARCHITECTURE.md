@@ -65,12 +65,16 @@ repo/
 
 | 契约 | 版本/入口 | 说明 |
 |---|---|---|
-| 工程文档 | **`wv-project@2`** | `@1` 原样加载、行为不变；片头是工程里的一层（`intro`），时长**来自媒体**；每角色样式覆盖见 A-6 |
-| 资产登记 | **`wv-assets@1`** | `<工程目录>/assets.json`；`resolve()` 出 `asset_id → 路径 + MediaInfo`；错误码 `MISSING_ASSET`/`DUPLICATE_ASSET`/`ASSET_FILE_MISSING`/`UNKNOWN_DURATION`；无登记表时「id 即路径」兜底 |
+| 工程文档 | **`wv-project@3`** | `@1`/`@2` 原样加载、行为不变；片头是工程里的一层（`intro`），时长**来自媒体**；每角色样式覆盖（`SetStyle/ClearStyle`，**字体不可在工程层替换**）；`SplitClip` 只对 `background` 生效（片头/文字/词角色在**命令层**拒绝） |
+| 资产登记 | **`wv-assets@1`** | `<工程目录>/assets.json`；`resolve()` 出 `asset_id → 路径 + MediaInfo`；错误码 `MISSING_ASSET`/`DUPLICATE_ASSET`/`ASSET_FILE_MISSING`/`UNKNOWN_DURATION`；可选 `voice` 记录字段；无登记表时「id 即路径」兜底 |
 | 音色登记 | **`wv-voices@1`** | 导入的旧配音/音色，带 `status`（仅可复用/可合成/待验证/需剪映操作） |
-| 排版 | `word_video.layout.LayoutSurface` | 预览与 MP4**唯一**排版；坐标 0..1、字号按 `height/2160` 缩放、溢出是数据不是异常 |
-| 三产物入口 | `python -m word_video.exporters` | `project.json` + 目录 → MP4 / 五轨 SRT / 可编辑剪映草稿；**只读计划**，不依赖剪映 GUI |
+| 协调器 | **`wv-coordinator@1`** | 一个工作根一个写者；提交即冻结（收据 = 计划身份+导出配置+修订+输入 sha256）；`staging → 校验 → os.replace → 同事务登记产物`；取消入 `recovery/`；`reconcile` 判 `interrupted`/`partial_failed`（**永不把半成品当成功**）；SQLite 只存 `projects/jobs/receipts/artifacts` |
+| CLI（Agent 入口） | **`wv-cli@1`**，`python -m word_video.cli` | `capabilities/doctor/project/batch plan\|submit/job status\|cancel\|resume\|run/artifacts/receipts/reconcile/watch`；stdout 恒一个 JSON、`watch` 用 NDJSON、缺信息 `NEEDS_INPUT+fixes`、退出码 0/2/1；`batch plan` 不落文件；`voice`/`template` 动作待补 |
+| 排版 | `word_video.layout.LayoutSurface` | 预览与 MP4**唯一**排版；坐标 0..1、字号按 `height/2160` 缩放、溢出是数据不是异常；**消费必须经 `application/styles.py::merged_styles`**（否则会静默丢掉未覆盖角色） |
+| 三产物入口 | `python -m word_video.exporters` | `project.json` + 目录 → MP4 / 五轨 SRT / 可编辑剪映草稿；**只读计划**，不依赖剪映 GUI；多段背景按计划 item 顺序落段，**多段片头明确拒绝** |
 | 朗读文本策略 | `word_video.text_policy` | 默认 `v2`（去词性标记与其连接符、去内嵌音标）；`legacy` 仅用于复现历史批次 |
+| 编辑器 | `python -m desktop`（窗口 + `--import/--open/--export` 脚本化驱动） | 编辑只经 application 命令；画布复用 W04 预览与 `LayoutSurface`；工程文件夹含 `project.json`/`assets.json`/`media.json`（后者在 `voice` 迁移完成后删）/`delivery.json`/`.preview`（代理缓存，跨重启保留） |
+| 成员包 | `out\packages\word-video-member-<ver>` | 双 onedir（CLI console + 编辑器 windowed）+ 包内 ffmpeg + 启动器（无参数进编辑器）+ 清洗环境验收脚本 |
 | 旧线 | `word_video_cli.py`、旧字幕工厂 | 保持可用；旧核心 6 文件逐字节未改，W10 只做子进程适配 |
 
 演进方式：**不做推倒重写**——旧 `timeline.json` 生产链与新工程模型共存，

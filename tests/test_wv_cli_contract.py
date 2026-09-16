@@ -41,7 +41,7 @@ def run_cli(*argv, root=None):
 
 
 def prepare(root, *, project_id='golden'):
-    """A project + registry under the coordinator's own layout."""
+    """A project + registry under the coordinator's own layout, with a picture."""
     from word_video.storage import AssetIndex, AssetRef
     folder = root / 'projects' / project_id
     project = instantiate(DEFAULT_LESSON_TEMPLATE, (golden_record(index=151),), golden_media(),
@@ -51,11 +51,18 @@ def prepare(root, *, project_id='golden'):
     (folder / 'media').mkdir(exist_ok=True)
     for name in ('female', 'male', 'chinese'):
         (folder / 'media' / ('%s.wav' % name)).write_bytes(b'x' * 16)
+    # A delivery background is a *delivery* input, not project content: a batch
+    # without one is refused by name (see `batch submit ... --background`).
+    (folder / 'background.mp4').write_bytes(b'picture')
     AssetIndex.of((AssetRef('w1:female', 'media/female.wav', units=55200),
                    AssetRef('w1:male', 'media/male.wav', units=40800),
                    AssetRef('w1:chinese', 'media/chinese.wav', units=157200)),
                   project_id=project.project_id, folder=str(folder)).save(folder)
     return folder
+
+
+def background(root, project_id='golden'):
+    return str(root / 'projects' / project_id / 'background.mp4')
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +106,58 @@ def test_needs_input_carries_actionable_fixes(tmp_path):
     assert code == 2 and document['error']['code'] == 'NEEDS_INPUT'
 
 
+def test_stdout_is_utf8_even_where_the_console_code_page_cannot_hold_it(tmp_path):
+    """A character the code page lacks must not turn the JSON into a traceback.
+
+    The phonetic field carries IPA (``ˈæpl``), which a GBK console cannot encode:
+    writing it after a successful action would raise *after* the work was done, so
+    the caller would see a crash instead of the answer it asked for.
+    """
+    prepare(tmp_path)
+    project = tmp_path / 'projects' / 'golden' / 'project.json'
+    document = json.loads(project.read_text(encoding='utf-8'))
+    document['records'][0]['word'] = 'ˈæpl'         # U+02C8 is not in GBK
+    project.write_text(json.dumps(document, ensure_ascii=False), encoding='utf-8')
+    program = (
+        'import sys\n'
+        'sys.path.insert(0, sys.argv[1])\n'
+        'from word_video.cli.main import main\n'
+        'raise SystemExit(main(sys.argv[2:]))\n')
+    result = subprocess.run(
+        [sys.executable, '-c', program, str(Path(__file__).resolve().parents[1]),
+         '--root', str(tmp_path), 'project', 'show', '--project', 'golden'],
+        capture_output=True, cwd=str(Path(__file__).resolve().parents[1]))
+    assert result.returncode == 0, result.stderr.decode('utf-8', 'replace')
+    payload = json.loads(result.stdout.decode('utf-8'))     # bytes, not locale text
+    assert payload['result']['records'][0]['word'] == 'ˈæpl'
+
+
+def test_stdout_is_readable_by_a_caller_that_decodes_with_its_own_locale(tmp_path):
+    """The other half of "one JSON object": a plain ``text=True`` caller must get it.
+
+    ``subprocess.run(..., text=True)`` decodes with the *caller's* locale encoding —
+    cp936 on this machine — and UTF-8 Chinese is not decodable there.  The read then
+    fails inside the reader thread, the caller silently gets ``stdout is None`` and
+    "not JSON" instead of a structured refusal, which is exactly how H0's contract tool
+    reported every Chinese-bearing action as a failure.  ASCII-safe output decodes
+    identically under every code page and parses to the same object.
+    """
+    prepare(tmp_path)
+    result = subprocess.run(
+        [sys.executable, '-m', 'word_video.cli', '--root', str(tmp_path),
+         'batch', 'plan', '--project', 'golden', '--batch', '151-151'],
+        capture_output=True, text=True,            # no encoding: the locale decides
+        cwd=str(Path(__file__).resolve().parents[1]))
+    assert result.stdout is not None, 'the caller could not decode stdout at all'
+    payload = json.loads(result.stdout)            # one object, nothing else
+    assert payload['ok'] is True
+    assert payload['result']['ready'] is False
+    # The Chinese the answer carries survived the round trip; only its *bytes* are
+    # escaped, so the object a caller parses is the same one.
+    assert '--background' in ' '.join(payload['result']['delivery_fixes'])
+    assert result.stdout.isascii()
+
+
 # ---------------------------------------------------------------------------
 # Plan writes nothing; submit freezes; receipts are checkable
 # ---------------------------------------------------------------------------
@@ -112,20 +171,59 @@ def test_plan_reports_the_batch_and_writes_nothing(tmp_path):
     assert result['wrote_files'] is False
     assert result['plan']['plan_identity']
     assert result['plan']['total_ticks'] == 3960000
+    # The picture is a delivery input, so the preflight names the miss and hands back
+    # the fix instead of letting a run discover it as PermissionError on the cwd.
+    assert result['ready'] is False
+    assert result['plan']['delivery']['ready'] is False
+    assert [problem['code'] for problem in result['plan']['delivery']['problems']] == \
+        ['BACKGROUND_MISSING']
+    assert '--background' in ' '.join(result['delivery_fixes'])
+
+    with_picture = run_cli('batch', 'plan', '--project', 'golden', '--batch', '151-151',
+                           '--background', background(tmp_path), root=tmp_path)[1]
+    assert with_picture['result']['ready'] is True
+    assert with_picture['result']['delivery_fixes'] == []
     assert sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob('*')) == \
         before
 
 
-def test_submit_status_cancel_and_receipts_through_the_cli(tmp_path):
+def test_submit_without_a_background_is_needs_input_not_internal(tmp_path):
+    """H0's second finding, as a counterexample: a missing picture is a question.
+
+    The empty background used to reach the exporter as ``Path('')`` — the current
+    working directory — and came back as ``PermissionError: [Errno 13]`` on a folder,
+    reported as INTERNAL.  Nothing may be frozen either: the refusal happens before
+    the receipt exists.
+    """
     prepare(tmp_path)
     code, document, _ = run_cli('batch', 'submit', '--project', 'golden', '--batch',
-                                '151-151', '--key', 'cli-1', root=tmp_path)
+                                '151-151', '--key', 'no-picture', root=tmp_path)
+    assert code == 2, document
+    assert document['error']['code'] == 'NEEDS_INPUT'      # not INTERNAL
+    assert '--background' in ' '.join(document['error']['fixes'])
+    assert run_cli('receipts', root=tmp_path)[1]['result']['receipts'] == []
+
+    # A background that is not there is named as itself, not probed as the cwd.
+    code, document, _ = run_cli('batch', 'submit', '--project', 'golden', '--batch',
+                                '151-151', '--key', 'ghost',
+                                '--background', str(tmp_path / 'ghost.mp4'),
+                                root=tmp_path)
+    assert code == 2 and document['error']['code'] == 'NEEDS_INPUT'
+    assert 'ghost.mp4' in json.dumps(document['error'], ensure_ascii=False)
+
+
+def test_submit_status_cancel_and_receipts_through_the_cli(tmp_path):
+    prepare(tmp_path)
+    picture = background(tmp_path)
+    code, document, _ = run_cli('batch', 'submit', '--project', 'golden', '--batch',
+                                '151-151', '--background', picture, '--key', 'cli-1',
+                                root=tmp_path)
     assert code == 0, document
     job = document['result']['job']
     assert document['result']['created'] is True
 
     again = run_cli('batch', 'submit', '--project', 'golden', '--batch', '151-151',
-                    '--key', 'cli-1', root=tmp_path)[1]
+                    '--background', picture, '--key', 'cli-1', root=tmp_path)[1]
     assert again['result']['created'] is False and again['result']['job'] == job
 
     status = run_cli('job', 'status', '--job', job, root=tmp_path)[1]
@@ -139,7 +237,8 @@ def test_submit_status_cancel_and_receipts_through_the_cli(tmp_path):
 
     # Conflicting content under the same key is a conflict, not a new task.
     conflict = run_cli('batch', 'submit', '--project', 'golden', '--batch', '151-151',
-                       '--codec', 'h265', '--key', 'cli-1', root=tmp_path)
+                       '--background', picture, '--codec', 'h265', '--key', 'cli-1',
+                       root=tmp_path)
     assert conflict[0] == 1
     assert conflict[1]['error']['code'] == 'IDEMPOTENCY_CONFLICT'
 
@@ -170,7 +269,8 @@ def test_batch_range_selects_by_word_list_index(tmp_path):
 def test_watch_streams_ndjson_until_the_task_settles(tmp_path):
     prepare(tmp_path)
     job = run_cli('batch', 'submit', '--project', 'golden', '--batch', '151-151',
-                  '--key', 'w', root=tmp_path)[1]['result']['job']
+                  '--background', background(tmp_path), '--key', 'w',
+                  root=tmp_path)[1]['result']['job']
     run_cli('job', 'cancel', '--job', job, root=tmp_path)
     out = io.StringIO()
     code = main(['--root', str(tmp_path), 'watch', '--job', job,
@@ -184,7 +284,8 @@ def test_watch_streams_ndjson_until_the_task_settles(tmp_path):
 def test_reconcile_reports_a_task_a_dead_worker_left_behind(tmp_path):
     prepare(tmp_path)
     job = run_cli('batch', 'submit', '--project', 'golden', '--batch', '151-151',
-                  '--key', 'r', root=tmp_path)[1]['result']['job']
+                  '--background', background(tmp_path), '--key', 'r',
+                  root=tmp_path)[1]['result']['job']
     from word_video.storage.coordinator import connect
     with connect(tmp_path / 'coordinator.sqlite3') as con:
         con.execute("UPDATE jobs SET state='running', phase='rendering' WHERE id=?",

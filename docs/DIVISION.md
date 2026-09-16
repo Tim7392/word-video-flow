@@ -36,6 +36,16 @@ H0 每次派工写清"**为团队成员/Agent 解除什么生产阻塞，做到�
 
 ## 4. 隔离与资源纪律
 
+- **磁盘预算：重跑前先看可用空间（`Get-PSDrive D`），预估不够就先报 H0，不许跑到一半满盘。**
+  2026-09-16 实测过一次：`runtime\tmp` 被各 Agent 的跑批堆到 **37.7GB**、D 盘只剩 **8.85GB**；
+  H0 清掉可重建临时物（A 的 tmp 6.97GB、H0 检查根 1.56GB、out/tim 1.35GB、out/perf* 0.83GB）后回到 **17.3GB**。
+  清理只动"可重建的跑批/临时物"，**正式产物（out/production、out/packages、out/candidates）、
+  证据 JSON（out/reports）、仓库与 worktree 一律不动**。
+- **一个 worktree 同时只允许一个活跃子 Agent（H0 派工前必须确认目标 worktree 没有活跃写者）。**
+  2026-09-16 发生过一次真实事故：H0 把同一份 C-5 同时派给两个子 Agent 且都在 `worktrees\C`，
+  导致同一 worktree 出现两个竞争实现与互相覆盖的文件。处置：裁决唯一 owner、另一方立刻停写、
+  只按显式路径提交各自文件、未跟踪的竞争文件由 H0 处理。**重复/重派同一任务前，先确认旧 Agent 已结束。**
+- **提交一律按显式路径 `git add <paths>`；禁止 `git add -A` / `git add -u`**（会把别人的未跟踪文件卷进提交）。
 - 每个子 Agent 独立 worktree + 私有 tmp；同一套锁定依赖只由 H0 改。
 - 共用 venv 时禁止并发 editable 安装/依赖更新；从当前 worktree 显式加载源码。
 - 合并后 QA 在集成目录复跑，不能只相信各分支测试。

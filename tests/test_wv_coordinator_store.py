@@ -9,7 +9,14 @@ cancelling publishes nothing; and a worker that was killed is reconciled to
 
 A fake runner stands in for the renderer: the acceptance is about coordination, and
 the real one is already covered by B's exporter tests.  It writes a video, a SRT and
-a draft name into the staging folder, exactly where the real one puts them.
+a draft name into the **run folder** — the folder the run is published from, which
+is what keeps the absolute paths a real exporter writes inside its own documents
+(``complete.json``, ``timeline.json``) valid after the run is published.
+
+A delivery also needs a background file (H0's review): the profile check that
+refuses one without it is here, because "no picture" used to reach the exporter as
+an empty path, i.e. the current working directory, and came back as
+``PermissionError`` on a folder.
 """
 from dataclasses import replace
 import json
@@ -20,11 +27,11 @@ import pytest
 from test_wv_project_golden import golden_base, golden_media, golden_project, golden_record
 
 from word_video.application import MoveClip, apply, instantiate
-from word_video.application.batches import (BatchSelection, ExportProfile, plan_batch,
-                                           submission_for)
+from word_video.application.batches import (BatchSelection, ExportProfile,
+                                           check_delivery, plan_batch, submission_for)
 from word_video.domain import DEFAULT_LESSON_TEMPLATE, StaleRevisionError
 from word_video.storage import AssetIndex, AssetRef, save_project
-from word_video.storage.coordinator import (RECOVERY_DIR, Coordinator,
+from word_video.storage.coordinator import (RECOVERY_DIR, RUNS_DIR, Coordinator,
                                             IdempotencyConflict, InputChanged,
                                             JobStateError, NeedsInput,
                                             cleanup_partial, connect, fingerprint)
@@ -46,21 +53,47 @@ def build_project(folder, *, revision=0):
         media.parent.mkdir(parents=True, exist_ok=True)
         media.write_bytes(b'x' * 32)
     index.save(folder)
+    background_file(folder)
     return project, index
 
 
-def fake_runner(submission, staging, checkpoint):
-    """Stand in for the real export: three artifacts, correct shape, no ffmpeg."""
-    staging = Path(staging)
-    staging.mkdir(parents=True, exist_ok=True)
-    (staging / 'video').mkdir(exist_ok=True)
-    (staging / 'srt').mkdir(exist_ok=True)
-    (staging / 'editable-draft').mkdir(exist_ok=True)
-    (staging / 'video' / 'video.mp4').write_bytes(b'video')
-    (staging / 'srt' / '0151-0153_01_英文重复.srt').write_text('1\n', encoding='utf-8')
-    (staging / 'editable-draft' / 'draft_content.json').write_text('{}', encoding='utf-8')
+def background_file(folder):
+    """The delivery background a batch needs: a file, not project content."""
+    path = folder / 'background.mp4'
+    path.write_bytes(b'not really a video, but a readable file')
+    return path
+
+
+def _background(root, project_id='golden'):
+    return root / 'projects' / project_id / 'background.mp4'
+
+
+def fake_runner(submission, run_dir, checkpoint):
+    """Stand in for the real export: three artifacts, correct shape, no ffmpeg.
+
+    It writes the paths a real run carries into ``timeline.json``/``complete.json``
+    — absolute, pointing inside its own folder — so a publication step that moved
+    the folder afterwards would leave them dangling (the defect this file pins).
+    """
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / 'video').mkdir(exist_ok=True)
+    (run_dir / 'srt').mkdir(exist_ok=True)
+    (run_dir / 'editable-draft').mkdir(exist_ok=True)
+    (run_dir / 'video' / 'video.mp4').write_bytes(b'video')
+    (run_dir / 'background.mp4').write_bytes(b'looped background, as a split one is')
+    (run_dir / 'srt' / '0151-0153_01_英文重复.srt').write_text('1\n', encoding='utf-8')
+    (run_dir / 'editable-draft' / 'draft_content.json').write_text(
+        json.dumps({'references': [str(run_dir / 'video' / 'video.mp4')]}),
+        encoding='utf-8')
+    (run_dir / 'timeline.json').write_text(
+        json.dumps({'background': str(run_dir / 'background.mp4')}), encoding='utf-8')
     checkpoint()
-    return {'staged': str(staging)}
+    recorded = run_dir / 'complete.json'
+    recorded.write_text(json.dumps({'files': [
+        {'path': str(path)} for path in sorted(run_dir.rglob('*'))
+        if path.is_file()]}), encoding='utf-8')
+    return {'run_dir': str(run_dir)}
 
 
 @pytest.fixture
@@ -79,10 +112,11 @@ def submission_for_project(root, project_id='golden'):
     folder = root / 'projects' / project_id
     project = Coordinator(root).load_project(project_id)
     index = AssetIndex.load(folder)
+    background = folder / 'background.mp4'
     plan = plan_batch(project, index.media_map(), BatchSelection(),
-                      ExportProfile(background=''))
+                      ExportProfile(background=str(background)))
     return submission_for(plan, (str(folder / 'project.json'),
-                                str(folder / 'assets.json')))
+                                str(folder / 'assets.json'), str(background)))
 
 
 # ---------------------------------------------------------------------------
@@ -144,8 +178,9 @@ def test_the_same_key_with_different_content_is_a_conflict(coordinator, root):
     submission = submission_for_project(root)
     coordinator.submit(submission, 'batch-151-153')
     changed = submission_for_project(root)
-    changed = replace(changed, plan=replace(changed.plan,
-                                            profile=ExportProfile(video_codec='h265')))
+    changed = replace(changed, plan=replace(
+        changed.plan, profile=ExportProfile(background=str(_background(root)),
+                                            video_codec='h265')))
     with pytest.raises(IdempotencyConflict) as error:
         coordinator.submit(changed, 'batch-151-153')
     assert error.value.code == 'IDEMPOTENCY_CONFLICT'
@@ -171,10 +206,41 @@ def test_retrying_a_finished_task_does_nothing(coordinator, root):
     assert finished['state'] == 'succeeded'
     published = [item['path'] for item in finished['artifacts']]
     assert published and all(Path(path).is_file() for path in published)
+    before = sorted(str(path.relative_to(root)) for path in root.rglob('*'))
     again = coordinator.run(job)
     assert again['state'] == 'succeeded'
     assert [item['path'] for item in again['artifacts']] == published
-    assert not list((root / 'staging').iterdir())    # nothing new was staged
+    assert sorted(str(path.relative_to(root)) for path in root.rglob('*')) == before
+
+
+def test_a_published_run_keeps_the_paths_it_wrote_inside_its_own_folder(coordinator, root):
+    """The defect H0 caught: a delivery whose internal paths were left dangling.
+
+    A real exporter writes absolute paths into ``complete.json``/``timeline.json``/
+    the draft's resource references.  Publishing by renaming a staging folder leaves
+    every one of them pointing at a folder that no longer exists, so the run must be
+    exported where it will be published.
+    """
+    build_project(root / 'projects' / 'golden')
+    job = coordinator.submit(submission_for_project(root), 'k')['job']
+    finished = coordinator.run(job)
+    assert finished['state'] == 'succeeded'
+    run_dir = root / RUNS_DIR / job
+    assert run_dir.is_dir() and 'staging' not in str(run_dir)
+    assert not (root / 'staging').exists()
+    # Every path the run's own documents carry still resolves.
+    for name in ('complete.json', 'timeline.json',
+                 'editable-draft/draft_content.json'):
+        document = json.loads((run_dir / name).read_text(encoding='utf-8'))
+        paths = [item['path'] for item in document.get('files', [])] \
+            or document.get('references', []) or [document['background']]
+        assert paths, name
+        missing = [path for path in paths if not Path(path).exists()]
+        assert not missing, (name, missing)
+        assert all(str(run_dir) in path for path in paths), (name, paths)
+    # And the recorded artifacts are the same files, at the same place.
+    assert {item['path'] for item in finished['artifacts']} == \
+        {str(path) for path in run_dir.rglob('*') if path.is_file()}
 
 
 # ---------------------------------------------------------------------------
@@ -219,12 +285,12 @@ def test_cancelling_before_the_run_publishes_nothing(coordinator, root):
             coordinator.control(job, 'nonsense')
 
 
-def test_cancelling_during_the_run_recovers_the_staging(coordinator, root):
+def test_cancelling_during_the_run_recovers_the_unfinished_run(coordinator, root):
     build_project(root / 'projects' / 'golden')
     job = coordinator.submit(submission_for_project(root), 'k')['job']
 
-    def cancelling_runner(submission, staging, checkpoint):
-        fake_runner(submission, staging, lambda: None)
+    def cancelling_runner(submission, run_dir, checkpoint):
+        fake_runner(submission, run_dir, lambda: None)
         coordinator.cancel(job)                    # asked for while it was rendering
         checkpoint()                               # stops the run here
         return {}
@@ -232,7 +298,7 @@ def test_cancelling_during_the_run_recovers_the_staging(coordinator, root):
     coordinator.runner = cancelling_runner
     stopped = coordinator.run(job)
     assert stopped['state'] == 'cancelled'
-    assert not (root / 'runs' / job).exists()
+    assert not (root / RUNS_DIR / job).exists()
     assert coordinator.artifacts(job)['published'] is False
     assert list((root / RECOVERY_DIR).iterdir())   # kept as evidence, not published
 
@@ -241,10 +307,10 @@ def test_a_killed_worker_is_reconciled_to_interrupted(coordinator, root):
     build_project(root / 'projects' / 'golden')
     job = coordinator.submit(submission_for_project(root), 'k')['job']
     # A worker that died between "running" and any publish: the row says running,
-    # the lock is free, and there is a half-written staging folder.
-    staging = root / 'staging' / job
-    (staging / 'video').mkdir(parents=True, exist_ok=True)
-    (staging / 'video' / 'video.mp4').write_bytes(b'half')
+    # the lock is free, and its run folder holds a half-written export.
+    run_dir = root / RUNS_DIR / job
+    (run_dir / 'video').mkdir(parents=True, exist_ok=True)
+    (run_dir / 'video' / 'video.mp4').write_bytes(b'half')
     with connect(coordinator.db) as con:
         con.execute("UPDATE jobs SET state='running', phase='rendering' WHERE id=?",
                     (job,))
@@ -252,9 +318,73 @@ def test_a_killed_worker_is_reconciled_to_interrupted(coordinator, root):
     assert job in report['interrupted']
     assert coordinator.status(job)['state'] == 'interrupted'
     assert coordinator.artifacts(job)['published'] is False
+    # ``runs/`` holds deliveries: cleanup moves the unfinished folder to recovery.
     moved = cleanup_partial(root)
-    assert moved and not (root / 'staging' / job).exists()
+    assert moved and not run_dir.exists()
     assert list((root / RECOVERY_DIR).iterdir())
+    assert coordinator.cleanup() == []              # idempotent: nothing left behind
+
+
+def test_cleanup_keeps_a_published_run_and_moves_a_stranger(coordinator, root):
+    build_project(root / 'projects' / 'golden')
+    job = coordinator.submit(submission_for_project(root), 'k')['job']
+    assert coordinator.run(job)['state'] == 'succeeded'
+    stranger = root / RUNS_DIR / 'wv-not-in-the-database'
+    (stranger / 'video').mkdir(parents=True)
+    (stranger / 'video' / 'video.mp4').write_bytes(b'x')
+    moved = coordinator.cleanup()
+    assert (root / RUNS_DIR / job).is_dir()          # a delivery stays where it is
+    assert not stranger.exists()                     # nothing can be shown to be one
+    assert len(moved) == 1
+
+
+# ---------------------------------------------------------------------------
+# 4b. A delivery without a picture is refused by name, not by cwd
+# ---------------------------------------------------------------------------
+def test_a_batch_without_a_background_is_refused_with_fixes(coordinator, root):
+    build_project(root / 'projects' / 'golden')
+    folder = root / 'projects' / 'golden'
+    project = coordinator.load_project('golden')
+    index = AssetIndex.load(folder)
+    plan = plan_batch(project, index.media_map(), BatchSelection(), ExportProfile())
+    assert plan.ok                                    # the lesson solves fine
+    assert plan.ready is False
+    assert [problem.code for problem in plan.delivery.problems] == \
+        ['BACKGROUND_MISSING']
+    assert plan.delivery.fixes and '--background' in ' '.join(plan.delivery.fixes)
+
+    with pytest.raises(NeedsInput) as error:
+        coordinator.submit(submission_for(plan, ()), 'k')
+    assert error.value.code == 'NEEDS_INPUT'
+    assert '--background' in ' '.join(error.value.fixes)
+
+    # A background path that does not exist is named too, rather than probed as cwd.
+    missing = plan_batch(project, index.media_map(), BatchSelection(),
+                         ExportProfile(background=str(folder / 'ghost.mp4')))
+    assert [problem.code for problem in missing.delivery.problems] == \
+        ['BACKGROUND_FILE_MISSING']
+    assert str(folder / 'ghost.mp4') in missing.delivery.problems[0].message
+
+    # And the deliveries it *can* accept are the ones with a readable file.
+    assert check_delivery(ExportProfile(
+        background=str(background_file(folder)))).ready is True
+
+
+def test_a_submission_frozen_before_the_delivery_check_is_refused_at_run(coordinator,
+                                                                        root):
+    """The backstop H0 asked for: no INTERNAL, no PermissionError on the cwd."""
+    build_project(root / 'projects' / 'golden')
+    job = coordinator.submit(submission_for_project(root), 'k')['job']
+    with connect(coordinator.db) as con:
+        row = con.execute('SELECT submission FROM jobs WHERE id=?', (job,)).fetchone()
+        document = json.loads(row['submission'])
+        document['plan'].pop('delivery')              # as an older build froze it
+        con.execute('UPDATE jobs SET submission=? WHERE id=?',
+                    (json.dumps(document), job))
+    with pytest.raises(NeedsInput) as error:
+        coordinator.run(job)
+    assert '--background' in ' '.join(error.value.fixes)
+    assert not (root / RUNS_DIR / job).exists()
 
 
 def test_a_published_task_whose_artifacts_vanish_is_not_success(coordinator, root):
@@ -304,7 +434,7 @@ def test_the_coordinator_database_holds_tasks_receipts_and_artifacts(coordinator
                                                  'receipts'}
     assert [(row['state'], row['phase'], row['control']) for row in jobs] == \
         [('succeeded', 'done', 'run')]
-    assert artifacts == 3
+    assert artifacts == 6            # video, background, srt, draft, timeline, complete
     # The project itself is *not* duplicated into the database: project.json stays
     # the one editable truth.
     assert json.loads((root / 'projects' / 'golden' / 'project.json')

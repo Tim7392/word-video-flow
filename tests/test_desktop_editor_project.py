@@ -92,7 +92,8 @@ def test_a_request_becomes_a_folder_with_no_hand_written_json(area):
     folder = import_request(request_path, target)
 
     assert folder.project_path.is_file()
-    assert folder.catalog_path.is_file()
+    assert folder.assets_path.is_file()
+    assert not folder.catalog_path.exists(), '编辑器只写一份资产文档（assets.json）'
     assert folder.delivery_path.is_file()
     assert len(folder.project.records) == 3
     assert len(folder.project.clips) == 21                  # 3 words x 6 + 3 layers
@@ -110,16 +111,22 @@ def test_a_request_becomes_a_folder_with_no_hand_written_json(area):
     assert folder.diagnostics(folder.project) == ()
 
 
-def test_the_intro_window_is_the_picture_and_a_cut_lands_inside_it(area):
+def test_the_intro_window_is_the_picture_not_the_audio_packet_count(area):
     """Counterexample for a real measurement trap, kept as a regression.
 
     The reference countdown is a MOV whose audio is AAC.  ``catalog.measure``
     prefers the audio stream and trusts ``nb_frames``, which for a packetised codec
-    is the **packet** count: video.py's 1.856 s / 89 088-sample track came back as
-    88 "samples" (1.8 ms), and a source window built from that is 1000x too short -
-    ``SplitClip`` then refuses every cut as outside the window.  The editor builds
-    the intro's window from the measured *picture* instead, in milliseconds, and the
-    delivery is untouched because the exporter measures the intro from the plan.
+    is the **packet** count: the 1.856 s / 89 088-sample track came back as 88
+    "samples" (1.8 ms), so a source window built from it is 1000x too short and every
+    trim or cut on that layer would describe media that is not there.  The editor
+    builds the intro's window from the measured *picture* instead, in milliseconds,
+    and the delivery is untouched because the exporter measures the intro from the
+    plan.
+
+    The countdown can no longer be *cut* (A's rule: the intro is the one countdown
+    stage, so ``can_split`` refuses it and ``SplitClip`` refuses it too), so the
+    "a cut lands inside the window" half of this regression now lives in the
+    background test; the window assertion - the part this trap is about - stays here.
     """
     import json as json_module
     _, tones = assets_of(area, count=3)
@@ -134,35 +141,33 @@ def test_the_intro_window_is_the_picture_and_a_cut_lands_inside_it(area):
 
     assert clip.source.unit_den == 1000                      # a picture grid, not audio
     assert clip.source.source_units == pytest.approx(1000, abs=40)   # ~1.0 s of it
+    assert clip.source.source_units > 900                    # not 88 packets
     state = EditorState(folder.project, media=folder.media_table(),
                         intro=folder.intro_measurement(), path=folder.project_path)
     assert state.plan() is not None and state.cues_error is None
-    outcome = state.split_at_ticks(clip.id, clip.duration_ticks // 2)
-    assert outcome.changed is True, [notice.code for notice in outcome.notices]
-    halves = [item for item in state.project.clips if item.role == 'intro']
-    assert [item.id for item in halves] == ['layer.intro', 'layer.intro.2']
-    assert halves[0].source.source_end < halves[1].source.source_start + 1
-    assert halves[0].duration_ticks + halves[1].duration_ticks == clip.duration_ticks
-    # And the two halves still cover the file: contiguous source windows, no media
-    # invented and none dropped.
-    assert halves[0].source.source_start == 0
-    assert halves[1].source.source_end == clip.source.source_end
+    assert state.plan().intro_item.end_ticks == clip.duration_ticks
 
 
 def test_a_split_background_is_deliverable_and_a_split_intro_is_not(area):
     """B-5 draws every background piece; the countdown stays single by design.
 
-    The two halves of acceptance item 3 for the two splittable layers: a cut
-    background must **not** be blocked (one segment per piece, each looping inside
-    its own stage), and a cut intro must be refused with the clip named - because
-    the exporter would otherwise reject it after a render.
+    Two rules, both asserted here because they are the two halves of acceptance
+    item 3 for the splittable layers:
+
+    * a cut **background** is not blocked (B-5 delivers one segment per piece, each
+      looping inside its own stage) - and the cut really happens through A's command;
+    * a cut **intro** is refused by the delivery gate.  The countdown cannot even be
+      cut any more (A's ``can_split`` refuses the role), so the state is *constructed*
+      here instead: this is what keeps the gate a tested safety net rather than dead
+      code, and it also documents that the gate is the second line of defence behind
+      A's command-layer refusal.
     """
     from dataclasses import replace
     from word_video.application import expand
     from word_video.domain.compile import IntroMeasurement
     from word_video.domain.lesson import DEFAULT_LESSON_TEMPLATE
     from word_video.domain.model import MediaSlice, Project
-    from word_video.exporters.catalog import Asset
+    from word_video.domain.timebase import TimeExpr
     from word_video.storage.assets import AssetRef
 
     folder, state = tiny_state(area / 'project')
@@ -204,7 +209,23 @@ def test_a_split_background_is_deliverable_and_a_split_intro_is_not(area):
     background_clip = next(clip for clip in project.clips if clip.role == 'background')
     intro_clip = project.intro_clip()
     assert state.split_check(background_clip.id).ok is True
-    assert state.split_check(intro_clip.id).ok is True
+    # The countdown is refused *before the fact*, with a reason and the clip named.
+    intro_check = state.split_check(intro_clip.id)
+    assert intro_check.ok is False
+    assert intro_check.code == 'SPLIT_NOT_APPLICABLE'
+    assert 'countdown' in intro_check.reason
+    before = {clip.id: (clip.start.to_dict(), clip.duration_ticks)
+              for clip in project.clips}
+    revision_before = state.revision
+    refused = state.split_at_ticks(intro_clip.id, intro_clip.duration_ticks // 2)
+    assert refused.changed is False
+    assert [notice.code for notice in refused.notices] == ['SPLIT_NOT_APPLICABLE']
+    assert refused.notices[0].clip_id == intro_clip.id
+    assert refused.notices[0].role == 'intro'
+    # Refused with no side effect at all: A's command never touched the document.
+    assert state.revision == revision_before
+    assert {clip.id: (clip.start.to_dict(), clip.duration_ticks)
+            for clip in state.project.clips} == before
 
     cut_background = state.split_at_ticks(background_clip.id,
                                           background_clip.duration_ticks // 2)
@@ -215,17 +236,30 @@ def test_a_split_background_is_deliverable_and_a_split_intro_is_not(area):
     assert blocking_notices(folder, state.project) == ()
     assert state.cues_error is None
 
-    cut_intro = state.split_at_ticks(intro_clip.id, intro_clip.duration_ticks // 2)
-    assert cut_intro.changed is True, [n.code for n in cut_intro.notices]
-    blockers = blocking_notices(folder, state.project)
+    # The delivery gate is the *second* line of defence, so it is exercised on a
+    # document that A's command could no longer produce: a project carrying two
+    # intro clips.  Built directly - not by splitting - or the gate would be dead
+    # code that nothing tests.
+    twin = replace(intro_clip, id='layer.intro.2',
+                   start=TimeExpr.at(intro_clip.duration_ticks))
+    split_project = state.project.with_clips(state.project.clips + (twin,))
+    blockers = blocking_notices(folder, split_project)
     assert [notice.code for notice in blockers] == ['SPLIT_INTRO_NOT_EXPORTABLE']
-    assert blockers[0].clip_id == 'layer.intro.2' or blockers[0].clip_id == 'layer.intro'
+    assert blockers[0].clip_id == 'layer.intro.2'
     assert '片头不支持拆分' in blockers[0].message
     assert notices.ACTION_UNDO in [action.kind for action in blockers[0].actions]
+    # The gate blocks the *delivery* only: the document is still a document - it
+    # saves, reopens and keeps its two intro pieces.
+    folder.save_project(split_project)
+    reopened = ProjectFolder.open(folder.path)
+    assert len([clip for clip in reopened.project.clips if clip.role == 'intro']) == 2
+    assert reopened.project.revision == split_project.revision
 
-    # Undoing the intro cut makes the project deliverable again, background cut and all.
-    state.undo()
+    # And a project with the countdown in one piece stays deliverable, background cut
+    # and all - the gate is about the intro, not about having edited anything.
+    folder.save_project(state.project)
     assert blocking_notices(folder, state.project) == ()
+    assert state.cues_error is None
     assert len([clip for clip in state.project.clips if clip.role == 'background']) == 2
 
 
@@ -281,6 +315,30 @@ def test_a_missing_voice_file_fails_the_import_with_the_path_named(area):
     with pytest.raises(CatalogError) as error:
         import_request(request_path, area / 'project')
     assert 'w2:male' in str(error.value)
+
+
+def test_an_imported_project_records_the_voice_of_every_reading_asset(area):
+    """The voice travels from the request into the registry (H0's import finding).
+
+    Without it an imported project recorded **no** voice at all, so the delivery
+    pre-check - "a reading stage made from existing audio must have its voice recorded"
+    - could never be satisfied by a project the editor itself had just created: the loop
+    H0 spent a morning in, with a repair command that led back to the same refusal.
+    """
+    import json
+
+    _, tones = assets_of(area, count=3)
+    request_path, request = write_request(area, tones=tones)
+    folder = import_request(request_path, area / 'project')
+
+    wanted = {('w%d:%s' % (item['index'], item['role'])): item['voice']
+              for item in request['provider']['items']}
+    assert len(wanted) == 9 and all(wanted.values())
+    registry = json.loads(folder.assets_path.read_text(encoding='utf-8'))
+    stored = {row['asset_id']: row.get('voice', '') for row in registry['assets']}
+    assert {key: stored.get(key, '') for key in wanted} == wanted
+    # The folder agrees, which is what the repair UI and the exporter read.
+    assert {key: folder.voices.get(key, '') for key in wanted} == wanted
 
 
 def test_the_document_is_written_before_the_rest_of_the_folder(area):
@@ -366,15 +424,20 @@ def test_a_project_without_a_registry_opens_and_says_so(area):
                for notice in found)
 
 
-def test_both_registries_name_the_same_file_after_every_write(area):
-    """A's ``assets.json`` and B's ``media.json`` are two formats, one list.
+def test_assets_json_is_the_only_opinion_about_the_assets(area):
+    """One registry names an asset, and its voice lives *in* it.
 
-    The exporter reads ``media.json`` today, so the editor writes both from the
-    same ``AssetRef`` list; this is the guard that says the bridge has not drifted.
+    The bridge this test used to guard wrote ``assets.json`` **and** ``media.json``
+    from one ref list.  The exporter reads the registry first, so the second file was
+    one writer away from drifting and the voice was the field that only existed there.
+    Now there is one document: this asserts that after a re-point and after a voice is
+    recorded, ``media.json`` is not written at all and the exporter - which reads
+    ``assets.json`` first - finds the path *and* the voice in the same entry.
     """
     folder, state = tiny_state(area / 'project')
     ok, differences = assets_agree(area / 'project')
     assert ok, differences
+    assert not folder.catalog_path.exists(), '编辑器不该再写第二份资产文档'
 
     replacement = write_tone(area / 'other.wav', 1.0, 640.0)
     folder.set_asset_file('w1:male', str(replacement))
@@ -385,10 +448,57 @@ def test_both_registries_name_the_same_file_after_every_write(area):
     folder.set_voice('w1:male', 'BV504_streaming')
     ok, differences = assets_agree(area / 'project')
     assert ok, differences
-    from word_video.exporters.catalog import load_catalog
-    assert load_catalog(area / 'project')['w1:male'].voice == 'BV504_streaming'
-    # And the exporter's own reader sees the file the registry names.
-    assert load_catalog(area / 'project')['w1:male'].path == str(replacement)
+    assert not folder.catalog_path.exists()
+    # The exporter's own reader sees the file and the voice the registry names.
+    from word_video.exporters import render
+    entries, _, from_registry = render._asset_source(area / 'project')
+    assert from_registry is True
+    assert entries['w1:male'].path == str(replacement)
+    assert entries['w1:male'].voice == 'BV504_streaming'
+    # Reopening and saving again still writes one document.
+    again = ProjectFolder.open(area / 'project')
+    again.save_assets()
+    assert not again.catalog_path.exists()
+    ok, differences = assets_agree(area / 'project')
+    assert ok, differences
+
+
+def test_a_pre_registry_project_keeps_the_fallback_and_migrates_on_save(area):
+    """B's fallback reads a catalogue-only folder, and the first save adopts it.
+
+    A project written before the registry existed has ``project.json`` and
+    ``media.json`` only.  The exporter must keep working (that is B's documented
+    fallback, ``from_registry=False``), and the editor must not break it by writing an
+    empty registry next to it: the catalogue's entries and voices are adopted **and
+    measured** on the next save, because a registry entry without a measurement is a
+    refusal (``UNKNOWN_DURATION``) where the fallback used to measure the file itself.
+    """
+    from word_video.exporters import render
+    from word_video.exporters.catalog import Asset, save_catalog
+
+    folder, state = tiny_state(area / 'project')
+    voices = {asset_id: 'BV%d_streaming' % (500 + index)
+              for index, asset_id in enumerate(sorted(folder.refs))}
+    # The folder a pre-registry build left behind: a catalogue and no registry.
+    save_catalog({asset_id: Asset(asset_id=asset_id, path=ref.path, voice=voices[asset_id])
+                  for asset_id, ref in folder.refs.items()}, folder.path)
+    folder.assets_path.unlink()
+
+    ok, differences = assets_agree(area / 'project')  # 旧工程：目录就是唯一真相
+    assert ok, differences
+    entries, _, from_registry = render._asset_source(area / 'project')
+    assert from_registry is False and set(entries) == set(voices)
+
+    reopened = ProjectFolder.open(area / 'project')
+    reopened.measure()
+    reopened.save_assets()                           # 编辑器写一次：目录被并进登记表
+    entries, _, from_registry = render._asset_source(area / 'project')
+    assert from_registry is True
+    assert set(entries) == set(voices), '旧目录里的资产不能因为删桥而丢失'
+    assert {asset_id: entry.voice for asset_id, entry in entries.items()} == voices
+    assert all(entry.path == folder.refs[asset_id].path for asset_id, entry in entries.items())
+    ok, differences = assets_agree(area / 'project')
+    assert ok, ('迁移后两份文档一致，且音色已在登记表里', differences)
 
 
 def test_a_missing_delivery_file_is_reported_in_the_delivery_panel(area):

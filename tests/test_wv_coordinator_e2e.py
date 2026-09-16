@@ -78,6 +78,7 @@ def test_a_real_batch_runs_through_the_coordinator_and_publishes(project):
     plan = plan_batch(loaded, index.media_map(), BatchSelection(record_ids=('w152',)),
                       ExportProfile(background=str(background)))
     assert plan.ok, [problem.message for problem in plan.problems]
+    assert plan.delivery.ready, plan.delivery.to_dict()
     submission = submission_for(plan, (str(folder / 'project.json'),
                                        str(folder / 'assets.json'), str(background)))
     job = coordinator.submit(submission, 'e2e-152')['job']
@@ -96,3 +97,32 @@ def test_a_real_batch_runs_through_the_coordinator_and_publishes(project):
     receipt = coordinator.receipts()[0]
     assert receipt['plan_identity'] == plan.plan_identity
     assert receipt['idempotency_key'] == 'e2e-152'
+    # H0's red line: every path the delivery's own documents carry must resolve, and
+    # none of them may name a folder the run no longer lives in.
+    run_dir = root / 'runs' / job
+    checked = 0
+    for name in ('complete.json', 'timeline.json',
+                 'editable-draft/draft_content.json'):
+        document = json.loads((run_dir / name).read_text(encoding='utf-8'))
+        found = [item['path'] for item in document.get('files', [])]
+        if not found:                       # timeline/draft carry paths, not a file list
+            found = _paths_in(document)
+        assert found, name
+        assert all(Path(path).exists() for path in found), name
+        assert not [path for path in found if 'staging' in path], name
+        checked += len(found)
+    assert checked > 40                    # 43 files in H0's own run; not a smoke test
+
+
+def _paths_in(value):
+    """Every path-shaped string in a JSON document, whatever its shape."""
+    found = []
+    if isinstance(value, dict):
+        for item in value.values():
+            found.extend(_paths_in(item))
+    elif isinstance(value, list):
+        for item in value:
+            found.extend(_paths_in(item))
+    elif isinstance(value, str) and len(value) > 3 and value[1:3] == ':\\':
+        found.append(value)
+    return found

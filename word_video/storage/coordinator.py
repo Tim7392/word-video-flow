@@ -25,7 +25,6 @@ Design rules, in the order they matter:
 from contextlib import contextmanager
 from dataclasses import dataclass
 import json
-import os
 from pathlib import Path
 import shutil
 import sqlite3
@@ -157,18 +156,24 @@ def fingerprint(paths):
     return tuple(found)
 
 
-def default_runner(submission, staging, checkpoint):
-    """Produce the three deliverables into ``staging/<job>`` (the real pipeline).
+def default_runner(submission, run_dir, checkpoint):
+    """Produce the three deliverables **in the folder the run is published from**.
 
-    ``staging`` is the directory the run may create and fill; the coordinator moves
-    it into ``runs/`` only after the artifacts verify, so a kill cannot leave a
-    half-written run looking published.
+    The exporter writes absolute paths into its own documents (``complete.json``,
+    ``timeline.json``, the draft's resource references), and an independent checker
+    reads those paths.  So the run is exported straight into ``runs/<job>``: every
+    path it writes is final the moment it is written, and there is no rename step
+    that could leave a delivery pointing at a folder that no longer exists.
+
+    ``run_dir`` is the folder the run may create and fill; "unverified" is expressed
+    by the job state and by ``complete.json`` being written last, and an unfinished
+    folder is moved to ``recovery/`` rather than published.
     """
     from ..exporters import export_run
     plan = submission.plan
     project_dir = Path(submission.project_folder)
-    result = export_run(str(project_dir), output=str(Path(staging).parent),
-                        run_name=Path(staging).name,
+    result = export_run(str(project_dir), output=str(Path(run_dir).parent),
+                        run_name=Path(run_dir).name,
                         background=plan.profile.background or None,
                         video_codec=plan.profile.video_codec,
                         slices=plan.profile.slices)
@@ -189,6 +194,7 @@ class Coordinator:
         return self.root / PROJECTS_DIR / str(project_id)
 
     def staging_folder(self, job_id):
+        """The pre-fix staging location, kept so old leftovers can be recovered."""
         return self.root / STAGING_DIR / job_id
 
     def run_folder(self, job_id):
@@ -273,6 +279,35 @@ class Coordinator:
         path = folder / ASSETS_FILENAME
         return AssetIndex.load(folder) if path.is_file() else None
 
+    def create_instance(self, project, registry=None, *, replace_edits=False):
+        """Write one package's own project instance: its document and its registry.
+
+        A batch package gets its own instance so that packages share no mutable
+        state.  An instance a member has already edited (its stored revision is not
+        0) is **not** overwritten by a re-plan: those edits are the member's work,
+        and the caller has to say so explicitly (``replace_edits``) or keep them.
+        """
+        if not isinstance(project, Project):
+            raise SchemaError('an instance needs a Project', path='project')
+        folder = self.project_folder(project.project_id)
+        if not replace_edits:
+            stored = self._stored_document(project.project_id)
+            if stored is not None and int(stored.get('revision', 0) or 0) != 0:
+                raise NeedsInput(
+                    'instance %s has member edits (revision %s)'
+                    % (project.project_id, stored.get('revision')), path='batch',
+                    fixes=['保留这个实例（不改它的词/时间），只重跑它的作业',
+                           '或明确用 replace_edits 重建实例（会丢掉手改）'])
+        self.save_project(project)
+        if registry is not None:
+            registry.with_folder(folder).save(folder)
+        return folder
+
+    def instance_revision(self, project_id):
+        """The stored revision of an instance, or ``None`` when there is none."""
+        stored = self._stored_document(project_id)
+        return None if stored is None else int(stored.get('revision', 0) or 0)
+
     # -- submissions -----------------------------------------------------
     def submit(self, submission, idempotency_key):
         """Freeze one submission under a key; the same key and content is the same job.
@@ -286,6 +321,7 @@ class Coordinator:
         if not key:
             raise NeedsInput('submit needs an idempotency key', path='submit',
                              fixes=['加 --key <stable-name>（同一批活重试时复用同一个键）'])
+        self._require_delivery(submission.plan, fresh=True)
         digest = submission.digest()
         inputs = fingerprint(submission.input_paths)
         with connect(self.db) as con:
@@ -322,6 +358,31 @@ class Coordinator:
         with connect(self.db) as con:
             rows = con.execute('SELECT * FROM receipts ORDER BY created').fetchall()
         return [dict(row) for row in rows]
+
+    @staticmethod
+    def _require_delivery(plan, *, fresh=False):
+        """Refuse a batch whose delivery the run cannot produce a picture for.
+
+        The rule lives in :func:`word_video.application.batches.check_delivery`, and
+        both ends of the job use it: ``submit`` re-probes the profile before freezing
+        (``fresh``), and ``run`` reads the verdict frozen with the submission — a
+        submission frozen before this check existed carries no verdict, which is also
+        a refusal, with the same fixes.  A background that vanished *after* the
+        submission was accepted is not this check's business: the input fingerprints
+        report it as a changed input.
+        """
+        from ..application.batches import check_delivery
+        delivery = check_delivery(plan.profile) if fresh else plan.delivery
+        if delivery.ready:
+            return
+        problems = [problem.message for problem in delivery.problems]
+        fixes = list(delivery.fixes)
+        if not fixes:
+            from ..application.batches import BACKGROUND_FIXES
+            fixes = list(BACKGROUND_FIXES)
+        raise NeedsInput('this batch has no deliverable picture: %s'
+                         % ('; '.join(problems) or 'no background file'), path='submit',
+                         fixes=fixes)
 
     # -- task state ------------------------------------------------------
     def status(self, job_id):
@@ -387,9 +448,47 @@ class Coordinator:
                 'published': job['state'] == 'succeeded',
                 'artifacts': job['artifacts']}
 
+    def requeue(self, job_id):
+        """Put a delivery that no longer verifies back in the queue, ready to run again.
+
+        ``partial_failed`` means "this was published and the delivery is not there any
+        more" (``reconcile`` decides that from the recorded paths).  Retrying it is the
+        only repair, and the retry must not merge with what is left: the recorded
+        artifacts are dropped, whatever is left in the run folder moves to
+        ``recovery/``, and the job goes back to ``queued`` with its frozen submission —
+        the inputs it was accepted with — untouched.
+
+        A ``succeeded`` job is refused by name: re-running a delivery that verifies is
+        not a repair, it is a second delivery, and that is a new submission.  A job that
+        never ran is refused too: ``resume``/``run`` already handle those.
+        """
+        job = self.status(job_id)
+        if job['state'] != 'partial_failed':
+            raise JobStateError(
+                'task %s is %s, not partial_failed' % (job_id, job['state']),
+                path='job:%s' % job_id,
+                hint='只有"曾发布但产物已损坏/缺失"的任务需要重新排队；'
+                     '没跑过的用 job run，已成功的要改动就提交新任务')
+        folder = self.run_folder(job_id)
+        if folder.exists():
+            self._recover(folder, job_id)
+        with connect(self.db) as con:
+            con.execute('DELETE FROM artifacts WHERE job_id=?', (job_id,))
+        self._set(job_id, state='queued', phase='submitted', control='run', error=None)
+        return self.status(job_id)
+
     # -- running ---------------------------------------------------------
     def run(self, job_id, *, limit_seconds=None):
-        """Execute one queued task: verify inputs, render to staging, verify, publish."""
+        """Execute one queued task: verify inputs, export into the run folder, verify.
+
+        The export target is the **final** folder (``runs/<job>``) rather than a
+        staging folder that is renamed afterwards: the exporter writes absolute paths
+        into the documents a delivery carries (``complete.json``, ``timeline.json``,
+        the draft's resource references), so a rename would leave every one of them
+        pointing at a folder that no longer exists.  What "not verified yet" means is
+        the job state plus ``complete.json`` being written last; anything unfinished
+        is moved to ``recovery/`` instead of being published.
+        """
         with job_lock(self.db, 'job.' + job_id):
             job = self.status(job_id)
             if job['state'] in ('succeeded', 'partial_failed'):
@@ -399,25 +498,26 @@ class Coordinator:
             if job['control'] == 'cancel':
                 self._set(job_id, state='cancelled', phase='done')
                 return self.status(job_id)
+            self._require_delivery(_PlanView(job['submission']))
             self._set(job_id, state='running', phase='preparing', error=None)
             try:
                 self._check_inputs(job)
-                staging = self.staging_folder(job_id)
-                if staging.exists():
-                    # A previous attempt left a half-written run: move it aside, never
-                    # merge with it.
-                    self._recover(staging, job_id)
+                target = self.run_folder(job_id)
+                if target.exists():
+                    # A previous attempt left something here: move it aside, never
+                    # merge with it (the exporter refuses a non-empty run folder too).
+                    self._recover(target, job_id)
                 self._set(job_id, phase='rendering')
                 submission = _SubmissionView(
                     job, self.project_folder(job['submission'].get('plan', {})
                                              .get('project_id', '')))
                 try:
-                    result = self.runner(submission, staging,
+                    result = self.runner(submission, target,
                                          lambda: self._checkpoint(job_id))
                 except _Cancelled:
                     # Control changed at a checkpoint: keep the half-run as evidence
                     # and publish nothing.
-                    self._recover(staging, job_id)
+                    self._recover(target, job_id)
                     if self.status(job_id)['control'] == 'cancel':
                         self._set(job_id, state='cancelled', phase='done')
                     else:
@@ -425,30 +525,18 @@ class Coordinator:
                     return self.status(job_id)
                 current = self.status(job_id)
                 if current['control'] == 'cancel':
-                    self._recover(staging, job_id)
+                    self._recover(target, job_id)
                     self._set(job_id, state='cancelled', phase='done')
                     return self.status(job_id)
                 self._set(job_id, phase='verifying')
-                staged, problems = self._verify(staging)
+                staged, problems = self._verify(target)
                 if problems:
-                    self._recover(staging, job_id)
+                    self._recover(target, job_id)
                     self._set(job_id, state='partial_failed', phase='done',
                               error='; '.join(problems)[:1500])
                     return self.status(job_id)
                 self._set(job_id, phase='publishing')
-                published = self.run_folder(job_id)
-                published.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(staging, published)
-                with connect(self.db) as con:
-                    for item in staged:
-                        # Recorded *after* the move, under the published path: a
-                        # receipt that pointed into staging would stop verifying the
-                        # moment the run was published.
-                        path = published / item['relative']
-                        con.execute('INSERT INTO artifacts (job_id,path,sha256,kind,'
-                                    'published) VALUES (?,?,?,?,?)',
-                                    (job_id, str(path), item['sha256'], item['kind'],
-                                     _now()))
+                self._publish(target, job_id, staged)
                 self._set(job_id, state='succeeded', phase='done',
                           result=json.dumps(result, ensure_ascii=False))
                 return self.status(job_id)
@@ -458,6 +546,19 @@ class Coordinator:
                 self._set(job_id, state='failed', phase='done',
                           error=str(error)[:1500])
                 raise
+
+    def _publish(self, run_dir, job_id, staged):
+        """Record what the verified run holds, under the paths it will keep.
+
+        Nothing is added to the run folder here: ``complete.json`` covers every file
+        in it, so a receipt written inside would make that record wrong.
+        """
+        with connect(self.db) as con:
+            for item in staged:
+                con.execute('INSERT INTO artifacts (job_id,path,sha256,kind,'
+                            'published) VALUES (?,?,?,?,?)',
+                            (job_id, str(Path(run_dir) / item['relative']),
+                             item['sha256'], item['kind'], _now()))
 
     def _checkpoint(self, job_id):
         job = self.status(job_id)
@@ -481,9 +582,9 @@ class Coordinator:
     def _verify(self, staging):
         """Every staged artifact must exist; report paths *relative* to the run.
 
-        Relative paths are what make the artifact receipt survive publication: the
-        run folder is moved from ``staging/`` to ``runs/`` after this check, and a
-        receipt that named the staging path would stop verifying at that moment.
+        Relative paths keep the receipt readable independently of where the run
+        folder is; the run lives at its final path already (:meth:`run`), so the
+        absolute path in the database is the one the delivery itself carries.
         """
         staging = Path(staging)
         if not staging.is_dir():
@@ -498,12 +599,43 @@ class Coordinator:
                 problems.append('missing %s in the run' % name)
         return staged, problems
 
-    def _recover(self, staging, job_id):
+    def _recover(self, folder, job_id):
         """Move an unfinished run aside; it is evidence, not a delivery."""
-        if not Path(staging).exists():
+        if not Path(folder).exists():
             return
         target = self._mkdir(self.root / RECOVERY_DIR)
-        Path(staging).rename(target / ('%s-%s' % (job_id, uuid.uuid4().hex[:8])))
+        Path(folder).rename(target / ('%s-%s' % (job_id, uuid.uuid4().hex[:8])))
+
+    def cleanup(self):
+        """Move every unfinished run folder (and pre-fix ``staging/`` leftover) aside.
+
+        ``runs/`` is where deliveries live, so a folder for a task that never reached
+        ``succeeded`` is moved to ``recovery/`` — including the one a killed worker
+        left in the run folder.  A job id the database does not know is treated as
+        unfinished too: nothing without a state can be shown to be a delivery.
+        """
+        with connect(self.db) as con:
+            states = {row['id']: row['state']
+                      for row in con.execute('SELECT id, state FROM jobs')}
+        recovery = self._mkdir(self.root / RECOVERY_DIR)
+        moved = []
+        for folder in self._leftovers():
+            job_id = folder.name
+            if states.get(job_id) == 'succeeded':
+                continue
+            target = recovery / ('%s-%s' % (job_id, uuid.uuid4().hex[:8]))
+            shutil.move(str(folder), str(target))
+            moved.append(str(target))
+        return moved
+
+    def _leftovers(self):
+        """Folders that may hold an unfinished run, oldest layout first."""
+        found = []
+        for name in (STAGING_DIR, RUNS_DIR):
+            folder = self.root / name
+            if folder.is_dir():
+                found.extend(sorted(item for item in folder.iterdir() if item.is_dir()))
+        return found
 
     def reconcile(self):
         """Say what happened to tasks a killed process left behind.
@@ -579,18 +711,33 @@ class _PlanView:
             'background': profile.get('background', ''),
             'video_codec': profile.get('video_codec', 'h264'),
             'slices': profile.get('slices')})()
+        # A submission frozen before the delivery check existed carries no verdict,
+        # and a run has to refuse it with the same fixes a fresh plan would offer.
+        self.delivery = _DeliveryView(plan.get('delivery') or {})
+
+
+class _DeliveryView:
+    """The delivery verdict as it was frozen with the submission."""
+
+    def __init__(self, document):
+        self.ready = bool(document.get('ready'))
+        self.background = document.get('background', '')
+        self.problems = [_ProblemView(item)
+                         for item in document.get('problems') or ()
+                         if isinstance(item, dict)]
+        self.fixes = tuple(document.get('fixes') or ())
+
+
+class _ProblemView:
+    def __init__(self, document):
+        self.message = str(document.get('message', ''))
+        self.code = str(document.get('code', ''))
 
 
 def cleanup_partial(root):
-    """Move every leftover staging folder into ``recovery/`` (best effort)."""
-    staging = Path(root) / STAGING_DIR
-    if not staging.is_dir():
-        return []
-    recovery = Path(root) / RECOVERY_DIR
-    recovery.mkdir(parents=True, exist_ok=True)
-    moved = []
-    for folder in sorted(staging.iterdir()):
-        target = recovery / (folder.name + '-' + uuid.uuid4().hex[:8])
-        shutil.move(str(folder), str(target))
-        moved.append(str(target))
-    return moved
+    """Move every folder an unfinished run left behind into ``recovery/``.
+
+    Covers both the pre-fix ``staging/`` leftovers and unfinished run folders: a
+    delivery only lives in ``runs/`` once it has been verified.
+    """
+    return Coordinator(root).cleanup()
