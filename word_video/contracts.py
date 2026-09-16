@@ -2,6 +2,8 @@
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from .text_policy import ALL_POLICIES, DEFAULT_POLICY
+
 ROLES = ('female', 'male', 'chinese')
 DISPLAY_TRACKS = ('english', 'phonetic', 'meaning')
 
@@ -40,6 +42,11 @@ class LessonSpec:
     first_six: float = 0.4
     extra: float = 0.2
     gap_s: float = 0.1  # Before speed conversion.
+    # How the reading text of the Chinese stage was derived from the display
+    # meaning: 'v2' (approved cleaning, the default), 'legacy' (reproduce a
+    # delivered batch) or 'supplied' (the request carried its own reading text,
+    # so nothing was re-derived).  Only the derived reading field is affected.
+    spoken_policy: str = DEFAULT_POLICY
     background: str = ''
     intro_audio: str = ''
     # Reference intro clips: {"video": path, "audio": path}.  The audio length
@@ -77,6 +84,9 @@ class TimelineManifest:
     audio: list[dict[str, Any]]
     # Each audio: word_index, role, text, voice, path, start_frame, duration_frames.
     # duration_frames reserves the whole stage. Both exporters pad trailing silence.
+    # Provenance of the reading text: one of text_policy.ALL_POLICIES.  An empty
+    # string means the manifest predates the field, so nothing is claimed about it.
+    spoken_policy: str = ''
 
     def to_dict(self):
         return asdict(self)
@@ -85,4 +95,10 @@ class TimelineManifest:
     def from_dict(cls, value):
         if value.get('schema_version') != 1:
             raise ValueError('Unsupported timeline schema')
+        unknown = set(value) - set(cls.__dataclass_fields__)
+        if unknown:
+            raise ValueError('Unknown timeline field(s): %s' % ', '.join(sorted(unknown)))
+        policy = value.get('spoken_policy', '')
+        if policy and policy not in ALL_POLICIES:
+            raise ValueError('Unknown spoken_policy %r' % (policy,))
         return cls(**value)
