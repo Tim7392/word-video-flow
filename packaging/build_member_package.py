@@ -4,16 +4,32 @@ What it produces (one folder, copied to a member machine as-is):
 
     word-video-member-<version>/
       WordVideo/                PyInstaller onedir build of word_video_cli.py
+      WordVideoEditor/          PyInstaller onedir build of desktop/__main__.py (Qt window)
       ffmpeg/ffmpeg.exe         ffmpeg + ffprobe copied from the development machine
       ffmpeg/ffprobe.exe
-      单词视频.cmd               launcher: package-internal TEMP, PATH gains only ffmpeg
+      单词视频.cmd               launcher: opens the editor, or the CLI when given arguments
       README-成员使用.md
       VERSION.txt               version, build time, source commit, file count/size
 
-The entry point stays the existing headless CLI, so argv and the single-JSON
+Two executables, one engine
+---------------------------
+The member's route is the window (``WordVideoEditor.exe``) and the agent's route is
+the headless JSON CLI (``WordVideo.exe``); both are built from the same sources, the
+same staged runtime data and the same exclusion list, differing only in the entry
+script and in Qt.  They are two builds rather than one dispatcher because the two
+routes need opposite Windows subsystems - a windowed executable has no console at all
+(so a member never sees a black window they must not close), while the CLI's whole
+contract is one JSON line on stdout, which a windowed build cannot produce.  The
+price is one extra copy of the runtime next to the shared ffmpeg; a single build
+would have to hide a console window or re-attach stdout with ctypes to fake the
+other subsystem, and that is exactly the silent difference this package refuses.
+
+The CLI entry point stays the existing headless CLI, so argv and the single-JSON
 stdout contract are unchanged.  The only frozen-mode difference (the worker argv
 that ``word_video_cli.py start`` injects through ``sys.executable``) is handled
-by ``packaging/pyi_rth_cli_argv.py``; production code is not touched.
+by ``packaging/pyi_rth_cli_argv.py``; production code is not touched.  The editor
+never re-enters itself as a subprocess (B's exporter runs in-process), so its build
+needs no runtime hook.
 
 Run it with the locked interpreter - it needs ``-m PyInstaller`` from that venv:
 
@@ -43,6 +59,9 @@ from pathlib import Path
 
 APP_DIR = 'WordVideo'
 APP_EXE = 'WordVideo.exe'
+EDITOR_DIR = 'WordVideoEditor'
+EDITOR_EXE = 'WordVideoEditor.exe'
+EDITOR_ENTRY = 'desktop/__main__.py'
 FFMPEG_DIR = 'ffmpeg'
 FFMPEG_TOOLS = ('ffmpeg.exe', 'ffprobe.exe')
 ENTRY_SCRIPT = 'word_video_cli.py'
@@ -62,6 +81,14 @@ FIXTURE_NAME = 'p1-无片头.json'
 #: imaging / test stacks would only inflate it.
 EXCLUDED_MODULES = ('uiautomation', 'comtypes', 'pyautogui', 'PyQt5', 'PyQt6', 'PySide2',
                     'PySide6', 'numpy', 'PIL', 'imageio', 'pytest', '_pytest')
+
+#: The editor build keeps every exclusion above except Qt itself, which is the one
+#: thing it adds.  Same module set on purpose: two executables in one package must
+#: not measure, lay out or deliver differently - the layout takes a documented
+#: estimate-only path when PIL is absent (``word_video/layout/metrics.py``), and a
+#: GUI that shipped PIL while the CLI did not would publish a slightly different
+#: caption box from the same project.
+EDITOR_EXCLUDED_MODULES = tuple(name for name in EXCLUDED_MODULES if name != 'PySide6')
 
 #: Files that must never ship.  Suffix list first, header bytes second: an
 #: extension can lie, a file header cannot.
@@ -240,22 +267,49 @@ def stage_build_data(tmp_root, jyd_source, mediainfo_dll):
 
 
 def pyinstaller_command(root, hook, jyd_dir, media_dir, dist, work, spec, python=None):
+    """The headless CLI build: console subsystem, worker-argv hook, no Qt."""
+    root = Path(root)
+    return _pyinstaller_command(
+        root, name=APP_DIR, entry=root / ENTRY_SCRIPT, windowed=False, hook=hook,
+        jyd_dir=jyd_dir, media_dir=media_dir, dist=dist, work=work, spec=spec,
+        excludes=EXCLUDED_MODULES, python=python)
+
+
+def editor_pyinstaller_command(root, jyd_dir, media_dir, dist, work, spec, python=None):
+    """The editor build: same sources and data, windowed, with Qt and no hook."""
+    root = Path(root)
+    return _pyinstaller_command(
+        root, name=EDITOR_DIR, entry=root / EDITOR_ENTRY, windowed=True, hook=None,
+        jyd_dir=jyd_dir, media_dir=media_dir, dist=dist, work=work, spec=spec,
+        excludes=EDITOR_EXCLUDED_MODULES, python=python)
+
+
+def _pyinstaller_command(root, *, name, entry, windowed, hook, jyd_dir, media_dir, dist,
+                         work, spec, excludes, python=None):
+    """One PyInstaller invocation; the only difference between the two is the mode.
+
+    ``--windowed`` is what a member's editor needs (no console window they could
+    close by accident) and what the CLI must never be (its contract is one JSON line
+    on stdout, which a process without a console cannot write).
+    """
     root = Path(root)
     command = [str(python or sys.executable), '-m', 'PyInstaller',
-               '--noconfirm', '--onedir', '--console', '--noupx',
-               '--name', APP_DIR,
+               '--noconfirm', '--onedir', '--windowed' if windowed else '--console',
+               '--noupx',
+               '--name', name,
                '--distpath', str(dist), '--workpath', str(work), '--specpath', str(spec),
-               '--paths', str(root),
-               '--runtime-hook', str(hook),
-               '--copy-metadata', JYD_PACKAGE,
-               '--add-data', '%s%s%s' % (jyd_dir, os.pathsep, JYD_PACKAGE),
-               '--add-data', '%s%spymediainfo' % (media_dir, os.pathsep),
-               '--hidden-import', 'pymediainfo',
-               '--hidden-import', 'docx',
-               '--collect-submodules', 'docx']
-    for name in EXCLUDED_MODULES:
-        command += ['--exclude-module', name]
-    command.append(str(root / ENTRY_SCRIPT))
+               '--paths', str(root)]
+    if hook is not None:
+        command += ['--runtime-hook', str(hook)]
+    command += ['--copy-metadata', JYD_PACKAGE,
+                '--add-data', '%s%s%s' % (jyd_dir, os.pathsep, JYD_PACKAGE),
+                '--add-data', '%s%spymediainfo' % (media_dir, os.pathsep),
+                '--hidden-import', 'pymediainfo',
+                '--hidden-import', 'docx',
+                '--collect-submodules', 'docx']
+    for name_ in excludes:
+        command += ['--exclude-module', name_]
+    command.append(str(entry))
     return command
 
 
@@ -266,6 +320,15 @@ def package_layout_problems(package):
                 '%s/%s' % (FFMPEG_DIR, FFMPEG_TOOLS[0]),
                 '%s/%s' % (FFMPEG_DIR, FFMPEG_TOOLS[1]),
                 LAUNCHER_NAME, README_NAME, VERSION_NAME]
+    return [item for item in required if not (package / item).is_file()]
+
+
+def editor_layout_problems(package):
+    """The editor half of the same rule, kept separate so each list stays exact."""
+    package = Path(package)
+    required = ['%s/%s' % (EDITOR_DIR, EDITOR_EXE),
+                '%s/_internal/PySide6/QtCore.pyd' % EDITOR_DIR,
+                '%s/_internal/PySide6/plugins/platforms/qoffscreen.dll' % EDITOR_DIR]
     return [item for item in required if not (package / item).is_file()]
 
 
@@ -432,10 +495,15 @@ def render_version(facts, file_count, byte_count):
              'built_with=%s' % facts['built_with'],
              'entry=%s (existing headless JSON CLI; argv and stdout contract unchanged)'
              % ENTRY_SCRIPT,
+             'editor=%s (PyInstaller windowed; menu import/export, and the same window '
+             'driven by --import/--into/--export/--report)' % EDITOR_ENTRY,
+             'launcher_default=%s with no arguments opens the editor; any other argument '
+             'is passed to the CLI' % LAUNCHER_NAME,
              'member_requirements=none (no Python, no FFmpeg, no PATH change)',
              'temp=%PKG%\\temp unless WORD_VIDEO_TEMP is set',
-             'layout=%s/ (PyInstaller onedir), %s/, %s, %s, %s'
-             % (APP_DIR, FFMPEG_DIR, LAUNCHER_NAME, README_NAME, VERSION_NAME)]
+             'layout=%s/ (PyInstaller onedir), %s/ (PyInstaller onedir, windowed), '
+             '%s/, %s, %s, %s'
+             % (APP_DIR, EDITOR_DIR, FFMPEG_DIR, LAUNCHER_NAME, README_NAME, VERSION_NAME)]
     lines += ['%s=%s' % item for item in sorted(facts['tools'].items())]
     lines += ['content_scan=%s errors=%d warnings=%d (every file except %s itself)'
               % (facts['scan']['result'], facts['scan']['errors'], facts['scan']['warnings'],
@@ -522,7 +590,8 @@ def build(args):
     launcher_template = Path('packaging') / 'launcher' / LAUNCHER_NAME
     readme_template = Path('packaging') / README_NAME
     hook_source = Path('packaging') / RUNTIME_HOOK
-    for relative in (Path(ENTRY_SCRIPT), hook_source, launcher_template, readme_template):
+    for relative in (Path(ENTRY_SCRIPT), Path(EDITOR_ENTRY), hook_source, launcher_template,
+                     readme_template):
         if not (root / relative).is_file():
             raise SystemExit('missing source file: %s' % (root / relative))
     ffmpeg_dir = Path(args.ffmpeg_dir).resolve() if args.ffmpeg_dir else default_ffmpeg_dir()
@@ -554,43 +623,65 @@ def build(args):
     dist, work, spec = tmp_root / 'dist', tmp_root / 'work', tmp_root / 'spec'
     if args.clean:
         shutil.rmtree(work, ignore_errors=True)
-    command = pyinstaller_command(root, root / hook_source,
-                                  data['jyd'], data['media'], dist, work, spec)
-    note('running: %s' % ' '.join(command[:6] + ['...']))
     environment = dict(os.environ)
     environment['PYINSTALLER_CONFIG_DIR'] = str(tmp_root / 'pyinstaller-config')
-    result = subprocess.run(command, cwd=str(root), env=environment, capture_output=True,
-                            text=True, encoding='utf-8', errors='replace')
-    pyi_log = tmp_root / 'pyinstaller.log'
-    pyi_log.write_text(result.stdout + result.stderr, encoding='utf-8')
-    if result.returncode:
-        print('\n'.join((result.stdout + result.stderr).splitlines()[-40:]), file=sys.stderr)
-        raise SystemExit('PyInstaller failed (%d); full log: %s' % (result.returncode, pyi_log))
-    warn_file = work / APP_DIR / ('warn-%s.txt' % APP_DIR)
-    unresolved = [line for line in warn_file.read_text(encoding='utf-8', errors='replace').splitlines()
-                  if line.startswith('missing module named')] if warn_file.is_file() else []
-    note('PyInstaller done (%d modules it could not find; log %s)' % (len(unresolved), pyi_log))
-    built_app = dist / APP_DIR
-    if not (built_app / APP_EXE).is_file():
-        raise SystemExit('PyInstaller produced no %s in %s' % (APP_EXE, built_app))
-    shutil.move(str(built_app), str(stage / APP_DIR))
+
+    runs = (
+        ('CLI', APP_DIR, APP_EXE,
+         pyinstaller_command(root, root / hook_source, data['jyd'], data['media'],
+                             dist, work, spec),
+         ('_internal/%s/__init__.py' % JYD_PACKAGE,
+          '_internal/pymediainfo/%s' % MEDIAINFO_DLL,
+          '_internal/pyjianyingdraft-0.3.0.dist-info/METADATA')),
+        ('editor', EDITOR_DIR, EDITOR_EXE,
+         editor_pyinstaller_command(root, data['jyd'], data['media'], dist, work, spec),
+         ('_internal/%s/__init__.py' % JYD_PACKAGE,
+          '_internal/pymediainfo/%s' % MEDIAINFO_DLL,
+          '_internal/PySide6/QtCore.pyd',
+          '_internal/PySide6/plugins/platforms/qoffscreen.dll')),
+    )
+    unresolved = 0
+    for label, app_dir, exe, command, required_files in runs:
+        note('running PyInstaller for the %s: %s ...' % (label, ' '.join(command[3:8])))
+        result = subprocess.run(command, cwd=str(root), env=environment, capture_output=True,
+                                text=True, encoding='utf-8', errors='replace')
+        pyi_log = tmp_root / ('pyinstaller-%s.log' % app_dir)
+        pyi_log.write_text(result.stdout + result.stderr, encoding='utf-8')
+        if result.returncode:
+            print('\n'.join((result.stdout + result.stderr).splitlines()[-40:]), file=sys.stderr)
+            raise SystemExit('PyInstaller failed for the %s (%d); full log: %s'
+                             % (label, result.returncode, pyi_log))
+        warn_file = work / app_dir / ('warn-%s.txt' % app_dir)
+        missing_here = [line for line in
+                        warn_file.read_text(encoding='utf-8', errors='replace').splitlines()
+                        if line.startswith('missing module named')] if warn_file.is_file() else []
+        unresolved += len(missing_here)
+        note('PyInstaller done for the %s (%d modules it could not find; log %s)'
+             % (label, len(missing_here), pyi_log.name))
+        built_app = dist / app_dir
+        if not (built_app / exe).is_file():
+            raise SystemExit('PyInstaller produced no %s in %s' % (exe, built_app))
+        if (stage / app_dir).exists():
+            shutil.rmtree(stage / app_dir)
+        shutil.move(str(built_app), str(stage / app_dir))
+        frozen = stage / app_dir
+        for item in required_files:
+            if not (frozen / item).is_file():
+                raise SystemExit('frozen %s is missing %s' % (label, item))
+        note('%s layout and runtime data verified' % label)
 
     layout_missing = [item for item in package_layout_problems(stage)
                       if item not in (VERSION_NAME, README_NAME)]
+    layout_missing += editor_layout_problems(stage)
     if layout_missing:
         raise SystemExit('PyInstaller output is incomplete: missing %s' % ', '.join(layout_missing))
-    frozen = stage / APP_DIR
-    for required in ('_internal/%s/__init__.py' % JYD_PACKAGE,
-                     '_internal/pymediainfo/%s' % MEDIAINFO_DLL,
-                     '_internal/pyjianyingdraft-0.3.0.dist-info/METADATA'):
-        if not (frozen / required).is_file():
-            raise SystemExit('frozen app is missing %s' % required)
-    note('layout and runtime data verified')
 
     facts = {'version': version,
              'built': datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %z'),
-             'built_with': 'CPython %s / PyInstaller %s'
-                           % (sys.version.split()[0], importlib.metadata.version('PyInstaller')),
+             'built_with': 'CPython %s / PyInstaller %s / PySide6 %s'
+                           % (sys.version.split()[0],
+                              importlib.metadata.version('PyInstaller'),
+                              importlib.metadata.version('PySide6')),
              'tools': {'ffmpeg_version': ffmpeg_version(ffmpeg_dir / 'ffmpeg.exe'),
                        'ffmpeg_sha256': sha256_file(ffmpeg_dir / 'ffmpeg.exe'),
                        'ffprobe_sha256': sha256_file(ffmpeg_dir / 'ffprobe.exe'),
@@ -614,7 +705,7 @@ def build(args):
             scan['evidence']['files'], scan['evidence']['bytes']))
 
     write_version_file(stage, facts)
-    layout_missing = package_layout_problems(stage)
+    layout_missing = package_layout_problems(stage) + editor_layout_problems(stage)
     if layout_missing:
         raise SystemExit('staged package is incomplete: missing %s' % ', '.join(layout_missing))
 
@@ -636,8 +727,9 @@ def build(args):
     return {'ok': not scan['errors'], 'published': not scan['errors'],
             'package': str(location), 'version': version,
             'files': count, 'bytes': size, 'seconds': round(time.monotonic() - started, 1),
-            'pyinstaller_missing_modules': len(unresolved),
-            'pyinstaller_warn_file': str(warn_file), 'pyinstaller_log': str(pyi_log),
+            'pyinstaller_missing_modules': unresolved,
+            'pyinstaller_logs': [str(tmp_root / ('pyinstaller-%s.log' % app_dir))
+                                 for _, app_dir, _, _, _ in runs],
             'scan': scan, 'steps': steps}
 
 
@@ -662,7 +754,7 @@ def main(argv=None):
                                         for name in SECRET_ENV_NAMES],
                             dev_markers=dev_markers(root))
         scan['result'] = 'PASS' if not scan['errors'] else 'FAIL'
-        scan['layout_missing'] = package_layout_problems(package)
+        scan['layout_missing'] = package_layout_problems(package) + editor_layout_problems(package)
         scan['ok'] = scan['result'] == 'PASS' and not scan['layout_missing']
         print(json.dumps(scan, ensure_ascii=False, indent=1))
         return 0 if scan['ok'] else 1

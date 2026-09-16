@@ -11,17 +11,25 @@ for every later package (W10 update/rollback included) instead of being retyped:
      folder, and the job is submitted and started through the packaged launcher.
      The engine starts its worker with ``sys.executable``, so a completed job is
      also the proof that the packaged worker process starts and holds the job lock.
-  3. Both steps run with a fresh ``--db`` inside the scratch folder, and the
+  3. **The editor**, which is what a member actually opens: the launcher with no
+     arguments must start ``WordVideoEditor.exe`` (the windowed build) and leave it
+     running, and the same launcher driven with ``--editor --import ... --export
+     --report ...`` must deliver the three products *through the window*.  The
+     published folder is then handed to the independent checker
+     ``tests/acceptance/accept_range.py --cleaning v2 --pixels all``, because the
+     editor approving its own output is not evidence.
+  4. Both steps run with a fresh ``--db`` inside the scratch folder, and the
      packaged ffprobe re-reads the produced MP4.
 
 Usage (locked interpreter; it only *drives* the package, it never runs the app):
 
     & <work root>\\runtime\\venv\\Scripts\\python.exe packaging\\verify_member_package.py `
-        --package <work root>\\out\\packages\\word-video-member-0.1.0
+        --package <work root>\\out\\packages\\word-video-member-0.3.0
 
 Evidence JSON goes to stdout; progress goes to stderr.
 """
 import argparse
+import csv
 import hashlib
 import importlib.util
 import json
@@ -35,9 +43,14 @@ from pathlib import Path
 
 LAUNCHER_NAME = '单词视频.cmd'
 APP_DIR = 'WordVideo'
+EDITOR_DIR = 'WordVideoEditor'
+EDITOR_EXE = 'WordVideoEditor.exe'
 FFMPEG_DIR = 'ffmpeg'
 FFPROBE = '%s/%s' % (FFMPEG_DIR, 'ffprobe.exe')
 FIXTURE_NAME = 'p1-无片头.json'
+GUI_FIXTURE_NAME = 'p1-有片头.json'
+GUI_WORDS = (151, 153)
+CHECKER = 'tests/acceptance/accept_range.py'
 SRT_TRACKS = ('_01_英文重复.srt', '_02_英文单次.srt', '_03_音标.srt',
               '_04_中文带词性.srt', '_05_中文无词性.srt')
 
@@ -104,25 +117,41 @@ def clean_environment(scratch, system_root=r'C:\Windows'):
     return environment, environment_provenance
 
 
-def run_launcher(package, arguments, environment, timeout=300):
-    """One CLI call through the packaged launcher; stdout must be exactly one JSON."""
+def run_command(package, arguments, environment, timeout=300):
+    """One call through the packaged launcher; raw result, no contract assumed.
+
+    The CLI route's contract (exactly one JSON line on stdout) is checked by
+    :func:`run_launcher`, which builds on this.  The editor's route deliberately
+    writes nothing to stdout - a windowed build has no console - so it needs the
+    same driver without the stdout rule.
+    """
     package = Path(package)
-    command = [environment['ComSpec'], '/c', LAUNCHER_NAME] + list(arguments)
+    command = [environment['ComSpec'], '/c', LAUNCHER_NAME] + [str(item) for item in arguments]
     started = time.monotonic()
     try:
         result = subprocess.run(command, cwd=str(package), env=environment, capture_output=True,
                                 text=True, encoding='utf-8', errors='replace', timeout=timeout)
     except subprocess.TimeoutExpired as error:
-        return {'command': ' '.join([LAUNCHER_NAME] + list(arguments)), 'timeout': True,
-                'returncode': None, 'seconds': round(time.monotonic() - started, 2),
-                'stdout_lines': 0, 'stdout': (error.stdout or '')[-2000:],
+        return {'command': ' '.join([LAUNCHER_NAME] + [str(i) for i in arguments]),
+                'timeout': True, 'returncode': None,
+                'seconds': round(time.monotonic() - started, 2), 'stdout_lines': 0,
+                'stdout': (error.stdout or '')[-2000:],
                 'stderr': 'TIMEOUT after %ss' % timeout}
     seconds = round(time.monotonic() - started, 2)
     lines = [line for line in result.stdout.splitlines() if line.strip()]
-    record = {'command': ' '.join(['cd /d %s &&' % package, LAUNCHER_NAME] + list(arguments)),
-              'returncode': result.returncode, 'seconds': seconds,
-              'stdout_lines': len(lines), 'stderr': result.stderr.strip()[-2000:],
-              'stdout': result.stdout.strip()[:4000]}
+    return {'command': ' '.join(['cd /d %s &&' % package, LAUNCHER_NAME]
+                                + [str(i) for i in arguments]),
+            'returncode': result.returncode, 'seconds': seconds,
+            'stdout_lines': len(lines), 'stderr': result.stderr.strip()[-2000:],
+            'stdout': result.stdout.strip()[:4000]}
+
+
+def run_launcher(package, arguments, environment, timeout=300):
+    """One CLI call through the packaged launcher; stdout must be exactly one JSON."""
+    record = run_command(package, arguments, environment, timeout)
+    lines = [line for line in record['stdout'].splitlines() if line.strip()]
+    if record.get('timeout'):
+        return record
     if len(lines) == 1:
         try:
             record['json'] = json.loads(lines[0])
@@ -131,6 +160,230 @@ def run_launcher(package, arguments, environment, timeout=300):
     else:
         record['parse_error'] = 'expected exactly one JSON line, got %d' % len(lines)
     return record
+
+
+def process_ids(image, environment):
+    """PIDs of a running image, by asking Windows instead of trusting our own spawn.
+
+    A windowed executable gives its parent nothing to hold on to (the launcher
+    ``start``s it and returns), so "the editor is running" has to be an observation
+    about the machine.  ``tasklist`` is in System32, which is the one directory the
+    cleaned environment keeps on PATH.
+    """
+    result = subprocess.run([environment['ComSpec'], '/c', 'tasklist', '/FI',
+                             'IMAGENAME eq %s' % image, '/FO', 'CSV', '/NH'],
+                            capture_output=True, text=True, encoding='utf-8',
+                            errors='replace', timeout=120)
+    pids = []
+    for line in (result.stdout or '').splitlines():
+        if not line.startswith('"'):
+            continue
+        fields = next(csv.reader([line]), [])
+        if fields and fields[0].lower() == image.lower():
+            pids.append(fields[1])
+    return {'pids': pids, 'returncode': result.returncode,
+            'stdout': (result.stdout or '').strip()[:400]}
+
+
+def kill_image(image, environment):
+    result = subprocess.run([environment['ComSpec'], '/c', 'taskkill', '/IM', image, '/F'],
+                            capture_output=True, text=True, encoding='utf-8',
+                            errors='replace', timeout=120)
+    return {'returncode': result.returncode, 'stdout': (result.stdout or '').strip()[:300]}
+
+
+def checker_path():
+    return repo_root() / CHECKER
+
+
+def run_checker(run_dir, wordlist, words, out_json, timeout=3600):
+    """The independent checker, quoted verbatim: the editor does not grade itself."""
+    checker = checker_path()
+    if not checker.is_file():
+        return {'ran': False, 'reason': 'checker not present at %s' % checker}
+    command = [sys.executable, str(checker), str(run_dir), '--source', str(wordlist),
+               '--range', '%d-%d' % (words[0], words[-1]), '--cleaning', 'v2',
+               '--pixels', 'all', '--json', str(out_json)]
+    started = time.monotonic()
+    result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8',
+                            errors='replace', timeout=timeout)
+    payload = {'ran': True, 'command': ' '.join(str(item) for item in command),
+               'returncode': result.returncode,
+               'seconds': round(time.monotonic() - started, 2),
+               'stdout_tail': (result.stdout or '').strip().splitlines()[-12:],
+               'stderr_tail': (result.stderr or '').strip().splitlines()[-6:]}
+    if Path(out_json).is_file():
+        report = json.loads(Path(out_json).read_text(encoding='utf-8'))
+        payload['verdict'] = report.get('verdict')
+        payload['failures'] = report.get('failures')
+        payload['face_summaries'] = {
+            name: ({key: value[key] for key in ('problem_count', 'problems')
+                    if key in value} if isinstance(value, dict) else value)
+            for name, value in report.items()
+            if name in ('integrity', 'timing', 'srt', 'draft', 'pixels', 'mix', 'video')}
+    return payload
+
+
+def gui_fixture(root):
+    """The three-word fixture that also carries the intro layer, and its word list."""
+    path = Path(root) / 'data' / 'fixtures' / GUI_FIXTURE_NAME
+    if not path.is_file():
+        return None
+    return path
+
+
+def gui_smoke(package, environment, scratch, root, timeout, words=GUI_WORDS):
+    """Open the editor the way a member does, then deliver through the window.
+
+    Two runs, because they answer two different questions:
+
+    * **no arguments at all** - the member's double-click.  The launcher must leave
+      ``WordVideoEditor.exe`` running (observed by ``tasklist``, not by asking the
+      launcher how it went), and that run is stopped again so it cannot be mistaken
+      for the next one;
+    * **``--editor --import ... --export --report ...``** - the same window, driven,
+      ending in a published folder that the independent checker judges.  Its report
+      carries the two numbers a member feels: how long until a window appears, and
+      how long the delivery takes.
+    """
+    package = Path(package)
+    evidence = {'package_editor_dir': str(package / EDITOR_DIR),
+                'editor_exe_present': (package / EDITOR_DIR / EDITOR_EXE).is_file()}
+    if not evidence['editor_exe_present']:
+        evidence['ok'] = False
+        evidence['reason'] = 'the package has no %s/%s' % (EDITOR_DIR, EDITOR_EXE)
+        return evidence
+
+    # Nothing of this name may be running before the smoke, or "it started" could be
+    # somebody else's process - including a previous, failed run of this script.
+    before = process_ids(EDITOR_EXE, environment)
+    evidence['processes_before'] = before
+    if before['pids']:
+        evidence['pre_existing_killed'] = kill_image(EDITOR_EXE, environment)
+        time.sleep(1.0)
+
+    print('[verify] launcher with no arguments (the member double-click)', file=sys.stderr)
+    launched = run_command(package, [], environment, timeout=120)
+    deadline = time.monotonic() + 60
+    observed = {'pids': []}
+    while time.monotonic() < deadline:
+        observed = process_ids(EDITOR_EXE, environment)
+        if observed['pids']:
+            break
+        time.sleep(1.0)
+    still = process_ids(EDITOR_EXE, environment) if observed['pids'] else observed
+    time.sleep(3.0)
+    survived = process_ids(EDITOR_EXE, environment)
+    evidence['default_launch'] = {
+        'launcher': {key: launched[key] for key in ('command', 'returncode', 'seconds',
+                                                    'stdout_lines', 'stdout', 'stderr')},
+        'editor_started': bool(observed['pids']),
+        'editor_pids': observed['pids'],
+        'editor_still_running_after_3s': bool(survived['pids']),
+        'tasklist': survived,
+        'cli_stdout_is_empty': launched['stdout_lines'] == 0}
+    evidence['default_launch']['ok'] = bool(
+        launched['returncode'] == 0 and observed['pids'] and survived['pids'])
+    print('[verify] default launch: started=%s survived=%s (%.2fs)'
+          % (evidence['default_launch']['editor_started'],
+             evidence['default_launch']['editor_still_running_after_3s'],
+             launched['seconds']), file=sys.stderr)
+    evidence['killed_after_default_launch'] = kill_image(EDITOR_EXE, environment)
+    time.sleep(1.0)
+
+    fixture = gui_fixture(root)
+    if fixture is None:
+        evidence['ok'] = evidence['default_launch']['ok']
+        evidence['reason'] = 'no %s; the scripted delivery was not run' % GUI_FIXTURE_NAME
+        return evidence
+
+    project = Path(scratch) / 'editor-project'
+    output = Path(scratch) / 'editor-out'
+    workspace = Path(scratch) / 'editor-work'
+    workspace.mkdir(parents=True, exist_ok=True)
+    request = prepare_request(fixture, workspace, output)
+    evidence['request'] = request
+    report_path = Path(scratch) / 'editor-run.json'
+    print('[verify] editor: import + export through the launcher', file=sys.stderr)
+    driven = run_command(package,
+                         ['--editor', '--import', request['path'], '--into', str(project),
+                          '--export', '--report', str(report_path)],
+                         environment, timeout=timeout)
+    evidence['driven_run'] = {key: driven[key] for key in
+                              ('command', 'returncode', 'seconds', 'stdout_lines',
+                               'stdout', 'stderr')}
+    evidence['driven_run']['report_written'] = report_path.is_file()
+    report = json.loads(report_path.read_text(encoding='utf-8')) if report_path.is_file() else {}
+    evidence['editor_report'] = {
+        'mode': report.get('mode'),
+        'ok': report.get('ok'),
+        'frozen': (report.get('environment') or {}).get('frozen'),
+        'entry_to_window_seconds': report.get('entry_to_window_seconds'),
+        'qt': report.get('qt'),
+        'window_shown': report.get('window_shown'),
+        'canvas_present': report.get('canvas_present'),
+        'timeline': report.get('timeline'),
+        'preview': report.get('preview'),
+        'import': report.get('import'),
+        'environment': report.get('environment'),
+        'error': report.get('error')}
+    exported = report.get('export') or {}
+    evidence['delivery'] = {key: exported.get(key) for key in
+                            ('ok', 'started', 'seconds_wall', 'run_dir', 'reason',
+                             'messages', 'saved_revision', 'file_count')}
+    evidence['delivery']['seconds_engine'] = exported.get('seconds')
+    evidence['delivery']['file_count'] = len(exported.get('files') or [])
+    evidence['delivery']['file_sample'] = (exported.get('files') or [])[:12]
+    run_dir = exported.get('run_dir') or ''
+    evidence['delivery_import_seconds'] = (report.get('import') or {}).get('seconds')
+    print('[verify] editor export ok=%s in %.1fs -> %s'
+          % (exported.get('ok'), driven['seconds'], run_dir or '(no run dir)'), file=sys.stderr)
+
+    wordlist = request['wordlist']
+    if run_dir:
+        evidence['acceptance'] = run_checker(run_dir, wordlist, words,
+                                             Path(scratch) / 'acceptance-report.json')
+        print('[verify] independent checker verdict=%s failures=%s'
+              % ((evidence['acceptance'] or {}).get('verdict'),
+                 (evidence['acceptance'] or {}).get('failures')), file=sys.stderr)
+
+    environment_seen = report.get('environment') or {}
+    path_entries = [item for item in (environment_seen.get('PATH') or '').split(os.pathsep)
+                    if item]
+    package_text = str(package)
+    evidence['cleaned_environment_seen_by_the_editor'] = {
+        'PATH': environment_seen.get('PATH'),
+        'PATH_entries_outside_package': [item for item in path_entries
+                                         if not item.lower().startswith(package_text.lower())
+                                         and item.lower() != 'c:\\windows\\system32'],
+        'TEMP': environment_seen.get('TEMP'), 'TMP': environment_seen.get('TMP'),
+        'PYTHONHOME': environment_seen.get('PYTHONHOME'),
+        'PYTHONPATH': environment_seen.get('PYTHONPATH'),
+        'tts_credentials_present': environment_seen.get('tts_credentials_present'),
+        'cwd': environment_seen.get('cwd')}
+    after = process_ids(EDITOR_EXE, environment)
+    evidence['processes_after_driven_run'] = after
+    if after['pids']:
+        evidence['killed_after_driven_run'] = kill_image(EDITOR_EXE, environment)
+
+    evidence['checks'] = {
+        'default_launch_opens_the_editor': evidence['default_launch']['ok'],
+        'driven_run_exit_code_0': driven['returncode'] == 0,
+        'editor_report_written': bool(report),
+        'editor_report_ok': bool(report.get('ok')),
+        'window_was_shown': bool(report.get('window_shown')),
+        'preview_session_opened': bool((report.get('preview') or {}).get('has_session')),
+        'delivery_ok': bool(exported.get('ok')),
+        'delivery_has_a_run_dir': bool(run_dir),
+        'acceptance_verdict_pass': (evidence.get('acceptance') or {}).get('verdict') == 'PASS',
+        'no_python_variables': not (environment_seen.get('PYTHONHOME')
+                                    or environment_seen.get('PYTHONPATH')),
+        'no_tts_credentials': not environment_seen.get('tts_credentials_present'),
+        'path_stays_inside_the_package': not evidence[
+            'cleaned_environment_seen_by_the_editor']['PATH_entries_outside_package'],
+        'editor_not_left_running': not after['pids']}
+    evidence['ok'] = all(evidence['checks'].values())
+    return evidence
 
 
 def prepare_request(fixture, workspace, output_root):
@@ -299,6 +552,9 @@ def main(argv=None):
     parser.add_argument('--report', help='also write the evidence JSON here')
     parser.add_argument('--skip-job', action='store_true', help='run doctor only')
     parser.add_argument('--skip-docx', action='store_true', help='skip the .docx source check')
+    parser.add_argument('--skip-gui', action='store_true',
+                        help='skip the editor smoke (launcher opens it + import/export '
+                             'through the window + independent checker)')
     args = parser.parse_args(argv)
     if hasattr(sys.stdout, 'reconfigure'):
         sys.stdout.reconfigure(encoding='utf-8')
@@ -432,6 +688,13 @@ def main(argv=None):
             'no_external_temp_pollution': not evidence['external_temp_entries']})
     if 'docx_submit' in evidence:
         checks['docx_source_ok'] = evidence['docx_submit']['ok']
+    if not args.skip_gui:
+        # The GUI checks are counted one by one rather than as one aggregate: an
+        # aggregate would let "the window opened" hide "the delivery was refused".
+        evidence['gui'] = gui_smoke(package, environment, scratch, root, args.timeout)
+        checks.update({'gui_%s' % name: bool(value)
+                       for name, value in (evidence['gui'].get('checks') or {}).items()})
+        checks['gui_smoke_ran'] = bool(evidence['gui'].get('checks'))
     evidence['checks'] = checks
     evidence['ok'] = all(checks.values())
     evidence['finished'] = datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %z')

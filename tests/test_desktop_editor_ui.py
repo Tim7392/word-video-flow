@@ -275,12 +275,19 @@ def test_editing_the_font_size_reaches_the_style_table_and_the_canvas(window, ap
     assert '（默认）' in editor.property_labels['style'].text()
 
 
-def test_splitting_the_intro_layer_works_and_undo_puts_it_back(window, app, area):
-    """The one splittable layer an imported project has: the countdown.
+def test_the_intro_is_not_splittable_and_the_window_says_so(window, app, area):
+    """The countdown is A's one non-splittable media layer, and the window shows it.
 
-    ``SplitClip`` creates a clip, so this also proves the editor is driving A's
-    command rather than a private code path: the revision moves, the second half
-    appears with a new id, and undo restores the document exactly.
+    Two layers of defence are asserted here, and the second one has to be tested on a
+    document the first layer could never produce:
+
+    * A's ``can_split`` refuses the intro with a reason, so the button is disabled
+      and the Alt+click route returns the same structured refusal - located at the
+      clip, with the document untouched (revision included);
+    * the delivery gate (``SPLIT_INTRO_NOT_EXPORTABLE``) still refuses to *publish* a
+      project that carries two countdowns, on a project built directly for the test
+      so the safety net stays exercised instead of becoming dead code.  It blocks the
+      export only: the conflicting project still saves.
     """
     from desktop.editor_import import import_request
     from test_editor_support import tiny_folder
@@ -311,35 +318,68 @@ def test_splitting_the_intro_layer_works_and_undo_puts_it_back(window, app, area
     settle(app)
     clip = editor.state.project.intro_clip()
     assert clip is not None
-    assert editor.state.split_check(clip.id).ok is True
     before = revision_snapshot(editor.state)
 
-    # Split it at its midpoint through the button (the playhead is the cut point).
-    editor.state.select(clip.id)
+    # The button is *unavailable* for the countdown, and the reason comes from A's
+    # own check - so what the member sees greyed out and what the command would say
+    # cannot disagree.  Selecting it through the timeline is what refreshes the panel.
+    QtTest.QTest.mouseClick(editor.timeline, QtCore.Qt.LeftButton,
+                            QtCore.Qt.NoModifier, bar_point(editor, clip.id))
+    settle(app)
+    assert editor.state.selection == (clip.id,)
+    check = editor.state.split_check(clip.id)
+    assert check.ok is False and check.code == 'SPLIT_NOT_APPLICABLE'
+    assert 'countdown' in check.reason
+    assert editor.split_button.isEnabled() is False
+    assert 'SPLIT_NOT_APPLICABLE' in editor.split_button.text()
+
+    # Pressing it anyway changes nothing: no clip is created, the revision stays put.
     editor.seek(clip.duration_ticks // 2)
     settle(app)
     editor.split_button.click()
     settle(app)
-    after = revision_snapshot(editor.state)
-    assert editor.state.revision == 1
-    intros = [item.id for item in editor.state.project.clips if item.role == 'intro']
-    assert len(intros) == 2, intros
-    assert clip.id in intros
-    assert sum(1 for key in before if key not in after) == 0
+    assert revision_snapshot(editor.state) == before
+    assert editor.state.revision == 0
+    assert len([item for item in editor.state.project.clips
+                if item.role == 'intro']) == 1
 
-    # And the delivery is blocked, loudly, until the cut is undone: this build
-    # delivers one intro (B refuses two by name), so the editor says so first.
-    from desktop.editor_export import blocking_notices
-    blockers = blocking_notices(editor.folder, editor.state.project)
-    assert [notice.code for notice in blockers] == ['SPLIT_INTRO_NOT_EXPORTABLE']
-    assert blockers[0].clip_id in intros
-    assert editor.export() is None
-    assert editor.diagnostics()['exporting'] is False
-
-    editor.action_undo.trigger()
+    # Alt+click asks for a cut at that tick and gets A's structured refusal, located
+    # at the clip - the same code, so the two routes cannot say different things.
+    QtTest.QTest.mouseClick(editor.timeline, QtCore.Qt.LeftButton,
+                            QtCore.Qt.AltModifier,
+                            bar_point(editor, clip.id, fraction=0.4))
     settle(app)
     assert revision_snapshot(editor.state) == before
-    assert not blocking_notices(editor.folder, editor.state.project)
+    assert any(notice.code == 'SPLIT_NOT_APPLICABLE' for notice in editor._last_notices)
+    assert any(clip.id in notice.headline() or notice.clip_id == clip.id
+               for notice in editor._last_notices)
+    assert editor.export() is not None or editor.last_export is not None
+
+    # The delivery gate is the second line of defence, so it is exercised on a
+    # document A's command can no longer produce: two intro clips, built directly.
+    # (``tests/test_desktop_editor_project.py`` asserts the same for the folder and
+    # the checker; here it is the *window* that must refuse to publish.)
+    from dataclasses import replace
+    from desktop.editor_export import blocking_notices
+    from word_video.domain.timebase import TimeExpr
+    twin = replace(clip, id='layer.intro.2', start=TimeExpr.at(clip.duration_ticks))
+    editor.state.session = replace(editor.state.session,
+                                   project=editor.state.project.with_clips(
+                                       editor.state.project.clips + (twin,)),
+                                   history=editor.state.session.history, future=())
+    editor.state._invalidate()
+    editor.after_edit(rebuild_preview=False)
+    settle(app)
+    intros = [item.id for item in editor.state.project.clips if item.role == 'intro']
+    assert sorted(intros) == ['layer.intro', 'layer.intro.2']
+    blockers = blocking_notices(editor.folder, editor.state.project)
+    assert [notice.code for notice in blockers] == ['SPLIT_INTRO_NOT_EXPORTABLE']
+    assert blockers[0].clip_id == 'layer.intro.2'
+    assert editor.export() is None
+    assert editor.diagnostics()['exporting'] is False
+    # Saving is not blocked: a conflicting project may be kept and fixed later.
+    assert editor.save() is not None
+    assert editor.state.dirty is False
 
 
 def test_a_click_on_a_group_member_collapses_to_that_one_clip(window, app):
