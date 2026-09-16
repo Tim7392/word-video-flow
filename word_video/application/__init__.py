@@ -11,18 +11,26 @@ from .commands import (COMMANDS, BindStart, ClearStyle, CommandResult, MoveClip,
                        SplitCheck, SplitClip, TrimClip, UnbindStart, apply, can_split)
 from .instantiate import asset_id_for, expand, instantiate
 from .intro import measure_intro, measure_project_intro
+from .packages import (BatchDocument, Check, PackagePlan, PackageRule, Preflight,
+                       UsageReport, batch_id_for, instance_for, intro_from,
+                       plan_document, recording_usage, split_packages)
 from .session import (MODE_ADVANCED, MODE_TEMPLATE, MODES, Session)
 from .styles import merged_styles, style_fonts
 from .templates import SCHEMA as TEMPLATE_SCHEMA, TemplateDocument, document_from_project
+from .upgrade import (SCHEMA as UPGRADE_SCHEMA, Conflict as UpgradeConflict, MergeResult,
+                      apply_upgrade, merge_styles, plan_upgrade, template_changes)
 
 __all__ = [
-    'BatchPlan', 'BatchSelection', 'BindStart', 'COMMANDS', 'ClearStyle',
-    'CommandResult', 'DeliveryCheck', 'ExportProfile', 'MODE_ADVANCED',
-    'MODE_TEMPLATE', 'MODES', 'MoveClip', 'MoveClips', 'SPLITTABLE_ROLES', 'Session',
-    'SetMediaSlice', 'SetStyle', 'SplitCheck', 'SplitClip', 'Submission',
-    'TEMPLATE_SCHEMA', 'TemplateDocument', 'TrimClip',
-    'UnbindStart', 'apply', 'asset_id_for', 'can_split', 'check_delivery',
-    'document_from_project', 'expand', 'instantiate', 'measure_intro',
-    'measure_project_intro', 'merged_styles', 'plan_batch', 'select_records',
-    'style_fonts', 'submission_for',
+    'BatchDocument', 'BatchPlan', 'BatchSelection', 'BindStart', 'COMMANDS', 'Check',
+    'ClearStyle', 'CommandResult', 'DeliveryCheck', 'ExportProfile', 'MODE_ADVANCED',
+    'MODE_TEMPLATE', 'MODES', 'MergeResult', 'MoveClip', 'MoveClips', 'PackagePlan',
+    'PackageRule', 'Preflight', 'SPLITTABLE_ROLES', 'Session', 'SetMediaSlice',
+    'SetStyle', 'SplitCheck', 'SplitClip', 'Submission', 'TEMPLATE_SCHEMA',
+    'TemplateDocument', 'TrimClip', 'UPGRADE_SCHEMA', 'UnbindStart',
+    'UpgradeConflict', 'UsageReport', 'apply', 'apply_upgrade', 'asset_id_for',
+    'batch_id_for', 'can_split', 'check_delivery', 'document_from_project', 'expand',
+    'instance_for', 'instantiate', 'intro_from', 'measure_intro',
+    'measure_project_intro', 'merge_styles', 'merged_styles', 'plan_batch',
+    'plan_document', 'plan_upgrade', 'recording_usage', 'select_records',
+    'split_packages', 'style_fonts', 'submission_for', 'template_changes',
 ]

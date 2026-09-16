@@ -16,6 +16,7 @@ The contract W05 promises an Agent, implemented here:
 Run it as ``python -m word_video.cli <action> ...``.
 """
 import argparse
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -26,7 +27,6 @@ from ..application.batches import (BatchSelection, ExportProfile, plan_batch,
                                    submission_for)
 from ..application.intro import measure_project_intro
 from ..domain.errors import ProjectError
-from ..storage.assets import AssetIndex
 from ..storage.coordinator import (Coordinator, NeedsInput, RECOVERY_DIR, connect)
 from ..storage.project_store import load_project, save_project
 
@@ -70,15 +70,32 @@ def build_parser():
     project.add_argument('--file', default='', help='project.json to save (project save)')
 
     batch = commands.add_parser('batch')
-    batch.add_argument('sub', choices=('plan', 'submit'))
-    batch.add_argument('--project', required=True, help='project id under the root')
+    batch.add_argument('sub', choices=('list', 'plan', 'submit', 'show', 'redo',
+                                       'upgrade'))
+    batch.add_argument('--project', default='', help='source project id or folder')
     batch.add_argument('--batch', default='', help='word-list range, e.g. 151-153')
     batch.add_argument('--records', default='', help='comma separated record ids')
+    batch.add_argument('--per-package', dest='per_package', type=int, default=0,
+                       help='words per package')
+    batch.add_argument('--packages', type=int, default=0, help='how many packages')
+    batch.add_argument('--template', default='', help='template id to pin')
+    batch.add_argument('--template-version', dest='template_version', type=int,
+                       default=0, help='template version (default: the latest)')
     batch.add_argument('--background', default='', help='delivery background file')
-    batch.add_argument('--codec', default='h264', choices=('h264', 'h265'))
+    batch.add_argument('--codec', default='', choices=('', 'h264', 'h265'))
     batch.add_argument('--slices', type=int, default=None)
-    batch.add_argument('--key', default='', help='idempotency key (submit)')
+    batch.add_argument('--key', default='', help='idempotency key (submit/redo)')
     batch.add_argument('--folder', default='', help='project folder holding the assets')
+    batch.add_argument('--id', dest='batch_id', default='', help='batch id (show/redo)')
+    batch.add_argument('--apply', action='store_true',
+                       help='redo: prepare the failed/changed packages; upgrade: write it')
+    batch.add_argument('--run', action='store_true', help='redo: also run them')
+    batch.add_argument('--replace-edits', dest='replace_edits', action='store_true',
+                       help='rebuild an instance even though it has member edits')
+    batch.add_argument('--take-template', dest='take_template', action='store_true',
+                       help='upgrade: the template wins where a member edit conflicts')
+    batch.add_argument('--undo', action='store_true',
+                       help='upgrade: put back the state the last upgrade replaced')
 
     job = commands.add_parser('job')
     job.add_argument('sub', choices=('status', 'cancel', 'resume', 'run'))
@@ -124,10 +141,17 @@ def build_parser():
     voices.add_argument('--preset', default='', help='preset file to write')
 
     template = commands.add_parser('template')
-    template.add_argument('sub', choices=('list', 'show'))
+    template.add_argument('sub', choices=('list', 'show', 'save', 'export', 'import',
+                                          'verify'))
     template.add_argument('--template', default='', help='template id')
     template.add_argument('--version', type=int, default=0,
                           help='template version (default: the latest stored one)')
+    template.add_argument('--from-project', dest='from_project', default='',
+                          help='template save: capture this project as a new version')
+    template.add_argument('--note', default='', help='template save: what changed')
+    template.add_argument('--out', default='', help='template export: target folder')
+    template.add_argument('--from', dest='source', default='',
+                          help='template import/verify: the package folder')
     return parser
 
 
@@ -168,7 +192,13 @@ def _prepare(args, coordinator):
         raise NeedsInput('project %r has no assets.json' % args.project, path='assets',
                          fixes=['用资产登记写入 %s（AssetIndex.save 或编辑器保存）'
                                 % args.project])
-    missing = [asset_id for asset_id in _referenced(project) if asset_id not in media]
+    # The intro layer's media is measured by the intro resolver, not registered in the
+    # asset store: it is a layer of its own (wv-project@2), so asking the registry for
+    # its units would refuse every project that has an intro.
+    intro_assets = {clip.source.asset_id for clip in project.clips
+                    if clip.is_intro and clip.source is not None}
+    missing = [asset_id for asset_id in _referenced(project)
+               if asset_id not in media and asset_id not in intro_assets]
     if missing:
         raise NeedsInput('%d asset(s) have no measurement' % len(missing),
                          path='assets',
@@ -187,23 +217,71 @@ def _referenced(project):
     return ids
 
 
-def _plan(args, coordinator):
+def _profile(args, folder):
+    """The delivery profile: the flag wins, then the editor's own ``delivery.json``.
+
+    A member who set a background in the editor must not have to pass it again, and
+    an Agent planning a batch must see the delivery the editor would render — so the
+    sidecar is read here (read-only; the editor owns that file).
+    """
+    from ..storage.delivery import delivery_settings
+    settings = delivery_settings(folder)
+    return ExportProfile(background=args.background or settings['background'],
+                         video_codec=args.codec or settings['video_codec'] or 'h264',
+                         slices=args.slices)
+
+
+def _rule(args):
+    from ..application.packages import PackageRule
+    return PackageRule(per_package=args.per_package, count=args.packages)
+
+
+def _template(args, coordinator):
+    """The template a batch pins: explicit by id, otherwise the reference one."""
+    from ..storage.templates import BUILTIN_TEMPLATE_ID, TemplateStore
+    store = TemplateStore(coordinator.root)
+    known = store.template_ids()
+    template_id = args.template or BUILTIN_TEMPLATE_ID
+    if args.template and args.template not in known:
+        raise NeedsInput('no template %r' % args.template, path='template',
+                         fixes=['可用模板：%s' % '、'.join(known),
+                                'python -m word_video.cli template list'])
+    if args.template_version and store.source(template_id, args.template_version) \
+            == 'missing':
+        raise NeedsInput('template %s has no version %d'
+                         % (template_id, args.template_version), path='template',
+                         fixes=['已存版本：%s' % (store.versions(template_id) or ['（无）'])])
+    return store.load(template_id, args.template_version or None)
+
+
+def _document(args, coordinator):
+    """Plan the whole batch (read-only) from the source project and its delivery.
+
+    Returns the source project, its registry, the plan document, and the intro the
+    expansion will use — measured **once** here, so a submit that follows does not probe
+    the same movie again for every package.
+    """
+    from ..application.packages import (free_bytes_for, intro_from, plan_document,
+                                        reference_bytes_for)
+    from ..storage.templates import BUILTIN_TEMPLATE_ID
     project, index, media, intro = _prepare(args, coordinator)
-    profile = ExportProfile(background=args.background, video_codec=args.codec,
-                            slices=args.slices)
-    plan = plan_batch(project, media, _selection(args), profile, intro)
-    return project, index, plan
-
-
-def _inputs(project, index, plan, folder):
-    """Every file a submission depends on, so a later change is a conflict."""
-    paths = [str(Path(folder) / 'project.json'), str(Path(folder) / 'assets.json')]
-    if plan.profile.background:
-        paths.append(plan.profile.background)
-    for asset_id in plan.assets:
-        if index is not None and index.has(asset_id):
-            paths.append(index.candidate_path(asset_id))
-    return tuple(str(path) for path in paths)
+    template = _template(args, coordinator)
+    try:
+        intro = intro_from(project, template, measured=intro)
+    except ProjectError:
+        intro = (None, '', None)        # reported per package by the plan itself
+    reference, note = reference_bytes_for(coordinator)
+    document = plan_document(project, media, index, selection=_selection(args),
+                             rule=_rule(args), profile=_profile(args, args.folder or
+                                                               coordinator.project_folder(
+                                                                   args.project)),
+                             template=template, intro=intro,
+                             free_bytes=free_bytes_for(coordinator.root),
+                             reference_bytes=reference, reference_note=note,
+                             source_folder=str(args.folder or
+                                               coordinator.project_folder(
+                                                   args.project)))
+    return project, index, document, intro
 
 
 def action_capabilities(args, coordinator):
@@ -225,8 +303,13 @@ def action_capabilities(args, coordinator):
                       ' re-queues an unfinished task and never touches a published run',
                       'voice list/import only reads the member\'s own drafts;'
                       ' importing existing audio is not a new synthesis capability',
-                      'template list/show only reads the versioned template files'
-                      ' under the root; an existing version is never rewritten']}
+                      'template list/show/save/export/import/verify only read or add'
+                      ' versions: an existing version is never rewritten, and a package'
+                      ' carries no path, no credential and no executable',
+                      'batch redo changes nothing without --apply, and re-does only the'
+                      ' packages that failed or changed; batch upgrade keeps member'
+                      ' edits (conflicts are reported) and --undo puts back the state'
+                      ' it replaced']}
 
 
 def action_doctor(args, coordinator):
@@ -288,28 +371,462 @@ def action_project(args, coordinator):
             'stored_revision': coordinator.project_revision(project.project_id)}
 
 
+def _plan_view(document, project):
+    """The plan answer: the batch document, plus the keys a W05 caller already reads.
+
+    A batch **is** the plan, so the document is the answer — but a caller that only
+    ever asks for one selection keeps reading ``records``, ``plan_identity``,
+    ``total_ticks`` and ``delivery`` exactly as before, because those are projections
+    of the same document and not a second plan.  With one package they are that
+    package's own numbers; with several, the delivery verdict is the batch's (one
+    profile, one answer) and the rest are sums over the packages.
+    """
+    view = dict(document.to_dict())
+    view.update(
+        {'project_id': document.source_project, 'revision': project.revision,
+         'records': [dict(word) for word in document.records],
+         'assets': _batch_assets(document),
+         'problems': [problem.to_dict() for problem in document.problems],
+         'plan_identity': document.plan_identity,
+         'total_ticks': document.total_ticks,
+         'estimated_seconds': round(document.total_ticks / 720000.0, 3),
+         'delivery': document.delivery.to_dict()})
+    return view
+
+
+def _batch_assets(document):
+    found = []
+    for package in document.packages:
+        for asset_id in package.usage.assets:
+            if asset_id not in found:
+                found.append(asset_id)
+    return found
+
+
 def action_batch(args, coordinator):
-    project, index, plan = _plan(args, coordinator)
+    """``batch plan|submit|show|redo``: plan a whole batch, then run only what must run.
+
+    ``plan`` and ``show`` only read.  ``submit`` creates one project instance per
+    package and freezes one job per package (keys derived from the caller's key, so a
+    retry is still the same work), and ``redo`` compares the plan on disk with the
+    source as it is now: packages that already succeeded and did not change are
+    *reused* — not re-rendered and not re-synthesised — while only the failed or
+    changed ones are prepared again.
+    """
+    if args.sub == 'list':
+        from ..storage.batches import BatchStore
+        return BatchStore(coordinator.root).index()
+    if args.sub == 'show':
+        return _batch_show(args, coordinator)
+    if args.sub == 'redo':
+        return _batch_redo(args, coordinator)
+    if args.sub == 'upgrade':
+        return _batch_upgrade(args, coordinator)
+    project, index, document, intro = _document(args, coordinator)
     if args.sub == 'plan':
         # The preflight prints what the batch still needs (delivery included) and
         # writes nothing: an Agent can act on `delivery.fixes` before submitting.
-        return {'plan': plan.to_dict(), 'wrote_files': False,
-                'ready': plan.ready, 'delivery_fixes': list(plan.delivery.fixes)}
+        return {'batch': document.batch_id, 'plan': _plan_view(document, project),
+                'wrote_files': False, 'ready': document.ready,
+                'checks': document.checks.to_dict(),
+                'fixes': document.fixes(),
+                'delivery_fixes': list(document.delivery.fixes)}
+    # submit
     if not args.key:
         raise NeedsInput('submit needs an idempotency key', path='submit',
                          fixes=['加 --key <stable-name>；同一批活重试时复用同一个键'])
-    if not plan.ok:
-        raise NeedsInput('the plan has %d problem(s)' % len(plan.problems),
-                         path='plan',
-                         fixes=[problem.message for problem in plan.problems] or
+    if not document.ready:
+        raise NeedsInput('the batch is not ready: %d problem(s)'
+                         % (len(document.problems) + len(document.checks.blocking)),
+                         path='plan', fixes=list(document.fixes()) or
                                ['修好工程或素材后重新 plan'])
-    folder = args.folder or coordinator.project_folder(args.project)
-    submission = submission_for(plan, _inputs(project, index, plan, folder))
-    # An incomplete delivery is refused by the coordinator itself (submit and run use
-    # the one rule), so a missing background comes back as NEEDS_INPUT with fixes.
-    receipt = coordinator.submit(submission, args.key)
-    return {'job': receipt['job'], 'created': receipt['created'], 'key': receipt['key'],
-            'digest': receipt['digest'], 'plan_identity': plan.plan_identity}
+    result = _submit_document(args, coordinator, document, index, key=args.key,
+                              template=_template(args, coordinator), intro=intro,
+                              replace_edits=args.replace_edits)
+    # One package is the plain single-batch case, so the answer keeps the fields a
+    # caller of W05 already reads (job/created/digest) and adds the batch view.
+    single = result[0] if len(result) == 1 else None
+    return {'batch': document.batch_id, 'key': args.key, 'ready': True,
+            'units': document.usage.units, 'packages': result,
+            'job': single['job'] if single else None,
+            'created': single['created'] if single else None,
+            'digest': single['submission_digest'] if single else None,
+            'plan_identity': document.plan_identity}
+
+
+def _submit_document(args, coordinator, document, index, *, key, template, intro,
+                     replace_edits=False, only=None, run=False, existing=()):
+    """Create the instance of every package that must run, and freeze its job.
+
+    ``existing`` names packages whose instance must be used **as it is** (a member has
+    edited it): the instance is the member's work, so it is neither rebuilt from the
+    source nor overwritten — it is submitted again with its own content.
+    """
+    from ..application.packages import instance_for
+    from ..storage.batches import BatchStore
+    store = BatchStore(coordinator.root)
+    project = coordinator.load_project(args.project)
+    intro_slice, intro_audio, intro_measure = intro
+    asset_ids = {(clip.record_id, clip.role): clip.source.asset_id
+                 for clip in project.clips
+                 if clip.source is not None and clip.record_id}
+    records = {record.id: record for record in project.records}
+    media = index.media_map() if index is not None else {}
+    # The plan is on disk before the first job exists, and each package's job is
+    # recorded the moment it is frozen: a submit that stops half way (a package whose
+    # instance a member edited, say) leaves a batch that says exactly which packages
+    # were submitted, so `batch redo` resumes the rest instead of redoing the lot.
+    store.save(document)
+    submitted = []
+    for package in document.packages:
+        if only is not None and package.package_id not in only:
+            continue
+        if package.package_id in existing:
+            instance = coordinator.load_project(package.project_id)
+        else:
+            chunk = tuple(records[record_id] for record_id in package.record_ids
+                          if record_id in records)
+            instance = instance_for(project, chunk, template, media,
+                                    package.project_id,
+                                    intro_slice=intro_slice, intro_audio=intro_audio,
+                                    intro_measure=intro_measure, asset_ids=asset_ids)
+            coordinator.create_instance(instance, index, replace_edits=replace_edits)
+        folder = coordinator.project_folder(package.project_id)
+        plan = plan_batch(instance, media, None, document.profile, intro_measure)
+        inputs = _instance_inputs(folder, document, index, plan)
+        submission = submission_for(plan, inputs)
+        package_key = _package_key(key, package.package_id, len(document.packages))
+        receipt = coordinator.submit(submission, package_key)
+        # What a later redo compares against: the package as it was actually
+        # submitted (its solved identity and the instance revision it ran with).
+        actual = replace(package, plan_identity=plan.plan_identity,
+                         instance_revision=coordinator.instance_revision(
+                             package.project_id) or 0)
+        entry = {'package_id': package.package_id, 'project_id': package.project_id,
+                 'job': receipt['job'], 'created': receipt['created'],
+                 'key': receipt['key'], 'digest': actual.digest(),
+                 'submission_digest': receipt['digest'],
+                 'units': package.usage.units,
+                 'records': list(package.record_ids)}
+        if run:
+            entry['state'] = coordinator.run(receipt['job'])['state']
+        submitted.append(entry)
+        store.save_jobs(document.batch_id, key,
+                        {entry['package_id']: {'job': entry['job'],
+                                               'digest': entry['digest'],
+                                               'key': entry['key']}})
+    return submitted
+
+
+def _package_key(key, package_id, packages=1):
+    """The idempotency key of one package's job.
+
+    A batch that is not cut into packages keeps the caller's key **verbatim**, which
+    is what a W05 caller already relies on ("the same key returns the same task").  A
+    cut batch derives one key per package from it, so retrying the whole batch is
+    still the same work, package by package.
+    """
+    if packages <= 1:
+        return str(key)
+    return '%s#%s' % (key, package_id)
+
+
+def _instance_inputs(folder, document, index, plan):
+    """Every file this package's job depends on, so a later change is a conflict."""
+    paths = [str(Path(folder) / 'project.json'), str(Path(folder) / 'assets.json')]
+    if document.profile.background:
+        paths.append(document.profile.background)
+    for asset_id in plan.assets:
+        if index is not None and index.has(asset_id):
+            paths.append(index.candidate_path(asset_id))
+    return tuple(str(path) for path in paths)
+
+
+def _batch_show(args, coordinator):
+    from ..storage.batches import BatchStore
+    if not args.batch_id:
+        raise NeedsInput('batch show needs --id', path='batch',
+                         fixes=['--id <批次 id>（python -m word_video.cli batch list）'])
+    store = BatchStore(coordinator.root)
+    if args.batch_id not in store.batch_ids():
+        raise NeedsInput('no batch %r' % args.batch_id, path='batch',
+                         fixes=['已知批次：%s' % '、'.join(store.batch_ids() or ['（无）'])])
+    document = store.load(args.batch_id)
+    jobs = store.jobs(args.batch_id)
+    packages = []
+    for package in document.packages:
+        entry = package.to_dict()
+        recorded = jobs.get(package.package_id) or {}
+        entry['job'] = recorded.get('job')
+        if entry['job']:
+            job = coordinator.status(entry['job'])
+            entry['state'] = job['state']
+            entry['published'] = job['state'] == 'succeeded'
+            entry['artifacts'] = len(job['artifacts'])
+        packages.append(entry)
+    return {'batch': document.batch_id, 'plan': document.to_dict(),
+            'packages': packages, 'ready': document.ready,
+            'units': document.usage.units, 'jobs_recorded': len(jobs)}
+
+
+def _batch_redo(args, coordinator):
+    """What a re-run would touch, and (with ``--apply``) only that.
+
+    The comparison is per package: its digest now against the digest recorded when it
+    was submitted.  A package that succeeded and did not change is *reused*: no
+    re-render, no re-synthesis, and the published run stays where it is.
+    """
+    from ..storage.batches import BatchStore
+    if not args.batch_id:
+        raise NeedsInput('batch redo needs --id', path='batch',
+                         fixes=['--id <批次 id>（batch show --id <id> 查看）'])
+    store = BatchStore(coordinator.root)
+    recorded = store.load(args.batch_id)
+    jobs = store.jobs(args.batch_id)
+    # Plan the batch again from the same source, selection, rule and delivery: the
+    # difference between the two documents *is* the redo scope.  The source folder is
+    # recorded with the plan, so a redo does not depend on the caller remembering it.
+    args.project = args.project or recorded.source_folder or recorded.source_project
+    args.batch, args.records = _selection_flags(recorded)
+    args.per_package = recorded.rule.per_package
+    args.packages = recorded.rule.count
+    args.background = args.background or recorded.profile.background
+    args.codec = args.codec or recorded.profile.video_codec
+    args.slices = recorded.profile.slices if args.slices is None else args.slices
+    args.template = recorded.template_id
+    args.template_version = recorded.template_version
+    project, index, fresh, intro = _document(args, coordinator)
+    media = index.media_map() if index is not None else {}
+    scope = []
+    for planned in fresh.packages:
+        package, edited = planned, coordinator.instance_revision(planned.project_id)
+        # An instance a member saved (revision > 0) is the truth for its package: it
+        # is planned as it is, never rebuilt from the source behind their back.
+        if edited:
+            instance = coordinator.load_project(package.project_id)
+            plan = plan_batch(instance, media, None, recorded.profile, None)
+            package = replace(package, basis='instance', instance_revision=edited,
+                              plan_identity=plan.plan_identity,
+                              problems=plan.problems, delivery=plan.delivery)
+        entry = jobs.get(package.package_id) or {}
+        job_id = entry.get('job')
+        state = coordinator.status(job_id)['state'] if job_id else None
+        changed = bool(job_id) and entry.get('digest') != package.digest()
+        if job_id is None:
+            action, reason = 'new', '这个包还没有作业'
+        elif state == 'succeeded' and not changed:
+            action, reason = 'reuse', '已发布且内容未变'
+        elif changed:
+            action, reason = 'resubmit', ('内容变了（%s）'
+                                          % ('成员改过实例' if edited
+                                             else '词/时间/交付不同'))
+        else:
+            action, reason = 'rerun', '内容未变但作业没成功（%s）' % state
+        scope.append({'package_id': package.package_id, 'job': job_id, 'state': state,
+                      'action': action, 'reason': reason,
+                      'basis': package.basis, 'units': package.usage.units,
+                      'records': list(package.record_ids),
+                      'words': [dict(item) for item in package.words],
+                      'digest_now': package.digest(), 'digest_then': entry.get('digest')})
+    result = {'batch': fresh.batch_id, 'plan': fresh.to_dict(), 'scope': scope,
+              'redo': [item['package_id'] for item in scope
+                       if item['action'] in ('new', 'resubmit', 'rerun')],
+              'untouched': [item['package_id'] for item in scope
+                            if item['action'] == 'reuse'],
+              'units': sum(item['units'] for item in scope
+                           if item['action'] in ('new', 'resubmit')),
+              'applied': False}
+    if not args.apply:
+        result['note'] = ('只报告重做范围；加 --apply 才建实例/提交，'
+                          '再加 --run 立刻执行')
+        return result
+    key = args.key or ('redo-%s' % fresh.batch_id)
+    resubmit = [item['package_id'] for item in scope if item['action'] == 'resubmit']
+    new = [item['package_id'] for item in scope if item['action'] == 'new']
+    # A resubmit whose instance a member edited is submitted *from that instance*:
+    # rebuilding it from the source would throw their edits away, which is the one
+    # thing an upgrade or a redo must never do quietly.
+    existing = {item['package_id'] for item in scope
+                if item['action'] == 'resubmit' and item['basis'] == 'instance'}
+    prepared = []
+    if resubmit or new:
+        prepared = _submit_document(args, coordinator, fresh, index, key=key,
+                                    template=_template(args, coordinator), intro=intro,
+                                    replace_edits=args.replace_edits,
+                                    only=set(resubmit) | set(new),
+                                    run=args.run, existing=existing)
+    # A package whose content did not change keeps its job: retrying it is "run the
+    # same job again", which is exactly what the W05 idempotency already promises.  Two
+    # states need a word first, or running would do nothing at all: a cancelled job
+    # still carries its cancel bit, and a delivery that no longer verifies
+    # (`partial_failed`) refuses to run again until it is re-queued.
+    rerun = [item for item in scope if item['action'] == 'rerun']
+    for item in rerun:
+        if not args.run:
+            continue
+        if item['state'] == 'cancelled':
+            item['state'] = coordinator.resume(item['job'])['state']
+        elif item['state'] == 'partial_failed':
+            item['state'] = coordinator.requeue(item['job'])['state']
+        item['state'] = coordinator.run(item['job'])['state']
+    result['applied'] = True
+    result['key'] = key
+    result['prepared'] = prepared
+    result['rerun'] = [{'package_id': item['package_id'], 'job': item['job'],
+                        'state': item['state']} for item in rerun]
+    result['note'] = '只重做了失败/变化的包；未变且已发布的包没有重渲染、没有重新合成'
+    return result
+
+
+def _selection_flags(document):
+    if document.selection.record_ids:
+        return '', ','.join(document.selection.record_ids)
+    return '%d-%d' % (document.selection.first or 1, document.selection.last or 0), ''
+
+
+def _batch_upgrade(args, coordinator):
+    """Move a batch to a newer template version — or put back what the last one replaced.
+
+    Only this batch is touched: another batch that pinned the same template keeps its
+    own version, which is what "升级只影响显式升级的批" means in practice.  A member's
+    hand edits survive: the newer version's own changes are applied field by field, a
+    value the member changed stays theirs and is reported as a conflict, and the whole
+    thing is recorded before it is written so ``--undo`` restores the same bytes.
+    """
+    from ..application.upgrade import plan_upgrade
+    from ..domain.model import Project
+    from ..storage.batches import BatchStore
+    from ..storage.templates import TemplateStore
+
+    if not args.batch_id:
+        raise NeedsInput('batch upgrade needs --id', path='batch',
+                         fixes=['--id <批次 id>（python -m word_video.cli batch list）'])
+    store = BatchStore(coordinator.root)
+    templates = TemplateStore(coordinator.root)
+    recorded = store.load(args.batch_id)
+    if args.undo:
+        return _batch_undo(args, coordinator, store, recorded)
+
+    template_id = args.template or recorded.template_id
+    old = templates.load(recorded.template_id, recorded.template_version)
+    version = args.template_version or templates.latest(template_id)
+    if not version:
+        raise NeedsInput('no template %r to upgrade to' % template_id, path='template',
+                         fixes=['可用模板：%s' % '、'.join(templates.template_ids()),
+                                'python -m word_video.cli template list'])
+    new = templates.load(template_id, version)
+    packages, documents, blocked = [], {}, []
+    for package in recorded.packages:
+        revision_now = coordinator.instance_revision(package.project_id)
+        if revision_now is None:
+            packages.append({'package_id': package.package_id,
+                             'project_id': package.project_id, 'missing': True,
+                             'note': '这个包还没有工程实例（先 batch submit）'})
+            continue
+        instance = coordinator.load_project(package.project_id)
+        upgraded, merge = plan_upgrade(instance, old, new,
+                                       take_template=args.take_template)
+        entry = {'package_id': package.package_id, 'project_id': package.project_id,
+                 'missing': False, 'revision_before': instance.revision,
+                 'revision_after': upgraded.revision,
+                 'styles_before': instance.style_table(),
+                 'styles_after': upgraded.style_table(),
+                 'member_edits': revision_now > 0,
+                 'changed': merge.changed, **merge.to_dict()}
+        if merge.wiring:
+            blocked.append(entry)
+        elif merge.changed and merge.appliable:
+            documents[package.project_id] = instance.to_dict()
+        packages.append(entry)
+    report = {'schema': 'wv-upgrade@1', 'batch': recorded.batch_id,
+              'template_before': {'template_id': old.template_id, 'version': old.version},
+              'template_after': {'template_id': new.template_id, 'version': new.version},
+              'take_template': bool(args.take_template),
+              'packages': packages, 'applied': False,
+              'batch_plan_before': recorded.to_dict()}
+    result = {'batch': recorded.batch_id, 'from': '%s@%d' % (old.template_id, old.version),
+              'to': '%s@%d' % (new.template_id, new.version), 'packages': packages,
+              'conflicts': [dict(item, package_id=entry['package_id'])
+                            for entry in packages
+                            for item in entry.get('conflicts', ())],
+              'kept': [dict(item, package_id=entry['package_id'])
+                       for entry in packages for item in entry.get('kept', ())],
+              'changed': sorted({entry['package_id'] for entry in packages
+                                 if entry.get('changed')}),
+              'blocked': [entry['package_id'] for entry in blocked],
+              'applied': False}
+    if not result['changed']:
+        result['note'] = '这个批已经是 %s：没有要改的地方' % result['to']
+        return result
+    if blocked:
+        raise NeedsInput(
+            '%s@%d 改的是版式，不是样式：原地升级会重建片段并丢掉成员改过的时间/拆分'
+            % (new.template_id, new.version), path='template',
+            fixes=['新建一个包（batch submit --template %s --template-version %d）'
+                   % (new.template_id, new.version),
+                   '受影响的包：%s' % '、'.join(entry['package_id'] for entry in blocked)])
+    if not args.apply:
+        result['note'] = ('只报告升级范围与冲突；加 --apply 才写入实例'
+                          '（写入前会记录可撤销的旧状态）')
+        return result
+    number = 1 + max(store.upgrades(recorded.batch_id) or [0])
+    report['number'] = number
+    store.save_upgrade(recorded.batch_id, report, documents, number=number)
+    applied = []
+    for entry in packages:
+        if entry.get('missing') or entry['project_id'] not in documents:
+            continue
+        instance = Project.from_dict(documents[entry['project_id']])
+        upgraded, merge = plan_upgrade(instance, old, new,
+                                       take_template=args.take_template)
+        # The revision the instance had when it was planned: a member who saved in
+        # between gets a stale-revision refusal instead of losing that save.
+        coordinator.save_project(upgraded, expected_revision=entry['revision_before'])
+        entry['revision_after'] = upgraded.revision
+        entry['styles_after'] = upgraded.style_table()
+        applied.append(entry['package_id'])
+    store.save(replace(recorded, template_id=new.template_id,
+                       template_version=new.version))
+    report['applied'] = True
+    report['packages'] = packages
+    store.save_upgrade(recorded.batch_id, report, documents, number=number)
+    result['applied'] = True
+    result['upgrade'] = number
+    result['note'] = ('已按 %s@%d 升级 %d 个包；未升级的批仍钉在它们自己的版本；'
+                      '--undo 可整体撤销' % (new.template_id, new.version, len(applied)))
+    return result
+
+
+def _batch_undo(args, coordinator, store, recorded):
+    """Put back the instance documents the last upgrade replaced, byte for byte."""
+    from ..application.upgrade import describe_undo
+    from ..domain.model import Project
+
+    report, documents = store.load_upgrade(recorded.batch_id)
+    before = report.get('template_after') or {}
+    after = report.get('template_before') or {}
+    restored = []
+    for project_id, document in sorted(documents.items()):
+        current = coordinator.instance_revision(project_id)
+        if current is None:
+            restored.append({'project_id': project_id, 'restored': False,
+                             'note': '实例已不在'})
+            continue
+        previous = Project.from_dict(document)
+        coordinator.save_project(previous, expected_revision=current)
+        restored.append({'project_id': project_id,
+                         'revision_restored': previous.revision,
+                         'revision_replaced': current,
+                         **describe_undo(previous,
+                                         coordinator.load_project(project_id))})
+    store.save(replace(recorded, template_id=after.get('template_id',
+                                                       recorded.template_id),
+                       template_version=after.get('version', recorded.template_version)))
+    return {'batch': recorded.batch_id, 'undo': report.get('number'),
+            'from': '%s@%s' % (before.get('template_id'), before.get('version')),
+            'to': '%s@%s' % (after.get('template_id'), after.get('version')),
+            'packages': restored, 'applied': True,
+            'note': '已把升级前的实例文档原样放回，批的计划版本也回到升级前'}
 
 
 def action_job(args, coordinator):
@@ -479,17 +996,37 @@ def action_voice(args, coordinator):
 
 
 def action_template(args, coordinator):
-    """``template list`` / ``template show``: the shareable arrangement + styles.
+    """``template``: the shareable arrangement + styles, as versions and as a package.
 
-    Reading only: a template version is what a batch was planned against, so the
-    CLI never rewrites one.  ``show`` answers with the document a member or an Agent
-    needs to compare two versions by hand.
+    Reading never rewrites: a version is what a batch was planned against, so the CLI
+    only ever *adds* a version (``save`` writes the next number; ``import`` refuses one
+    that already exists).  ``export``/``import`` move one version between work roots as
+    a package — a manifest plus the document — and refuse anything that would make the
+    package machine-specific or executable.
     """
+    from ..storage.template_package import (import_package, read_package,
+                                            write_package)
     from ..storage.templates import TemplateStore
 
     store = TemplateStore(coordinator.root)
     if args.sub == 'list':
         return store.index()
+    if args.sub == 'save':
+        return _template_save(args, coordinator, store)
+    if args.sub in ('export', 'import', 'verify'):
+        if args.sub == 'export':
+            return _template_export(args, coordinator, store, write_package)
+        if not args.source:
+            raise NeedsInput('template %s needs a package folder' % args.sub,
+                             path='template',
+                             fixes=['--from <目录>（export 用 --out <目录> 指定目标）'])
+        document, report = read_package(args.source)
+        if args.sub == 'verify':
+            return {**report, 'template': document.to_dict(),
+                    'styles': document.style_table(),
+                    'note': '只扫描，不导入；import 会在这里报出的问题都清掉之后才写入'}
+        return {**import_package(args.source, store),
+                'note': '版本只增不改：目标根已有同名版本时会被拒绝'}
     if not args.template:
         raise NeedsInput('template show needs --template', path='template',
                          fixes=['--template <模板 id>（template list 列出可用模板）'])
@@ -512,6 +1049,44 @@ def action_template(args, coordinator):
     if source == 'stored':
         result['path'] = str(store.path(document.template_id, document.version))
     return result
+
+
+def _template_save(args, coordinator, store):
+    """Capture a project as the *next* version of a template.
+
+    The number is computed, never given by accident: writing over a version a batch
+    already pinned is refused by the store, and the note is what a later reader has
+    instead of a diff.
+    """
+    from ..application.templates import document_from_project
+    from ..storage.templates import BUILTIN_TEMPLATE_ID
+
+    if not args.from_project:
+        raise NeedsInput('template save needs --from-project', path='template',
+                         fixes=['--from-project <工程 id 或目录>：把它的片头/样式存成模板版本'])
+    project = coordinator.load_project(args.from_project)
+    template_id = args.template or BUILTIN_TEMPLATE_ID
+    version = args.version or (max(store.versions(template_id) or [0]) + 1)
+    document = document_from_project(project, template_id=template_id, version=version,
+                                     note=args.note)
+    path = store.save(document)
+    return {'template': document.to_dict(), 'saved': str(path),
+            'versions': store.versions(template_id), 'styles': document.style_table(),
+            'note': '版本只增不改：已有版本不会被覆盖，升级要写下一个号'}
+
+
+def _template_export(args, coordinator, store, write_package):
+    """Write one version as a package folder; a machine-specific template is refused."""
+    if not args.template:
+        raise NeedsInput('template export needs --template', path='template',
+                         fixes=['--template <模板 id> [--version N] [--out <空目录>]'])
+    document = store.load(args.template, args.version or None)
+    out = Path(args.out) if args.out else \
+        coordinator.root / 'template-packages' / ('%s-v%d' % (document.template_id,
+                                                              document.version))
+    written = write_package(document, out)
+    return {**written, 'styles': document.style_table(),
+            'note': '包内只有 package.json 与 template.json：不含路径、凭据与可执行文件'}
 
 
 HANDLERS = {'capabilities': action_capabilities, 'doctor': action_doctor,

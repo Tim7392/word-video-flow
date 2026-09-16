@@ -279,6 +279,35 @@ class Coordinator:
         path = folder / ASSETS_FILENAME
         return AssetIndex.load(folder) if path.is_file() else None
 
+    def create_instance(self, project, registry=None, *, replace_edits=False):
+        """Write one package's own project instance: its document and its registry.
+
+        A batch package gets its own instance so that packages share no mutable
+        state.  An instance a member has already edited (its stored revision is not
+        0) is **not** overwritten by a re-plan: those edits are the member's work,
+        and the caller has to say so explicitly (``replace_edits``) or keep them.
+        """
+        if not isinstance(project, Project):
+            raise SchemaError('an instance needs a Project', path='project')
+        folder = self.project_folder(project.project_id)
+        if not replace_edits:
+            stored = self._stored_document(project.project_id)
+            if stored is not None and int(stored.get('revision', 0) or 0) != 0:
+                raise NeedsInput(
+                    'instance %s has member edits (revision %s)'
+                    % (project.project_id, stored.get('revision')), path='batch',
+                    fixes=['保留这个实例（不改它的词/时间），只重跑它的作业',
+                           '或明确用 replace_edits 重建实例（会丢掉手改）'])
+        self.save_project(project)
+        if registry is not None:
+            registry.with_folder(folder).save(folder)
+        return folder
+
+    def instance_revision(self, project_id):
+        """The stored revision of an instance, or ``None`` when there is none."""
+        stored = self._stored_document(project_id)
+        return None if stored is None else int(stored.get('revision', 0) or 0)
+
     # -- submissions -----------------------------------------------------
     def submit(self, submission, idempotency_key):
         """Freeze one submission under a key; the same key and content is the same job.
@@ -418,6 +447,35 @@ class Coordinator:
         return {'job': job_id, 'state': job['state'],
                 'published': job['state'] == 'succeeded',
                 'artifacts': job['artifacts']}
+
+    def requeue(self, job_id):
+        """Put a delivery that no longer verifies back in the queue, ready to run again.
+
+        ``partial_failed`` means "this was published and the delivery is not there any
+        more" (``reconcile`` decides that from the recorded paths).  Retrying it is the
+        only repair, and the retry must not merge with what is left: the recorded
+        artifacts are dropped, whatever is left in the run folder moves to
+        ``recovery/``, and the job goes back to ``queued`` with its frozen submission —
+        the inputs it was accepted with — untouched.
+
+        A ``succeeded`` job is refused by name: re-running a delivery that verifies is
+        not a repair, it is a second delivery, and that is a new submission.  A job that
+        never ran is refused too: ``resume``/``run`` already handle those.
+        """
+        job = self.status(job_id)
+        if job['state'] != 'partial_failed':
+            raise JobStateError(
+                'task %s is %s, not partial_failed' % (job_id, job['state']),
+                path='job:%s' % job_id,
+                hint='只有"曾发布但产物已损坏/缺失"的任务需要重新排队；'
+                     '没跑过的用 job run，已成功的要改动就提交新任务')
+        folder = self.run_folder(job_id)
+        if folder.exists():
+            self._recover(folder, job_id)
+        with connect(self.db) as con:
+            con.execute('DELETE FROM artifacts WHERE job_id=?', (job_id,))
+        self._set(job_id, state='queued', phase='submitted', control='run', error=None)
+        return self.status(job_id)
 
     # -- running ---------------------------------------------------------
     def run(self, job_id, *, limit_seconds=None):
