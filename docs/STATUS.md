@@ -96,6 +96,10 @@
 | **验收缺口（C 诚实报告，H0 已派修）** | 新入口把语音准备在 `run\.speech\`，**没有 per-asset 记录**，导致验收器 `timing` 面 `data_missing=9`——**"阶段时长=节奏重算"这一面实际上没跑，却仍报 PASS**。这是"看起来全绿、其实少验一面"的假通过，必须修：① QA 适配新布局并**把无法重算的子检查显式标成未执行/partial**（不许"缺数据 → 仍 PASS"）；② B 在新入口运行目录补**最小 per-asset 记录**（role/text/voice/raw 秒/rendered 秒/路径/计划阶段），并作为发布的一部分。**在此之前，新入口的"全绿"要标注计时面未完整执行** |
 | C 提出的档位细节 | 预览画布已是 720p，但**解码仍是工程帧率 60fps**；冻结档位写的是 720p30。降抽帧率会改动 W04 已验收模块，需单派（H0 记为后续项，要求"保持 60fps 能力、默认 30fps 抽帧、记录实测差异、目标机未验"） |
 
+| **A-3：W05 协调器/存储/CLI（已合并 `765e89a`）** | 新增 `storage/coordinator.py`：**一个工作根一个写者**（复用同一把 OS 文件锁）、锁内比对**磁盘 revision**（输方得 `STALE_REVISION` 并写明两个版本号）、旧修订进 `backups/revN.json`；**提交即冻结**（收据含计划身份+导出配置+修订+词条 id、工程修订、每个输入文件 sha256），运行前复核指纹（变了 → `INPUT_CHANGED`）；渲染进 `staging/`，**校验通过才 `os.replace` 进 `runs/` 并同事务登记产物**；取消/暂停在检查点生效、未完成 staging 移入 `recovery/`；`reconcile` 把"running 但无人持锁"判 `interrupted`（**永不 succeeded**）、"已发布但产物缺失/哈希不符"判 `partial_failed`。另增 `application/batches.py`（纯函数批次计划，W08 复用）与 `word_video/cli/`（`capabilities/doctor/project/batch plan|submit/job status|cancel|resume|run/artifacts/receipts/reconcile/watch`，stdout 恒一个 JSON、`NEEDS_INPUT+fixes`、退出码 0/2/1）。**实测**：`batch plan` 跑前跑后文件数 5→5（不落文件）、同键同请求返回同 job、同键换 codec → `IDEMPOTENCY_CONFLICT`、`receipts` 一行可核对、`cancel` 后 `published False/artifacts 0`、强杀后 `reconcile → interrupted` 且半成品进 `recovery/`；真实端到端（`acceptance_media`）1 词工程 `submit→run→发布` 成功。实测中修掉两个真 bug（收据曾登记 staging 路径；运行中取消被当普通失败） |
+| A 的 `AssetRef.voice` | 可选"记录"字段（只记录不校验、非空才写键 → 旧登记表逐字不变）；**`wv-assets@1` 不升版**（新增记录字段、不引入新能力）。同时按 H0 裁决把 `SPLITTABLE_ROLES` 收紧为 **`('background',)`** |
+| **H0 改判：拆片头在命令层拒绝** | 原裁决只说"投影拒绝多段片头"，A 做成**命令层直接拒绝**（`can_split(intro)` 返回 `ok=False` + 理由）。**H0 保留更严做法**：按钮直接不可用胜过"能改但导不出"。连带 4 个用例需按新规则更新（C 的 3 项 + B 的 1 项），已分别派回；C 的 `SPLIT_INTRO_NOT_EXPORTABLE` 保留为**防御性安全网**并要求**直接构造状态**来测它（不许变成死代码）。集成回归当前 **646 passed / 4 failed / 3 分 12 秒**（红的就是这 4 项） |
+
 ### 待决/风险（不阻塞当前开发）
 - GitHub owner/repo 仍未提供 → 只本地提交。
 - 预览档位（720p30/540p30）未批准冻结，实测后再请 Tim 确认。
