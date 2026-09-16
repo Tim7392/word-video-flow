@@ -217,34 +217,46 @@ def _video_stream_seconds(path):
 
 
 def intro_frames_for(lesson):
-    """Frames occupied by the reference intro clip, from the clip itself.
+    """Frames occupied by the intro, from the media that defines it.
 
-    The intro's *audio* length decides the duration, so the first word starts
-    exactly when the countdown sound effect ends.  The clip's picture must cover
-    that length (it may run longer and simply end on black).  An unusable clip
-    fails the job rather than silently dropping the intro.
+    The intro's *sound* decides the duration, so the first word starts exactly
+    when the countdown ends.  Which file that sound comes from is decided by
+    :func:`word_video.media.resolve_intro_audio` - the clip's own soundtrack
+    first, then ``intro_audio`` - and this function reads the length from that
+    same decision.  Reading it from the clip alone made a longer fallback file
+    impossible to fit (the mix would have to cut it) and made the two artifacts
+    describe different intros.
+
+    A silent clip still owns the intro: its picture sets the length when nothing
+    sounds.  The clip's picture must cover the sound (it may run longer and
+    simply end on black).  An unusable clip fails the job rather than silently
+    dropping the intro.
     """
+    from .media import resolve_intro_audio
     clip = dict(lesson.intro or {})
-    if not clip:
-        return 0, ''
     video = clip.get('video')
-    if not video:
-        raise ValueError('intro video path is required')
-    Path(video).resolve(strict=True)
-    audio = clip.get('audio')
-    if audio:
-        Path(audio).resolve(strict=True)
-        seconds = duration(audio)
+    if video:
+        Path(video).resolve(strict=True)
+    elif not (lesson.intro_audio or '').strip():
+        return 0, ''
+    choice = resolve_intro_audio(video, clip.get('audio'), lesson.intro_audio)
+    if choice.silent:
+        # A clip with no usable sound still occupies its own picture length.
+        seconds = _video_stream_seconds(video)
     else:
-        seconds = duration(video)
+        seconds = choice.duration_s
     frames = math.ceil(seconds * lesson.fps)
     if frames <= 0:
-        raise ValueError('intro audio has no usable duration')
-    picture = _video_stream_seconds(video)
-    if picture + 0.05 < seconds:
-        raise ValueError('intro video (%.3fs) is shorter than its audio (%.3fs)'
-                         % (picture, seconds))
-    return frames, str(video)
+        raise ValueError('intro has no usable duration')
+    if video and choice.from_clip:
+        # The clip's picture must cover its own soundtrack; it may run longer and
+        # simply end on black.  A *fallback* file is not part of the clip, so it
+        # may outlast the picture - the background is already running behind it.
+        picture = _video_stream_seconds(video)
+        if picture + 0.05 < seconds:
+            raise ValueError('intro video (%.3fs) is shorter than its audio (%.3fs)'
+                             % (picture, seconds))
+    return frames, (str(video) if video else '')
 
 
 def build_timeline(lesson, speech_assets):

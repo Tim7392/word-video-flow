@@ -1,4 +1,10 @@
-"""Local media IO. No shell strings and no desktop automation."""
+"""Local media IO. No shell strings and no desktop automation.
+
+This module was ``word_video/media.py``; it moved into a package so the newer
+media facts (real sample counts, proxy files, bounded overlap mixing) live next
+to it instead of in a second, competing helper.  Every name it exported before
+is re-exported from :mod:`word_video.media` unchanged.
+"""
 import hashlib
 import json
 import math
@@ -8,6 +14,14 @@ import shutil
 import subprocess
 import tempfile
 import wave
+
+__all__ = ['executable', 'run', 'probe', 'duration', 'has_audio', 'wav_duration',
+           'atomic_json', 'sha256', 'prepare_audio']
+
+# A process that writes nothing for this long is not "slow", it is gone.  The
+# default is generous on purpose: a 4K Tempo pass on a loaded machine is slow
+# but it streams, so it always has bytes to show for itself.
+DEFAULT_TIMEOUT = 300
 
 
 def executable(name):
@@ -21,7 +35,7 @@ def executable(name):
     return path
 
 
-def run(args, timeout=300):
+def run(args, timeout=DEFAULT_TIMEOUT):
     result = subprocess.run([str(x) for x in args], capture_output=True, timeout=timeout,
                             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
     if result.returncode:
@@ -90,7 +104,16 @@ def sha256(path):
 
 
 def prepare_audio(source, target, speed, fps=60):
-    """At tempo ONCE; pad to a whole frame for identical draft/video durations."""
+    """Apply the speed ONCE and return ``(original_s, prepared_s)``.
+
+    ``original_s`` is the source's own duration - the length the timeline has to
+    reserve room for.  ``prepared_s`` is the duration of the WAV this function
+    wrote, which is *not* the same number: the Tempo pass pads the tail by a
+    couple of frames of silence so the mixer never has to reject the item for
+    being a sample too long.  Reporting the padded length as the source length,
+    which an earlier cache did, made a reused cache describe unscaled audio as
+    already processed; the two are now measured separately, from the two files.
+    """
     if not math.isfinite(speed) or not .5 <= speed <= 2:
         raise ValueError('speed must be between 0.5 and 2')
     target = Path(target)
@@ -105,8 +128,13 @@ def prepare_audio(source, target, speed, fps=60):
         run([executable('ffmpeg'), '-v', 'error', '-nostdin', '-n', '-i', source,
              '-vn', '-af', f'atempo={speed},apad,atrim=duration={frames/fps:.9f}',
              '-ar', '48000', '-ac', '1', '-c:a', 'pcm_s16le', temp])
-        rendered = wav_duration(temp)
+        prepared = wav_duration(temp)
+        if prepared * speed + 1e-6 < original:
+            # The processed file must still hold the whole utterance: the Tempo
+            # filter's windowing can round a few samples either way, and a file
+            # that lost part of the speech must fail here, not in the mix.
+            raise RuntimeError('Tempo output is shorter than the speech it must carry')
         os.replace(temp, target)
-        return original, rendered
+        return original, prepared
     finally:
         temp.unlink(missing_ok=True)
