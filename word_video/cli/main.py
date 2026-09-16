@@ -291,7 +291,10 @@ def action_project(args, coordinator):
 def action_batch(args, coordinator):
     project, index, plan = _plan(args, coordinator)
     if args.sub == 'plan':
-        return {'plan': plan.to_dict(), 'wrote_files': False}
+        # The preflight prints what the batch still needs (delivery included) and
+        # writes nothing: an Agent can act on `delivery.fixes` before submitting.
+        return {'plan': plan.to_dict(), 'wrote_files': False,
+                'ready': plan.ready, 'delivery_fixes': list(plan.delivery.fixes)}
     if not args.key:
         raise NeedsInput('submit needs an idempotency key', path='submit',
                          fixes=['加 --key <stable-name>；同一批活重试时复用同一个键'])
@@ -302,6 +305,8 @@ def action_batch(args, coordinator):
                                ['修好工程或素材后重新 plan'])
     folder = args.folder or coordinator.project_folder(args.project)
     submission = submission_for(plan, _inputs(project, index, plan, folder))
+    # An incomplete delivery is refused by the coordinator itself (submit and run use
+    # the one rule), so a missing background comes back as NEEDS_INPUT with fixes.
     receipt = coordinator.submit(submission, args.key)
     return {'job': receipt['job'], 'created': receipt['created'], 'key': receipt['key'],
             'digest': receipt['digest'], 'plan_identity': plan.plan_identity}

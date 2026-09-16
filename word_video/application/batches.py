@@ -8,11 +8,15 @@ either side re-deriving what was meant.
 
 Nothing in this module renders, synthesises or writes a file: planning is the
 preflight an Agent runs before it spends anything, so a plan that cannot be solved
-comes back as structured problems instead of half a batch.
+comes back as structured problems instead of half a batch.  The one thing a plan
+does touch is the delivery's own inputs (the background file), because "the picture
+this delivery uses" is not in the project and a run cannot invent it: see
+:func:`check_delivery`.
 """
 from dataclasses import dataclass, field
 import hashlib
 import json
+from pathlib import Path
 
 from ..domain.errors import SchemaError
 from ..domain.model import Project, Record
@@ -59,6 +63,74 @@ class ExportProfile:
                 'slices': self.slices}
 
 
+#: What a caller can do about a delivery with no picture.  Kept as data with the
+#: check that produces it, so every refusal (plan, submit, run) says the same thing.
+BACKGROUND_FIXES = (
+    '--background <文件>：这次交付的画面底（导出背景是交付设置，不在工程内容里）',
+    r'例如 D:\单词速记自动化_测试归档_0915\_prepared-1080p'
+    r'\background-from-reference-1080p.mp4',
+    '或在编辑器里给工程设置交付背景，导出时由 editor_export 传入',
+)
+
+
+@dataclass(frozen=True)
+class DeliveryCheck:
+    """Whether a delivery profile is complete enough to produce a picture.
+
+    A background file is a *delivery* setting: ``export_run``/``build_manifest`` take
+    it as a parameter and never read one out of the project, so a batch without one
+    reaches the draft and render steps with an **empty** path.  ``Path('')`` is the
+    current working directory, so that failure arrives as ``PermissionError: [Errno
+    13]`` on a folder — an INTERNAL error about the cwd, days after the cause.  The
+    check turns it into a named problem with a fix, before anything is frozen.
+    """
+
+    ready: bool = False
+    background: str = ''
+    problems: tuple = ()
+    fixes: tuple = ()
+
+    def to_dict(self):
+        return {'ready': self.ready, 'background': self.background,
+                'problems': [problem.to_dict() for problem in self.problems],
+                'fixes': list(self.fixes)}
+
+
+def check_delivery(profile):
+    """Check the delivery inputs a run cannot invent (today: the background file)."""
+    if not isinstance(profile, ExportProfile):
+        raise SchemaError('a delivery check needs an ExportProfile', path='profile')
+    background = str(profile.background or '').strip()
+    if not background:
+        return DeliveryCheck(
+            ready=False, background='',
+            problems=(Conflict(code='BACKGROUND_MISSING',
+                               message='这次交付没有背景文件（导出背景不是工程内容）',
+                               path='profile.background',
+                               hint='给出一个存在的视频文件，或先在编辑器里设置交付背景'),),
+            fixes=BACKGROUND_FIXES)
+    if not Path(background).is_file():
+        return DeliveryCheck(
+            ready=False, background=background,
+            problems=(Conflict(code='BACKGROUND_FILE_MISSING',
+                               message='背景文件不存在：%s' % background,
+                               path='profile.background',
+                               hint='--background 指向存在的视频文件'),),
+            fixes=('--background <存在的视频文件>（当前：%s）' % background,))
+    try:
+        with open(background, 'rb') as stream:
+            stream.read(1)
+    except OSError as error:
+        return DeliveryCheck(
+            ready=False, background=background,
+            problems=(Conflict(code='BACKGROUND_UNREADABLE',
+                               message='背景文件打不开：%s（%s）' % (background, error),
+                               path='profile.background',
+                               hint='换一个可读的文件，或修好它的权限'),),
+            fixes=('--background <可读的视频文件>（当前打不开：%s）' % background,))
+    return DeliveryCheck(ready=True, background=background)
+
+
 @dataclass(frozen=True)
 class BatchPlan:
     """The frozen preflight: what would run, over which revision, and its identity."""
@@ -73,10 +145,19 @@ class BatchPlan:
     assets: tuple = ()
     problems: tuple = ()
     estimated_seconds: float = 0.0
+    #: The delivery inputs, checked at plan time.  ``problems`` stays about solving
+    #: the lesson, so a caller can tell "this project cannot be solved" from
+    #: "this delivery is missing its picture".
+    delivery: DeliveryCheck = DeliveryCheck()
 
     @property
     def ok(self):
         return not self.problems
+
+    @property
+    def ready(self):
+        """Solved *and* deliverable: what a submission needs to be accepted."""
+        return self.ok and self.delivery.ready
 
     def to_dict(self):
         return {'project_id': self.project_id, 'revision': self.revision,
@@ -87,6 +168,7 @@ class BatchPlan:
                 'plan_identity': self.plan_identity, 'total_ticks': self.total_ticks,
                 'assets': list(self.assets),
                 'estimated_seconds': round(self.estimated_seconds, 3),
+                'delivery': self.delivery.to_dict(),
                 'problems': [problem.to_dict() for problem in self.problems]}
 
 
@@ -173,7 +255,8 @@ def plan_batch(project, media, selection=None, profile=None, intro=None):
         selection=selection, profile=profile, records=records,
         plan_identity=plan.identity() if plan is not None else '',
         total_ticks=total_ticks, assets=tuple(assets), problems=tuple(problems),
-        estimated_seconds=_estimated_seconds(plan) if plan is not None else 0.0)
+        estimated_seconds=_estimated_seconds(plan) if plan is not None else 0.0,
+        delivery=check_delivery(profile))
 
 
 def submission_for(plan, input_paths=(), key=''):
