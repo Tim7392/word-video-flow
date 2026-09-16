@@ -111,6 +111,10 @@
 | **QA 抓到 B 侧新缺陷（已派 B）** | **多段背景 + 非整帧舞台 → 剪映草稿导出必失败**：舞台 2556000 tick = 106.5 帧（30fps），`build_background_track` 产出片段文件 3.5340s = 106.0195 帧（**差 -0.48 帧**），而 `draft.py` 按整段舞台请求源区间 [0, 3566667us] > 素材 3534000us → `pyJianYingDraft ValueError: 读取媒体时间范围超出媒体时长`。整帧舞台（各 108 帧）时正常。修法二选一（`ceil(stage*fps)` 取齐并末段补足，或草稿把源区间夹到素材时长），**红线**：新增"非整帧舞台"用例且**未拆分工程产物仍逐字节一致** |
 | 测试纪律问题（已派独立 worktree） | 编辑器用例**顺序相关**：`test_the_intro_is_not_splittable_and_the_window_says_so` 单跑/两文件跑通过、三文件一起或全套**失败**（状态泄漏，非逻辑错）；当前集成树 **684 passed / 1 failed / 约 7 分钟**。已在 `worktrees\Ctests`（分支 `task/Ctests`，从 main 建）派人修**顺序无关**，并要求用会话级 fixture 降 GUI setup 成本（必要时加 `gui_slow` 标记，覆盖不减）。**这次先建独立 worktree，避免重演上次"同目录双写者"事故** |
 
+| **A-7（voice/template + 导入子命令 + 两项缺陷修复，已合并 `059ff66`）** | ① `voice list\|import`、`template list\|show`（`wv-template@1` + `TemplateStore`，版本只增不改）、`capabilities.notes` 说明 `pause` **只是检查点控制位**（渲染中不停、停下退回 queued）；② **顺手修掉一个真缺陷**：stdout 写音标（U+02C8）会抛 `UnicodeEncodeError` → 动作成功却给调用方 traceback，现在 `main()` 固定重配 stdout/stderr 为 UTF-8（显式传入的流不动）；③ 缺陷①按"直接导出到最终目录"修（未校验由作业状态 + `complete.json` 最后写表达，失败/取消整目录移 `recovery/`，新增 `Coordinator.cleanup()`）；④ 缺陷②`application/batches.py::check_delivery` 成为唯一规则（非空+存在+可读 1 字节）→ `NEEDS_INPUT` 带 3 条可执行修复项，**旧版本冻结的提交同样按 NEEDS_INPUT 拒绝** |
+| **H0 独立复验红线：发布路径（`tools/verify_coordinator_publish.py`，已入库）** | 在**主干**上亲自跑，**PASS**：缺背景 `plan ready=false`（+3 fixes）→ `submit` exit 2 `NEEDS_INPUT` 且 **`receipts []`（什么都没冻结）**；给背景后 `job run` succeeded、**44 产物**；发布目录三份文档 **`complete.json` 43 路径 / `timeline.json` 9 / `draft_content.json` 12，`missing=0`、`staging=0`**；`staging/` 目录不存在；**独立验收器在运行目录上 `verdict=PASS / failures=[]`**。这条曾导致 integrity(43 missing)/draft/timing 三面全红的缺陷已闭环 |
+| 集成回归（A-7 后） | **710 passed / 21 deselected / 49 subtests / 2 分 55 秒**（全绿）。说明：此前观测到的 4–7 分钟里**有一部分是与其它 Agent 的重构建争机器**，不全是测试本身；编辑器用例的顺序相关失败本次全套未复现（属**偶发/负载相关**），独立 worktree `Ctests` 仍在做根因与降本 |
+
 ### 待决/风险（不阻塞当前开发）
 - **并发上限的短暂超出**：当前同时有 4 个开发位（A 的 W08/缺陷、B 的多段背景修复、C 的 C-5 收尾、Ctests 的用例顺序修复）+ QA，超出"最多 3 开发 + 1 QA"一格。原因是 C-5 已进入收尾（构建+清洗环境验证，分钟级），我选择等它自然结束而**不中断**已完成的构建，**在此期间不再新开任何开发任务**；C-5 一结束即回到 3 开发位。
 - GitHub owner/repo 仍未提供 → 只本地提交。

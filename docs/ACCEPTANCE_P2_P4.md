@@ -56,7 +56,7 @@
 
 | 组 | 状态 |
 |---|---|
-| **A 组（Agent 自动化）** | **7/7 通过**：H0 用 `repo\tools\verify_cli_contract.py` 独立核对（自建工程、自发命令、自判 stdout/退出码），报告 `out\reports\w05-cli-contract.json`。含 `batch plan` 不落文件、同键同请求同 job、同键换内容 `IdempotencyConflict`、cancel 后 `published=False`、`NeedsInput` 带 `fixes`、退出码 0/1/2、`reconcile` 返回结构。**未验**：独立 worker 进程（`job run` 目前前台、取消在检查点生效）、并发 worker 池、`pause` 无"渲染中暂停"语义 |
+| **A 组（Agent 自动化）** | **7/7 通过**：`repo\tools\verify_cli_contract.py` 独立核对（自建工程、自发命令、自判 stdout/退出码），报告 `out\reports\w05-cli-contract.json`；**A5/A7 另加"发布路径"红线**：`repo\tools\verify_coordinator_publish.py` 实测发布目录三份文档 `missing=0 / staging=0`、`staging/` 不存在、独立验收器在运行目录 `PASS`（`out\reports\h0-publish-check.json`）。**未验**：独立 worker 进程（`job run` 前台、取消在检查点生效）、并发 worker 池、真 `kill -9` 对账（开发侧用"杀 worker 留下的半成品"模拟） |
 | **B 组（成员可用）** | **部分通过**：C 的 W06 端到端（三词不手改 JSON → 42/43 文件 → 独立验收器 PASS）已达成 B1/B4/B5/B6/B7；B2/B3 有逐对象与结构化拒绝证据；**B8 只有本机高配数字（未在目标核显机）**；**新入口的验收器计时面因缺少 per-asset 记录而"未执行"**（B 在补，QA 在改判定口径），在此之前 B 组的结论要带这条限定 |
 | **C 组（交付与恢复）** | **待做**：成员包旧版（0.2.1）已过受限环境三词，但**不带编辑器**；C 正在做"包带编辑器"（C-5）。W10 旧字幕适配未开始 |
 | **D 组（人工）** | **全部待验**：剪映改稿/听感/成员试用/目标机 —— 前两项草稿与卡片已就绪
