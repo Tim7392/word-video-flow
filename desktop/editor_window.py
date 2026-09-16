@@ -101,6 +101,9 @@ class EditorWindow(QtWidgets.QMainWindow):
         #: offer the same list again without asking the member to find it twice.
         self.last_legacy = None
         self._last_wordlist = ''
+        #: The last import attempt's own account of itself (ok, reason, fix).  Read by
+        #: the driven run's report, so a failed import is never just "ok: false".
+        self.last_import = None
         self._build_ui()
         self._build_menus()
         if folder is not None:
@@ -281,7 +284,7 @@ class EditorWindow(QtWidgets.QMainWindow):
     def _build_menus(self):
         file_menu = self.menuBar().addMenu('文件')
         self.action_open = file_menu.addAction('打开工程…', self.choose_open)
-        self.action_import = file_menu.addAction('从请求导入三词工程…', self.choose_import)
+        self.action_import = file_menu.addAction('从请求导入工程…', self.choose_import)
         file_menu.addSeparator()
         self.action_save = file_menu.addAction('保存', self.save, 'Ctrl+S')
         self.action_export = file_menu.addAction('导出三产物', self.export, 'Ctrl+E')
@@ -451,6 +454,10 @@ class EditorWindow(QtWidgets.QMainWindow):
                                     % (presentation.position_seconds,
                                        presentation.generation, presentation.state))
         self.timeline.set_playhead(presentation.position_ticks)
+        # The canvas draws "preparing" itself; the label repeats it because a member
+        # who is looking at the status bar must not have to guess either.
+        if presentation.preparing and self.state_label.text() != presentation.preparing:
+            self.state_label.setText(presentation.preparing)
 
     def _update_title(self):
         if self.state is None:
@@ -1070,16 +1077,29 @@ class EditorWindow(QtWidgets.QMainWindow):
 
     def import_request(self, request, target):
         from .editor_import import import_request
+        self.last_import = None
         try:
             folder = import_request(request, target)
         except (ValueError, CatalogError, ProjectError, OSError) as error:
+            # The driven report needs the reason even when there is no project open to
+            # hang a notice card on: H0 hit exactly that (``import.ok=false`` and an
+            # empty ``messages`` list), and a failure with no reason is not a report.
+            self.last_import = {'ok': False, 'type': type(error).__name__,
+                                'reason': str(error),
+                                'fix': getattr(error, 'fix', '')
+                                       or '检查请求 JSON、词表路径与配音文件是否都在本机',
+                                'request': str(request), 'into': str(target)}
             notice = notices.Notice(code=type(error).__name__,
                                     message='导入失败：%s' % error,
                                     severity=notices.SEVERITY_BLOCK,
-                                    hint='检查请求 JSON、词表路径与配音文件是否都在本机')
+                                    hint=self.last_import['fix'])
             self.refresh_notices(extra=(notice,))
             self.status.showMessage('导入失败：%s' % error)
             return None
+        self.last_import = {'ok': True, 'request': str(request), 'into': str(target),
+                            'project_dir': str(folder.path),
+                            'records': len(folder.project.records),
+                            'clips': len(folder.project.clips)}
         self.attach(folder)
         self.status.showMessage('已导入 %d 个词到 %s'
                                 % (len(folder.project.records), folder.path))
