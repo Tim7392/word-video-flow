@@ -144,10 +144,13 @@ def export_run(project_path, *, output=None, run_name='', background=None,
     solution = solve(project, media)
     styles, font_paths, font_names = _styles()
     run_dir = Path(output) / (run_name or ('rev%d' % project.revision))
+    # A published batch may be checked by an independent reader that treats every
+    # file under the run folder as part of the delivery, so an existing folder is
+    # refused instead of merged with an older run.
     if run_dir.exists() and any(run_dir.iterdir()):
         raise ExportError('output folder is not empty: %s' % run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
-    speech_dir = run_dir / 'speech'
+    speech_dir = run_dir / '.speech'
     sources = {}
     for clip in project.clips:
         if clip.source is None or clip.role not in ('female', 'male', 'chinese'):
@@ -206,7 +209,29 @@ def export_run(project_path, *, output=None, run_name='', background=None,
                                   'tracks': {track: len(solution.cues.by_track()[track])
                                              for track in CUE_TRACKS}})
     _atomic_json(run_dir / 'export.json', result.to_dict())
+    _publish_record(run_dir)
     return result
+
+
+def _publish_record(run_dir):
+    """``complete.json``: the digest of everything this run published.
+
+    The same record the verified chain writes, and the one the independent
+    acceptance checker reads: ``{files: [{path, sha256}]}`` covering every file in
+    the run folder.  It is written last, so a failure earlier leaves no record
+    claiming a complete run - which is exactly what a reader must be able to trust.
+    """
+    from ..media import atomic_json, sha256
+
+    run_dir = Path(run_dir)
+    recorded = run_dir / 'complete.json'
+    published = sorted((path for path in run_dir.rglob('*')
+                        if path.is_file() and path != recorded),
+                       key=lambda path: str(path).lower())
+    if not published:
+        raise ExportError('nothing was published in %s' % run_dir)
+    return atomic_json(recorded, {'files': [{'path': str(path), 'sha256': sha256(path)}
+                                            for path in published]})
 
 
 def _atomic_json(path, value):
