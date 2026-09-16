@@ -21,6 +21,7 @@ heavy pixel comparison runs under the ``acceptance_media`` marker and writes its
 evidence to ``out/reports/``.
 """
 import json
+import math
 from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
@@ -93,16 +94,20 @@ def a_lesson(evidence):
 
     project = instantiate(
         DEFAULT_LESSON_TEMPLATE, records, media,
-        Project(project_id='qa-split-bg', intro_s=0.6, fps_num=FPS, width=320,
+        Project(project_id='qa-split-bg', intro_s=0.5, fps_num=FPS, width=320,
                 height=180, speed=1.0),
         background=MediaSlice('layer.background', 0, 200000))
     total = project.clip('layer.background').duration_ticks
     project = apply(project, SplitClip('layer.background', total // 2)).project
     # Give each piece its own colour, so the film can be asked which piece is on
-    # screen - the plan only knows ticks and windows.
-    clips = tuple(replace(clip, source=MediaSlice('qa:bg-red', 0, 576000))
+    # screen - the plan only knows ticks and windows.  The window is short on
+    # purpose: each piece then has to LOOP inside its own stage, which is the
+    # configuration that exposed the frame-alignment defect (a 106.5-frame stage
+    # whose piece file carried only 106 frames, so the draft read past its
+    # material and pyJianYingDraft refused the document).
+    clips = tuple(replace(clip, source=MediaSlice('qa:bg-red', 0, 19200))
                   if clip.id == 'layer.background' else
-                  replace(clip, source=MediaSlice('qa:bg-blue', 0, 576000))
+                  replace(clip, source=MediaSlice('qa:bg-blue', 0, 19200))
                   if clip.id == 'layer.background.2' else clip
                   for clip in project.clips)
     project = project.with_clips(clips)
@@ -115,6 +120,29 @@ def a_lesson(evidence):
                           styles=default_styles())
     pieces = background_segments(solution.render, sources)
     return project, media, solution, view, sources, pieces, red, blue
+
+
+def frame_at(ticks):
+    """The frame a project instant falls in, half-up - the plan's own conversion.
+
+    Restated here on purpose: the two ends of a piece decide how many frames it
+    carries, and that is the number the fix (ffcbe97) made consistent across the
+    plan, the piece files and the draft.
+    """
+    return (int(ticks) * FPS + TICKS // 2) // TICKS
+
+
+def video_frame_count(path):
+    """Frames the file really carries, from the stream itself."""
+    _, ffprobe = media_tools()
+    out = subprocess.run([ffprobe, '-v', 'error', '-select_streams', 'v:0',
+                          '-count_frames', '-show_entries',
+                          'stream=nb_read_frames', '-of', 'csv=p=0', str(path)],
+                         capture_output=True, text=True)
+    value = out.stdout.strip().splitlines()[-1] if out.stdout.strip() else ''
+    if not value.isdigit():
+        raise AssertionError('无法读出 %s 的帧数：%r' % (path, out.stdout[-200:]))
+    return int(value)
 
 
 def frame_pixel(path, seconds):
@@ -159,12 +187,9 @@ def test_the_plan_publishes_two_contiguous_pieces(tmp_path):
     assert left.start_ticks == 0
     assert right.end_ticks == view.total_frames * TICKS // view.fps
     # Each piece is its own cut of its own file, so each window is independent.
-    # The window is longer than the stage on purpose: the piece then needs no
-    # repeat, which is the case the delivered draft supports today.  (A piece that
-    # *loops* currently makes the draft read past its material - see the note in
-    # test_the_draft_carries_one_editable_segment_per_piece.)
-    assert (left.source_start, left.source_end) == (0, 576000)
-    assert (right.source_start, right.source_end) == (0, 576000)
+    # The window is short on purpose: the piece has to loop inside its stage.
+    assert (left.source_start, left.source_end) == (0, 19200)
+    assert (right.source_start, right.source_end) == (0, 19200)
     assert 'red' in left.path and 'blue' in right.path, (left.path, right.path)
     # Each piece fills its own stage, so the two stages together are the lesson.
     assert abs(sum(piece.stage_seconds for piece in pieces)
@@ -185,11 +210,20 @@ def test_each_planned_piece_reaches_the_delivered_film(tmp_path):
             target.unlink()
         outputs.append(build_background_track([piece], target, fps=view.fps,
                                              size=(view.width, view.height)))
-    # Each piece covers its own stage, and together they cover the lesson.
+    # Each piece covers its own stage, and together they cover the lesson.  The
+    # frame count is the check the alignment defect violated: the plan counts a
+    # piece as ``frame_at(end) - frame_at(start)`` (both ends half-up), so the two
+    # 106.5-frame stages of a 213-frame lesson are carried by 107 and 106 frames -
+    # not by two 106-frame files, which left the second stage a frame short.
     stages = [piece.stage_seconds for piece in pieces]
     lengths = [video_stream_seconds(path) for path in outputs]
-    for length, stage in zip(lengths, stages):
+    planned = [frame_at(piece.end_ticks) - frame_at(piece.start_ticks) for piece in pieces]
+    assert sum(planned) == view.total_frames, (planned, view.total_frames)
+    for path, length, stage, piece, want in zip(outputs, lengths, stages, pieces, planned):
+        file_frames = video_frame_count(path)
         assert length + 0.05 >= stage, (length, stage)
+        assert file_frames == want, (
+            '%s 有 %d 帧，计划要 %d 帧' % (piece.clip_id, file_frames, want))
     assert abs(sum(lengths) - view.total_frames / view.fps) <= 1.0
     # The picture itself: the halves must not look the same.
     first = frame_pixel(outputs[0], lengths[0] / 2)
@@ -203,14 +237,13 @@ def test_each_planned_piece_reaches_the_delivered_film(tmp_path):
 def test_the_draft_carries_one_editable_segment_per_piece(tmp_path):
     """The draft's background track is the plan, not a summary of it.
 
-    Known defect (reported to H0, not hidden here): this case is built so each
-    piece needs no repeat.  When a piece's stage is not a whole number of frames
-    the looped piece file comes out one frame shorter than the stage
-    (stage 106.5 frames -> file 106.0195 frames), and the draft then asks the
-    material for the whole stage and ``pyJianYingDraft`` refuses with
-    ``ValueError: 读取媒体时间范围 ... 超出媒体时长``.  The same project with a
-    looping piece therefore cannot export a draft today; the fix belongs in the
-    piece/loop rounding, and this test will cover it once that lands.
+    This is the configuration that exposed the frame-alignment defect (fixed in
+    ``ffcbe97``): each stage is 2556000 ticks = 106.5 frames at 30 fps, so a piece
+    file rounded to 106 frames could not cover its stage and the draft asked the
+    material for more time than it had (``pyJianYingDraft`` refused the document).
+    The checks below are the ones that defect violated: every segment's source
+    window must stay inside its material, the stages must be covered end to end,
+    and the two pieces must be two different files.
     """
     from word_video.draft import export_draft
 
@@ -234,34 +267,55 @@ def test_the_draft_carries_one_editable_segment_per_piece(tmp_path):
     materials = {item['id']: item for group in draft['materials'].values()
                  if isinstance(group, list) for item in group
                  if isinstance(item, dict) and 'id' in item}
+    # The track is laid out end to end with boundaries snapped to whole frames, so
+    # a boundary may sit up to one frame away from the plan's tick - checked, not
+    # assumed, and never more than that.
+    one_frame = 1e6 / view.fps
+    assert segments[0]['target_timerange']['start'] == 0
+    for left, right in zip(segments, segments[1:]):
+        left_end = left['target_timerange']['start'] + left['target_timerange']['duration']
+        assert abs(right['target_timerange']['start'] - left_end) <= 2, (left, right)
+    total_us = view.total_frames * 1e6 / view.fps
+    covered_end = max(item['target_timerange']['start'] + item['target_timerange']['duration']
+                      for item in segments)
+    assert abs(covered_end - total_us) <= one_frame + 2, (covered_end, total_us)
     for piece in pieces:
         start_us = round(piece.start_ticks * 1e6 / TICKS)
         end_us = round(piece.end_ticks * 1e6 / TICKS)
-        covered = sorted((item['target_timerange']['start'],
-                          item['target_timerange']['start']
-                          + item['target_timerange']['duration'])
-                         for item in segments
-                         if start_us - 2 <= item['target_timerange']['start'] < end_us)
-        assert covered, 'piece %s 没有落到草稿上' % piece.clip_id
-        # Contiguous coverage of the stage: no hole between the loop segments.
-        for (left_start, left_end), (right_start, _) in zip(covered, covered[1:]):
-            assert abs(left_end - right_start) <= 2, (piece.clip_id, covered)
-        assert abs(covered[0][0] - start_us) <= 2, (piece.clip_id, covered[:1])
-        assert abs(covered[-1][1] - end_us) <= 2, (piece.clip_id, covered[-1:])
-    # Each piece's material is a file that lives inside the draft folder, and the
-    # two pieces are two different files.
-    paths = []
-    for piece in pieces:
-        match = [item for item in materials.values()
-                 if isinstance(item, dict) and 'path' in item
-                 and Path(str(item['path'])).name
-                 and Path(str(item['path'])).stat().st_size > 0
-                 and Path(str(item['path'])).is_file()
-                 and Path(str(item['path'])).resolve().is_relative_to(target.resolve())]
-        assert match, 'piece %s 的素材不在草稿目录里' % piece.clip_id
+        inside = [item for item in segments
+                  if start_us - one_frame - 2 <= item['target_timerange']['start']
+                  < end_us - 2]
+        assert inside, 'piece %s 没有落到草稿上' % piece.clip_id
+        first = min(item['target_timerange']['start'] for item in inside)
+        last = max(item['target_timerange']['start'] + item['target_timerange']['duration']
+                   for item in inside)
+        assert abs(first - start_us) <= one_frame + 2, (piece.clip_id, first, start_us)
+        assert abs(last - end_us) <= one_frame + 2, (piece.clip_id, last, end_us)
+    # Each piece's material is a file that lives inside the draft folder, and every
+    # segment's source window has to stay inside the material it reads - the check
+    # the frame-alignment defect violated.
+    for segment in segments:
+        material = materials[segment['material_id']]
+        path = Path(str(material['path']))
+        assert path.is_file(), path
+        assert path.resolve().is_relative_to(target.resolve()), path
+        source = segment.get('source_timerange') or {}
+        start = int(source.get('start', 0))
+        length = int(source.get('duration', 0))
+        available = int(material.get('duration') or 0)
+        assert available > 0, material
+        assert start + length <= available + 2000, (
+            'piece %s 的 segment 读了素材之外：%d + %d > %d'
+            % (segment.get('id', '?'), start, length, available))
+    # The two pieces reach the draft as two different files.
     paths = sorted({str(item['path']) for item in materials.values()
                     if isinstance(item, dict) and 'path' in item})
-    assert len([p for p in paths if p.endswith('.mp4')]) >= 2, paths
+    videos = [p for p in paths if p.endswith('.mp4')]
+    assert len(videos) >= 2, paths
+    # And the frame counts the plan reserves are what the pieces carry: 106.5
+    # frames per stage, so the two pieces together must cover 213 frames exactly.
+    frames = sum(int(item['target_timerange']['duration']) for item in segments)
+    assert abs(frames - round(view.total_frames * 1e6 / view.fps)) <= 2000, frames
 
 
 def test_a_hole_between_the_pieces_is_refused_by_name(tmp_path):
@@ -323,13 +377,29 @@ def test_a_split_intro_is_refused_by_name(tmp_path):
         replace(DEFAULT_LESSON_TEMPLATE, intro=True), (record,), media,
         Project(project_id='qa-split-intro', intro_s=2.0, fps_num=FPS),
         intro=MediaSlice(clip, 0, 48000), intro_measure=measurement)
+    # The refusal now happens where the user asks for it: the command layer knows
+    # the intro is the single countdown stage and refuses the cut by name, instead
+    # of letting a two-intro project exist and failing at projection time.
+    from word_video.domain.errors import SplitNotAllowedError
+    with pytest.raises(SplitNotAllowedError) as raised:
+        apply(project, SplitClip('layer.intro', 360000))
+    message = str(raised.value)
+    assert 'intro' in message, message
+    # The projection layer keeps refusing the same shape, so a document that
+    # somehow carries two intro items still cannot be exported half-drawn.
+    from word_video.domain import Clip, TimeExpr, solve
     total = project.clip('layer.intro').duration_ticks
-    project = apply(project, SplitClip('layer.intro', total // 2)).project
-    solution = solve(project, media, measurement)
+    clips = tuple(clip for clip in project.clips if clip.id != 'layer.intro')
+    clips += (project.clip('layer.intro'),
+              Clip(id='layer.intro.2', role='intro', start=TimeExpr.at(total // 2),
+                   duration_ticks=total - total // 2,
+                   source=MediaSlice(clip, 24000, 48000)))
+    doubled = project.with_clips(clips)
+    solution = solve(doubled, media, measurement)
     sources = {'w1:%s' % role: SourceMedia(path='unused.wav', voice='V')
                for role in ('female', 'male', 'chinese')}
     with pytest.raises(ProjectionError) as raised:
-        build_manifest(solution.render, project, sources, background=clip,
+        build_manifest(solution.render, doubled, sources, background=clip,
                        styles=default_styles())
     message = str(raised.value)
     assert 'split' in message, message
