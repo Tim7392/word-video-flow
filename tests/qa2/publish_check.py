@@ -158,6 +158,19 @@ def check_document(path, run_dir):
             'ok': not missing and not staging and (inputs_allowed or not outside)}
 
 
+def delivery_from_project(project_file):
+    """The background the project's own ``delivery.json`` states, or None."""
+    path = Path(project_file)
+    if not path.exists():
+        return None
+    try:
+        document = json.loads(path.read_text(encoding='utf-8'))
+    except ValueError:
+        return None
+    value = document.get('background') or ''
+    return str(Path(value).resolve()) if value else None
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--worktree', required=True)
@@ -168,6 +181,12 @@ def main(argv=None):
     parser.add_argument('--codec', default='h265')
     parser.add_argument('--refusal-key', default='qa7-refusal-1')
     parser.add_argument('--key', default='qa7-published-1')
+    parser.add_argument('--project-file', dest='project_file', default=None,
+                        help='该工程的 delivery.json，用来核对“继承”是否真的发生')
+    parser.add_argument('--refusal-project', dest='refusal_project', default=None,
+                        help='没有交付设置的工程（判拒绝面必须用它）')
+    parser.add_argument('--refusal-project-file', dest='refusal_project_file',
+                        default=None)
     parser.add_argument('--range', default=None, help='验收器用的范围，默认同 --batch')
     parser.add_argument('--wordlist', default=None)
     parser.add_argument('--json', default=None)
@@ -184,12 +203,38 @@ def main(argv=None):
 
     plan = run([*cli, 'batch', 'plan', '--project', args.project,
                 '--batch', args.batch], worktree)
-    report['calls']['plan_without_background'] = plan
-    delivery = ((plan['payload'] or {}).get('result') or {}).get('plan', {}).get('delivery')
+    report['calls']['plan_without_argument'] = plan
+    delivery = ((plan['payload'] or {}).get('result') or {}).get('plan', {}).get('delivery') or {}
+    # A project that carries delivery settings is ready without --background: the
+    # plan inherits them.  Checked by comparing with the project's own file rather
+    # than by trusting the flag.
+    stated = None
+    if args.project_file:
+        stated = delivery_from_project(Path(args.project_file))
+    inherited_background = delivery.get('background') or ''
+    report['plan_without_argument'] = {
+        'project': args.project, 'ready': delivery.get('ready'),
+        'background': inherited_background,
+        'delivery_json_background': stated,
+        'matches_delivery_json': (stated is None or inherited_background == stated),
+        'problems': delivery.get('problems')}
+
+    # The refusal case has to use a project with *no* delivery settings; a project
+    # that carries a background is supposed to be ready.
+    refusal_project = args.refusal_project or args.project
+    refusal_file = args.refusal_project_file
+    plan_refusal = run([*cli, 'batch', 'plan', '--project', refusal_project,
+                        '--batch', args.batch], worktree)
+    report['calls']['plan_without_background'] = plan_refusal
+    refused = ((plan_refusal['payload'] or {}).get('result') or {}).get('plan', {}).get('delivery') or {}
     report['plan_refused_without_background'] = bool(
-        delivery and delivery.get('ready') is False
+        refused.get('ready') is False
         and any(item.get('code') == 'BACKGROUND_MISSING'
-                for item in delivery.get('problems', [])))
+                for item in refused.get('problems', [])))
+    if plan_refusal is not plan:
+        report['refusal_project'] = refusal_project
+        report['refusal_project_delivery_json'] = (delivery_from_project(Path(refusal_file))
+                                                   if refusal_file else 'unknown')
 
     def receipt_rows():
         payload = run([*cli, 'receipts'], worktree)['payload'] or {}
@@ -198,7 +243,7 @@ def main(argv=None):
         return rows if isinstance(rows, list) else []
 
     before = receipt_rows()
-    submit_without = run([*cli, 'batch', 'submit', '--project', args.project,
+    submit_without = run([*cli, 'batch', 'submit', '--project', refusal_project,
                           '--batch', args.batch, '--key', args.refusal_key,
                           '--codec', args.codec], worktree)
     report['calls']['submit_without_background'] = submit_without
