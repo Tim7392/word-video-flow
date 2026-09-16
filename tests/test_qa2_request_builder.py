@@ -61,7 +61,10 @@ def arguments(archive, wordlist, out, output):
         'output': str(output), 'key': 'k', 'first': 1, 'last': 3,
         'background': None, 'intro': None, 'intro_s': 1.0, 'width': 1920,
         'height': 1080, 'fps': 60, 'speed': 1.25, 'video_codec': None,
-        'concurrency': 1})()
+        'concurrency': 1,
+        # QA-3 added a source+range mode with a spoken policy; the entries mode
+        # tested here must stay the default.
+        'source_mode': False, 'policy': None, 'spoken_file': None})()
 
 
 def test_request_words_come_from_the_word_list_not_the_timeline(tmp_path):
