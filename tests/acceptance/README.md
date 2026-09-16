@@ -35,18 +35,21 @@ cd D:\1\1-AI_workflow\word_video_flow\worktrees\QA
 
 ```
 D:\1\1-AI_workflow\word_video_flow\out\reports\
-    gate-matrix-<日期>.json              媒体矩阵汇总（15 行判定表 + 命中的面）
+    gate-matrix-<日期>.json              媒体矩阵汇总（15 行判定表 + 命中的面 + _evidence 路径）
     gate-matrix-out-<日期>\range-*.json  每个样本的完整八面报告
     reproduction-vs-archive.json         复现批次 vs 归档的字段/SRT/哈希对照
     reproduction-request.json            本次复现用的请求（证据可复现）
+    reproduction-batch.txt               本次复现批次目录（复用时指向上次的批次）
     policy-accept-v2.json / policy-accept-legacy.json
     policy-legacy-vs-archive.json         legacy 批必须仍等于归档
     policy-v2-vs-legacy.json              两批差异面（只允许朗读文本 + 05 轨）
+    gate-aac-samples.json                 采样数三种口径的复算
     stamp-*.json                          指纹：哪次运行的源码/输入与这份证据对应
 ```
 
 `out\reports` 不可写时会**响亮退化**到 `runtime\tmp\QA\gate`，并在证据里记 `warning`；
-`run_fault_matrix.py` 的 `--json` 一律给稳定路径，不要只留在 pytest tmp。
+**所有** 步骤（含媒体矩阵）的 `--json` 都写这里，不允许只留在 pytest tmp——tmp 会被 pytest
+收尾删掉，等于没有证据。
 
 ## 复用规则（为什么第二次跑很快）
 
