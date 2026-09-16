@@ -200,19 +200,33 @@ def spoken_of(meaning, cleaning):
     return text.strip() if cleaning == 'legacy' else ' '.join(text.split())
 
 
-def load_expectations(wordlist, first, last, cleaning):
+def load_expectations(wordlist, first, last, cleaning, spoken_file=None):
+    """Expectations for one range.
+
+    ``spoken_file`` optionally replaces the *derived* reading text with a table
+    computed elsewhere (``{index: spoken_meaning}`` JSON).  The acceptance tool
+    then compares the batch against that table instead of its own rule, which is
+    how an approved policy change is judged without editing the tool.  The word,
+    phonetic and display meaning still come from the read-only word list.
+    """
     path = Path(wordlist)
     lines = [line.strip() for line in path.read_text(encoding='utf-8-sig').splitlines()]
     entries = [line for line in lines if line]
     if not (1 <= first <= last <= len(entries)):
         raise SystemExit('range %d-%d is outside the %d entries of %s'
                          % (first, last, len(entries), path))
+    supplied = {}
+    if spoken_file:
+        raw = json.loads(Path(spoken_file).read_text(encoding='utf-8'))
+        supplied = {int(key): value for key, value in raw.items()}
     words = []
     for index in range(first, last + 1):
         word, phonetic, meaning = split_entry(entries[index - 1])
         words.append({'index': index, 'word': word, 'phonetic': phonetic,
-                      'meaning': meaning, 'spoken_meaning': spoken_of(meaning, cleaning)})
+                      'meaning': meaning,
+                      'spoken_meaning': supplied.get(index, spoken_of(meaning, cleaning))})
     return {'source': str(path), 'source_sha256': sha256(path), 'cleaning': cleaning,
+            'spoken_file': str(spoken_file) if spoken_file else None,
             'first': first, 'last': last, 'words': words}
 
 
@@ -923,6 +937,9 @@ def main(argv=None):
     parser.add_argument('--range', dest='range_', help='形如 151-200')
     parser.add_argument('--cleaning', choices=['legacy', 'v2'], default='legacy',
                         help='朗读文本清洗政策；已交付批次用 legacy')
+    parser.add_argument('--spoken-file',
+                        help='{index: spoken_meaning} JSON，用外部推导的朗读文本'
+                             '替换本工具自己的规则（用于已批准政策变更的独立判定）')
     parser.add_argument('--pixels', choices=['all', 'first', 'none'], default='all')
     parser.add_argument('--json')
     args = parser.parse_args(argv)
@@ -938,10 +955,12 @@ def main(argv=None):
         write_report(report, args.json)
         return 2
     first, last = (int(part) for part in args.range_.split('-'))
-    expectations = load_expectations(args.source, first, last, args.cleaning)
+    expectations = load_expectations(args.source, first, last, args.cleaning,
+                                     args.spoken_file)
     report['expectations'] = {'provided': True, 'source': expectations['source'],
                               'source_sha256': expectations['source_sha256'],
                               'cleaning': args.cleaning, 'first': first, 'last': last,
+                              'spoken_file': expectations['spoken_file'],
                               'words': len(expectations['words']),
                               'sample': expectations['words'][:2]}
 
