@@ -201,6 +201,36 @@ def test_the_registry_round_trips_and_is_read_strictly(tmp_path):
     assert save_project(golden_project(), tmp_path).name == 'project.json'
 
 
+def test_an_asset_can_record_the_voice_it_already_has(tmp_path):
+    """``voice`` is recorded, never validated: it says which voice this file is."""
+    index = AssetIndex.of((AssetRef('w1:female', 'media/female.wav', units=55200,
+                                    kind='audio', voice='BV503_streaming'),),
+                          project_id='p1', folder=str(tmp_path))
+    written = index.save(tmp_path)
+    again = AssetIndex.load(tmp_path)
+    assert again.ref('w1:female') == index.ref('w1:female')
+    assert again.ref('w1:female').voice == 'BV503_streaming'
+    assert again.to_dict() == index.to_dict()
+    # The key is written only when there is a voice, so a registry that never had one
+    # keeps exactly the fields it had before the field existed.
+    plain = AssetIndex.of((AssetRef('a', 'media/a.wav', units=1),), project_id='p1')
+    assert plain.to_dict()['assets'][0] == {
+        'asset_id': 'a', 'path': 'media/a.wav', 'units': 1, 'unit_num': 1,
+        'unit_den': 48000, 'kind': '', 'sha256': ''}
+    # A registry written before the field existed still loads, with no voice.
+    import json
+    document = json.loads(written.read_text(encoding='utf-8'))
+    document['assets'][0].pop('voice')
+    older = AssetIndex.from_dict(document, folder=str(tmp_path))
+    assert older.ref('w1:female').voice == ''
+    assert older.ref('w1:female').units == 55200
+    # An unknown value is kept verbatim; nothing here decides whether a voice is real.
+    odd = AssetIndex.from_dict({'schema': 'wv-assets@1', 'project_id': 'p',
+                                'assets': [{'asset_id': 'x', 'path': 'x.wav',
+                                            'voice': 'not-a-known-voice'}]})
+    assert odd.ref('x').voice == 'not-a-known-voice'
+
+
 def test_relative_entries_survive_moving_the_project_folder(tmp_path):
     original = tmp_path / 'proj'
     touch(original, 'media/a.wav')

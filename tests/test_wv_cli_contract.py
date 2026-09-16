@@ -1,0 +1,205 @@
+"""The Agent-facing CLI contract: one JSON object, structured errors, no dialogs.
+
+An Agent cannot read a usage line on stderr or answer a dialog, so these tests pin
+the three things it depends on: every outcome leaves **one** JSON object on stdout
+(verified through a real subprocess for at least one case, because an in-process
+call cannot prove nothing else printed); a missing piece of information comes back
+as ``NEEDS_INPUT`` with a ``fixes`` list; and ``batch plan`` writes nothing at all.
+"""
+import io
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+import pytest
+
+from test_wv_coordinator_store import fake_runner
+
+from word_video.cli.main import main
+from word_video.storage.coordinator import Coordinator
+from word_video.storage.project_store import save_project
+from word_video.application import instantiate
+from word_video.domain import DEFAULT_LESSON_TEMPLATE
+
+from test_wv_project_golden import golden_base, golden_media, golden_record
+
+
+def run_cli(*argv, root=None):
+    """Call the CLI in process; return (exit code, parsed stdout, stderr text)."""
+    out, err = io.StringIO(), io.StringIO()
+    arguments = list(argv)
+    if root is not None:
+        arguments = ['--root', str(root)] + arguments
+    code = main(arguments, stdout=out, stderr=err)
+    text = out.getvalue()
+    try:
+        document = json.loads(text)
+    except ValueError:                      # pragma: no cover - the contract itself
+        raise AssertionError('stdout was not one JSON object: %r' % text[:400])
+    return code, document, err.getvalue()
+
+
+def prepare(root, *, project_id='golden'):
+    """A project + registry under the coordinator's own layout."""
+    from word_video.storage import AssetIndex, AssetRef
+    folder = root / 'projects' / project_id
+    project = instantiate(DEFAULT_LESSON_TEMPLATE, (golden_record(index=151),), golden_media(),
+                          golden_base())
+    folder.mkdir(parents=True, exist_ok=True)
+    save_project(project, folder)
+    (folder / 'media').mkdir(exist_ok=True)
+    for name in ('female', 'male', 'chinese'):
+        (folder / 'media' / ('%s.wav' % name)).write_bytes(b'x' * 16)
+    AssetIndex.of((AssetRef('w1:female', 'media/female.wav', units=55200),
+                   AssetRef('w1:male', 'media/male.wav', units=40800),
+                   AssetRef('w1:chinese', 'media/chinese.wav', units=157200)),
+                  project_id=project.project_id, folder=str(folder)).save(folder)
+    return folder
+
+
+# ---------------------------------------------------------------------------
+# One JSON object, always
+# ---------------------------------------------------------------------------
+def test_a_real_subprocess_prints_exactly_one_json_object(tmp_path):
+    result = subprocess.run(
+        [sys.executable, '-m', 'word_video.cli', '--root', str(tmp_path),
+         'capabilities'],
+        capture_output=True, text=True, encoding='utf-8',
+        cwd=str(Path(__file__).resolve().parents[1]))
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)             # one object, nothing else
+    assert payload['ok'] is True
+    assert set(payload['result']['actions']) >= {'capabilities', 'doctor', 'project',
+                                                 'batch', 'job', 'artifacts', 'watch'}
+    assert payload['result']['schemas']['project'].startswith('wv-project@')
+
+
+def test_bad_usage_and_unknown_actions_are_still_json(tmp_path):
+    for argv in ((), ('nonsense',), ('job',), ('project', 'show')): 
+        code, document, _ = run_cli(*argv, root=tmp_path)
+        assert code == 2, argv
+        assert document['ok'] is False, argv
+        assert document['error']['code'] in ('BAD_REQUEST', 'NEEDS_INPUT'), argv
+        assert document['error']['message'], argv
+
+
+def test_needs_input_carries_actionable_fixes(tmp_path):
+    prepare(tmp_path)
+    code, document, _ = run_cli('batch', 'submit', '--project', 'golden',
+                                '--batch', '151-151', root=tmp_path)
+    assert code == 2
+    assert document['error']['code'] == 'NEEDS_INPUT'
+    assert document['error']['fixes']
+    assert any('file' in fix or '工程' in fix or '--file' in fix
+               or 'key' in fix or '词条' in fix for fix in document['error']['fixes'])
+    # A missing project is a NEEDS_INPUT too, never a traceback.
+    code, document, _ = run_cli('batch', 'plan', '--project', 'ghost', '--batch',
+                                '151-151', root=tmp_path)
+    assert code == 2 and document['error']['code'] == 'NEEDS_INPUT'
+
+
+# ---------------------------------------------------------------------------
+# Plan writes nothing; submit freezes; receipts are checkable
+# ---------------------------------------------------------------------------
+def test_plan_reports_the_batch_and_writes_nothing(tmp_path):
+    prepare(tmp_path)
+    before = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob('*'))
+    code, document, _ = run_cli('batch', 'plan', '--project', 'golden', '--batch',
+                                '151-151', root=tmp_path)
+    assert code == 0, document
+    result = document['result']
+    assert result['wrote_files'] is False
+    assert result['plan']['plan_identity']
+    assert result['plan']['total_ticks'] == 3960000
+    assert sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob('*')) == \
+        before
+
+
+def test_submit_status_cancel_and_receipts_through_the_cli(tmp_path):
+    prepare(tmp_path)
+    code, document, _ = run_cli('batch', 'submit', '--project', 'golden', '--batch',
+                                '151-151', '--key', 'cli-1', root=tmp_path)
+    assert code == 0, document
+    job = document['result']['job']
+    assert document['result']['created'] is True
+
+    again = run_cli('batch', 'submit', '--project', 'golden', '--batch', '151-151',
+                    '--key', 'cli-1', root=tmp_path)[1]
+    assert again['result']['created'] is False and again['result']['job'] == job
+
+    status = run_cli('job', 'status', '--job', job, root=tmp_path)[1]
+    assert status['result'] == {'job': job, 'state': 'queued', 'phase': 'submitted',
+                               'control': 'run', 'error': None, 'artifacts': 0}
+
+    receipts = run_cli('receipts', root=tmp_path)[1]['result']['receipts']
+    assert [row['idempotency_key'] for row in receipts] == ['cli-1']
+    assert receipts[0]['job_id'] == job
+    assert json.loads(receipts[0]['inputs'])[0]['sha256']
+
+    # Conflicting content under the same key is a conflict, not a new task.
+    conflict = run_cli('batch', 'submit', '--project', 'golden', '--batch', '151-151',
+                       '--codec', 'h265', '--key', 'cli-1', root=tmp_path)
+    assert conflict[0] == 1
+    assert conflict[1]['error']['code'] == 'IDEMPOTENCY_CONFLICT'
+
+    cancelled = run_cli('job', 'cancel', '--job', job, root=tmp_path)[1]
+    assert cancelled['result']['state'] == 'cancelled'
+    # Running a cancelled task does nothing (and needs no renderer to prove it).
+    ran = run_cli('job', 'run', '--job', job, root=tmp_path)[1]
+    assert ran['result']['state'] == 'cancelled'
+    assert run_cli('artifacts', '--job', job, root=tmp_path)[1]['result']['published'] \
+        is False
+    assert not (tmp_path / 'runs' / job).exists()
+
+
+def test_batch_range_selects_by_word_list_index(tmp_path):
+    prepare(tmp_path)
+    code, document, _ = run_cli('batch', 'plan', '--project', 'golden', '--records',
+                                'w1', root=tmp_path)
+    assert code == 0
+    assert [record['id'] for record in document['result']['plan']['records']] == ['w1']
+    code, document, _ = run_cli('batch', 'plan', '--project', 'golden', '--records',
+                                'nope', root=tmp_path)
+    assert code == 1 and document['error']['code'] == 'SCHEMA'
+
+
+# ---------------------------------------------------------------------------
+# Watch streams NDJSON, and reconcile/reporting work through the CLI
+# ---------------------------------------------------------------------------
+def test_watch_streams_ndjson_until_the_task_settles(tmp_path):
+    prepare(tmp_path)
+    job = run_cli('batch', 'submit', '--project', 'golden', '--batch', '151-151',
+                  '--key', 'w', root=tmp_path)[1]['result']['job']
+    run_cli('job', 'cancel', '--job', job, root=tmp_path)
+    out = io.StringIO()
+    code = main(['--root', str(tmp_path), 'watch', '--job', job,
+                 '--until-seconds', '2'], stdout=out, stderr=io.StringIO())
+    lines = [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
+    assert code == 0
+    assert lines and lines[-1]['state'] == 'cancelled'
+    assert all({'job', 'state', 'phase'} <= set(line) for line in lines)
+
+
+def test_reconcile_reports_a_task_a_dead_worker_left_behind(tmp_path):
+    prepare(tmp_path)
+    job = run_cli('batch', 'submit', '--project', 'golden', '--batch', '151-151',
+                  '--key', 'r', root=tmp_path)[1]['result']['job']
+    from word_video.storage.coordinator import connect
+    with connect(tmp_path / 'coordinator.sqlite3') as con:
+        con.execute("UPDATE jobs SET state='running', phase='rendering' WHERE id=?",
+                    (job,))
+    code, document, _ = run_cli('reconcile', root=tmp_path)
+    assert code == 0
+    assert job in document['result']['interrupted']
+    assert run_cli('job', 'status', '--job', job, root=tmp_path)[1]['result']['state'] \
+        == 'interrupted'
+
+
+def test_doctor_reports_what_it_can_see(tmp_path):
+    code, document, _ = run_cli('doctor', root=tmp_path)
+    assert code == 0
+    report = document['result']
+    assert report['root_writable'] is True
+    assert report['ffmpeg'] and report['ffprobe']
+    assert isinstance(report['font_substitutions'], list)

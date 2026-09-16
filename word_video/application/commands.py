@@ -16,7 +16,7 @@ from ..domain.errors import (ClipBoundError, CycleError, DanglingRefError,
                              DuplicateIdError, InvalidTimeError, SchemaError,
                              SplitNotAllowedError, StaleRevisionError,
                              UnknownCommandError)
-from ..domain.model import (PROJECT_LAYERS, STYLE_FONT_KEYS, STYLE_KEYS,
+from ..domain.model import (INTRO_ROLE, PROJECT_LAYERS, STYLE_FONT_KEYS, STYLE_KEYS,
                             STYLE_ROLES, MediaSlice, Project, StyleOverride,
                             style_overrides)
 from ..domain.timebase import TICKS_PER_SECOND, TimeExpr, half_up, rational
@@ -84,11 +84,13 @@ class UnbindStart:
     ticks: int | None = None
 
 
-#: Roles a split may produce: the media project layers.  Everything else is
-#: singular by design — a per-record reading stage or text layer exists once per
-#: word, and two of them make the lesson undeliverable — so the command refuses
-#: them *before* the UI can offer a button that only ever errors.
-SPLITTABLE_ROLES = ('background', 'intro')
+#: Roles a split may produce: the media layers the exporters can really draw as
+#: several pieces (B's projection loops one file per planned background piece, and
+#: refuses a second intro).  Everything else is singular by design — a per-record
+#: reading stage or text layer exists once per word, a title/subtitle/footer layer
+#: is one window over the whole timeline — so the command refuses it *before* a UI
+#: can offer a button that only ever errors.
+SPLITTABLE_ROLES = ('background',)
 
 
 @dataclass(frozen=True)
@@ -119,6 +121,9 @@ def can_split(clip):
 
 
 def _split_reason(role):
+    if role == INTRO_ROLE:
+        return ('the intro is the single countdown stage the projection refuses to '
+                'see twice, so cutting it could never be exported')
     if role in PROJECT_LAYERS:
         return ('the %s layer is drawn as one window over the whole project; '
                 'splitting it is not expressible yet' % role)
@@ -130,12 +135,14 @@ def _split_reason(role):
 class SplitClip:
     """Cut one clip in two at ``at_ticks``; the left half keeps the original id.
 
-    Only the media project layers can be split (:data:`SPLITTABLE_ROLES`):
-    splitting a reading stage or a text layer would produce two clips claiming one
-    per-record role, which :mod:`word_video.domain.compile` refuses as
-    ``ROLE_AMBIGUOUS``, so the command refuses it up front with the same code
-    ``can_split`` reports.  A linked clip is refused too: the halves would need two
-    different bindings and the right half has no id to bind.
+    Only the roles in :data:`SPLITTABLE_ROLES` can be split — today just the
+    background, whose pieces the exporter already draws as separate loops.  A
+    reading stage or a text layer would produce two clips claiming one per-record
+    role, which :mod:`word_video.domain.compile` refuses as ``ROLE_AMBIGUOUS``; the
+    intro is the one countdown stage the manifest projection refuses to see twice.
+    The command refuses each of them up front with the same code ``can_split``
+    reports, so a button and its error message cannot disagree.  A linked clip is
+    refused too: the halves would need two different bindings.
 
     A clip with media is cut on its **source grid**: the cut lands on the unit
     closest to ``at_ticks`` (half up), the two source windows stay contiguous and
