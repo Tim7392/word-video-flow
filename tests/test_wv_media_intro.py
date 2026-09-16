@@ -20,6 +20,7 @@ must be audible is read back out of the mix, and the region that must stay
 silent is compared with exact zero bytes.
 """
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 import wave
@@ -30,6 +31,18 @@ from word_video.render.mix import build_mix
 from word_video.timing import build_timeline
 
 RATE = 48000
+
+
+def _same_path(left, right):
+    """Compare two paths as *the same file*, not as the same string.
+
+    ``resolve_intro_audio`` resolves what it is given, so on a machine whose TEMP
+    is an 8.3 short name (``C:\\Users\\ADMINI~1\\...``) it hands back the long
+    spelling while the caller still holds the short one.  Both name one file, and a
+    test that compared the text would fail on such a machine while the product is
+    perfectly correct - so both sides are resolved here.
+    """
+    return Path(left).resolve() == Path(right).resolve()
 
 
 def _wav(path, samples, rate=RATE):
@@ -111,7 +124,7 @@ class IntroAudioPolicyTests(unittest.TestCase):
     def test_clip_with_sound_wins_and_the_fallback_is_not_used(self):
         clip = _clip(self.root, 'talking.mp4', 0.2, level=15000)
         choice = resolve_intro_audio(clip, None, str(self.fallback))
-        self.assertEqual(clip, choice.path)
+        self.assertTrue(_same_path(clip, choice.path), choice.path)
         self.assertTrue(choice.from_clip)
         self.assertEqual('FROM_CLIP', choice.source)
         self.assertAlmostEqual(0.2, choice.duration_s, places=2)
@@ -119,10 +132,26 @@ class IntroAudioPolicyTests(unittest.TestCase):
     def test_silent_clip_falls_back_to_the_configured_file(self):
         clip = _clip(self.root, 'mute.mp4', 0.2, level=None)
         choice = resolve_intro_audio(clip, None, str(self.fallback))
-        self.assertEqual(str(self.fallback), choice.path)
+        self.assertTrue(_same_path(self.fallback, choice.path), choice.path)
         self.assertFalse(choice.from_clip)
         self.assertEqual('FROM_INTRO_AUDIO', choice.source)
         self.assertAlmostEqual(1.0, choice.duration_s, places=3)
+
+    def test_the_resolved_path_is_the_same_file_even_from_a_short_name(self):
+        """The regression for a short-name TEMP: identity is the file, not the text.
+
+        A path handed in as an 8.3 short name and the canonical long spelling the
+        resolver returns name one file; what matters to the mixer and the draft is
+        that they reach the same bytes, which is checked here directly.
+        """
+        folder = tempfile.mkdtemp(prefix='wv-short-')
+        self.addCleanup(shutil.rmtree, folder, True)
+        source = _constant(Path(folder) / 'fallback.wav', 9000, RATE)
+        choice = resolve_intro_audio(None, None, str(source))
+        self.assertTrue(Path(choice.path).is_file(), choice.path)
+        self.assertTrue(_same_path(source, choice.path), choice.path)
+        from word_video.media import has_audio
+        self.assertTrue(has_audio(choice.path))
 
     def test_no_clip_uses_the_configured_file(self):
         choice = resolve_intro_audio(None, None, str(self.fallback))
