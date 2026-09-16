@@ -223,6 +223,33 @@ def test_the_scanned_package_still_has_to_carry_the_editor(tmp_path):
     assert any(item.startswith(builder.EDITOR_DIR) for item in missing)
 
 
+def test_the_library_document_template_is_allowed_in_both_frozen_apps(tmp_path):
+    """Found the hard way: the allowance named only the CLI's ``_internal``, so the
+    editor's byte-identical copy was reported as "document material" and the entire
+    package refused to publish after ten minutes of building."""
+    for app in (builder.APP_DIR, builder.EDITOR_DIR):
+        allowed = tmp_path / app / '_internal' / 'docx' / 'templates' / 'default.docx'
+        allowed.parent.mkdir(parents=True)
+        allowed.write_bytes(b'PK\x03\x04' + b'\x00' * 32)
+    result = builder.scan_package(tmp_path)
+    assert result['findings'] == []
+    assert set(result['evidence']['allowances']) == {
+        'WordVideo/_internal/docx/templates/default.docx',
+        'WordVideoEditor/_internal/docx/templates/default.docx'}
+
+
+def test_a_member_document_inside_either_frozen_app_is_still_flagged(tmp_path):
+    """The allowance is one path shape, not "anything with .docx in _internal"."""
+    for app in (builder.APP_DIR, builder.EDITOR_DIR):
+        member = tmp_path / app / '_internal' / 'words.docx'
+        member.parent.mkdir(parents=True, exist_ok=True)
+        member.write_bytes(b'PK\x03\x04' + b'\x00' * 32)
+    findings = builder.scan_package(tmp_path)['findings']
+    assert [item['path'] for item in findings] == [
+        'WordVideo/_internal/words.docx', 'WordVideoEditor/_internal/words.docx']
+    assert {item['rule'] for item in findings} == {'forbidden-extension'}
+
+
 # ----------------------------------------------------------- the verification
 def test_the_verify_script_drives_the_editor_through_the_launcher():
     assert verify.EDITOR_EXE == builder.EDITOR_EXE

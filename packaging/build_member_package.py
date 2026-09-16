@@ -113,8 +113,12 @@ MEDIA_MAGIC = ((b'OggS', 'Ogg audio'), (b'RIFF', 'RIFF container (WAV/AVI)'),
 
 #: A library shipping its own data is not "a member's material".  Every allowance
 #: is explicit, and is reported in the scan evidence instead of being skipped.
+#: The two frozen apps each carry their own ``_internal``, so the folder names are
+#: built from the same constants the builds use rather than written out twice - an
+#: allowance that named only one of them would fail the other build's scan.
 ALLOWANCES = (
-    (re.compile(r'^WordVideo/_internal/docx/templates/[^/]+\.docx$'),
+    (re.compile(r'^(?:%s)/_internal/docx/templates/[^/]+\.docx$'
+                % '|'.join((APP_DIR, EDITOR_DIR))),
      'blank-document template of the python-docx library itself'),
 )
 
