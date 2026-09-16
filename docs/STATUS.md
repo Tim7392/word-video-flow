@@ -28,9 +28,11 @@
 | 迁移后测试套件 | 引擎套件（`repo\tests`）可跑；旧字幕工厂测试（`test_repair.py`、`test_ui_contract.py`、`test_ai_interface.py`、`test_glass_assets.py`）**移入 `legacy_tests\` 并标记待验**：需要 PyQt6（锁定 venv 未装，新软件用 PySide6）与审计基线目录 `ui_redesign_20260912_151831\baseline\`（未迁入）。原件仍在 C 盘原树，M0 已在原树跑通过（156 passed 那次）。`pytest.ini` 的 `testpaths=tests` 使默认套件只覆盖本产品引擎 |
 | 迁移期发现的真实破坏（已修） | 旧字幕工厂 6 文件最初被我放进 `legacy_subtitle\` 子目录，**导致 4 个 jobs 测试直接 `ModuleNotFoundError: subtitle_factory_api`**（`word_video/jobs.py` 用平铺 import 读 `load_words`/`selection`，旧模块之间也是平铺 import）。修法：按原树布局**平铺回仓库根目录**，一行旧代码都不用改（整体收益：零改动保持旧链可用；代价：仓库根目录多 6 个文件）。已写入 `docs/LEGACY_SUBTITLE.md` |
 | 环境 | `runtime\venv` 建立成功（Python 3.14）：pyjianyingdraft 0.3.0、pymediainfo、python-docx、lxml、pillow、pytest、numpy、uiautomation；**PySide6 未装**（`--dry-run` 解析结果见 `logs\venv-setup.log`），W04 预览开工前由 H0 决定是否安装及版本 |
+| **P1 早期三词候选包（H0 亲自跑）** | **完成（机器侧）**：在迁入后的仓库用现有引擎跑真实媒体三词（151-153，job `wv-c31788ea086725051de6f5d4`，本地缓存音频、**未联网未调 TTS**），产出 31 个产品文件：1080p/h265/60fps/12.467s 带透明片头 MP4（render 11.4s / draft 1.5s / speech 0.5s）+ 五轨 SRT + 可编辑剪映草稿（结构自检 structural_ok，17 个资源文件）。目录式候选包（**硬链接，未复制字节**，`fsutil hardlink list` 已核）：`out\candidates\p1-三词候选包\` |
+| 独立验收（非自检） | `tools\m0\accept_range.py` 八面 **PASS**、`failures={}`；`--pixels all` 11 个探针 `problem_count=0`，实测空白侧最大着墨 0.0017（阈值 0.015）、着墨侧最小 0.0379（阈值 0.006），两侧余量 4~20 倍。报告：`out\candidates\p1-三词候选包\acceptance-report.json` |
+| P1 仍**未验**（不要当成通过） | 真实剪映人工编辑（结构可编辑 ≠ 人打开能改）、听感/音色、目标核显轻薄本、跨机；本包未做真实 TTS 调用 |
 
 ### 待决/风险（不阻塞当前开发）
-
 - GitHub owner/repo 仍未提供 → 只本地提交。
 - 预览档位（720p30/540p30）未批准冻结，实测后再请 Tim 确认。
 - 引擎侧 v2 朗读字段清理策略（Tim 已批准"只清派生朗读字段"）尚未落到代码：
