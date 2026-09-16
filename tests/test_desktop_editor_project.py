@@ -92,7 +92,8 @@ def test_a_request_becomes_a_folder_with_no_hand_written_json(area):
     folder = import_request(request_path, target)
 
     assert folder.project_path.is_file()
-    assert folder.catalog_path.is_file()
+    assert folder.assets_path.is_file()
+    assert not folder.catalog_path.exists(), '编辑器只写一份资产文档（assets.json）'
     assert folder.delivery_path.is_file()
     assert len(folder.project.records) == 3
     assert len(folder.project.clips) == 21                  # 3 words x 6 + 3 layers
@@ -399,15 +400,20 @@ def test_a_project_without_a_registry_opens_and_says_so(area):
                for notice in found)
 
 
-def test_both_registries_name_the_same_file_after_every_write(area):
-    """A's ``assets.json`` and B's ``media.json`` are two formats, one list.
+def test_assets_json_is_the_only_opinion_about_the_assets(area):
+    """One registry names an asset, and its voice lives *in* it.
 
-    The exporter reads ``media.json`` today, so the editor writes both from the
-    same ``AssetRef`` list; this is the guard that says the bridge has not drifted.
+    The bridge this test used to guard wrote ``assets.json`` **and** ``media.json``
+    from one ref list.  The exporter reads the registry first, so the second file was
+    one writer away from drifting and the voice was the field that only existed there.
+    Now there is one document: this asserts that after a re-point and after a voice is
+    recorded, ``media.json`` is not written at all and the exporter - which reads
+    ``assets.json`` first - finds the path *and* the voice in the same entry.
     """
     folder, state = tiny_state(area / 'project')
     ok, differences = assets_agree(area / 'project')
     assert ok, differences
+    assert not folder.catalog_path.exists(), '编辑器不该再写第二份资产文档'
 
     replacement = write_tone(area / 'other.wav', 1.0, 640.0)
     folder.set_asset_file('w1:male', str(replacement))
@@ -418,10 +424,57 @@ def test_both_registries_name_the_same_file_after_every_write(area):
     folder.set_voice('w1:male', 'BV504_streaming')
     ok, differences = assets_agree(area / 'project')
     assert ok, differences
-    from word_video.exporters.catalog import load_catalog
-    assert load_catalog(area / 'project')['w1:male'].voice == 'BV504_streaming'
-    # And the exporter's own reader sees the file the registry names.
-    assert load_catalog(area / 'project')['w1:male'].path == str(replacement)
+    assert not folder.catalog_path.exists()
+    # The exporter's own reader sees the file and the voice the registry names.
+    from word_video.exporters import render
+    entries, _, from_registry = render._asset_source(area / 'project')
+    assert from_registry is True
+    assert entries['w1:male'].path == str(replacement)
+    assert entries['w1:male'].voice == 'BV504_streaming'
+    # Reopening and saving again still writes one document.
+    again = ProjectFolder.open(area / 'project')
+    again.save_assets()
+    assert not again.catalog_path.exists()
+    ok, differences = assets_agree(area / 'project')
+    assert ok, differences
+
+
+def test_a_pre_registry_project_keeps_the_fallback_and_migrates_on_save(area):
+    """B's fallback reads a catalogue-only folder, and the first save adopts it.
+
+    A project written before the registry existed has ``project.json`` and
+    ``media.json`` only.  The exporter must keep working (that is B's documented
+    fallback, ``from_registry=False``), and the editor must not break it by writing an
+    empty registry next to it: the catalogue's entries and voices are adopted **and
+    measured** on the next save, because a registry entry without a measurement is a
+    refusal (``UNKNOWN_DURATION``) where the fallback used to measure the file itself.
+    """
+    from word_video.exporters import render
+    from word_video.exporters.catalog import Asset, save_catalog
+
+    folder, state = tiny_state(area / 'project')
+    voices = {asset_id: 'BV%d_streaming' % (500 + index)
+              for index, asset_id in enumerate(sorted(folder.refs))}
+    # The folder a pre-registry build left behind: a catalogue and no registry.
+    save_catalog({asset_id: Asset(asset_id=asset_id, path=ref.path, voice=voices[asset_id])
+                  for asset_id, ref in folder.refs.items()}, folder.path)
+    folder.assets_path.unlink()
+
+    ok, differences = assets_agree(area / 'project')  # 旧工程：目录就是唯一真相
+    assert ok, differences
+    entries, _, from_registry = render._asset_source(area / 'project')
+    assert from_registry is False and set(entries) == set(voices)
+
+    reopened = ProjectFolder.open(area / 'project')
+    reopened.measure()
+    reopened.save_assets()                           # 编辑器写一次：目录被并进登记表
+    entries, _, from_registry = render._asset_source(area / 'project')
+    assert from_registry is True
+    assert set(entries) == set(voices), '旧目录里的资产不能因为删桥而丢失'
+    assert {asset_id: entry.voice for asset_id, entry in entries.items()} == voices
+    assert all(entry.path == folder.refs[asset_id].path for asset_id, entry in entries.items())
+    ok, differences = assets_agree(area / 'project')
+    assert ok, ('迁移后两份文档一致，且音色已在登记表里', differences)
 
 
 def test_a_missing_delivery_file_is_reported_in_the_delivery_panel(area):

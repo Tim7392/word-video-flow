@@ -8,17 +8,19 @@ Three files and one cache directory, each owned by exactly one layer:
     and nothing else.
 ``assets.json``
     A's asset registry (``wv-assets@1``): ``asset_id -> path`` plus what the media
-    layer measured.  This is the *one* place a path is looked up, and
+    layer measured **and the voice the file was made with**.  This is the *one* place
+    a path is looked up - by the solver, the renderer and the exporter
+    (``_asset_source`` reads the registry first) - and
     :meth:`ProjectFolder.diagnostics` asks its ``problems()`` for the whole list of
     broken references rather than discovering them one exception at a time.
 ``media.json``
-    B's exporter catalogue.  ``export_run`` reads this file today, and it is the
-    only document that also carries each asset's **voice**, which ``AssetRef`` has
-    no field for.  It is written from the same ``AssetRef`` list as ``assets.json``
-    on every save, in the same call, so the two cannot describe different files -
-    ``tests/test_desktop_editor_project.py`` asserts they agree after every write
-    and after every repair.  When the exporter moves to ``wv-assets@1`` (reported to
-    H0) the bridge and the voices move with it and this file disappears.
+    B's exporter catalogue, **read-only here and only for a project written before the
+    registry existed**.  The editor no longer writes it: two files that both name
+    asset paths are two opinions waiting to disagree, and the one the exporter reads
+    first is the registry.  A legacy file is not deleted (nothing here removes a
+    member's file) and it is not ignored either - the next save **migrates** its
+    entries and voices into the registry, so the fallback path keeps working without
+    the file that used to be authoritative.
 ``delivery.json``
     the settings that are *not* document content: which background, which codec.
     B's exporter takes the background as a delivery parameter
@@ -107,32 +109,63 @@ class Delivery:
 
 
 def assets_agree(folder):
-    """``(ok, differences)``: does the exporter's catalogue name what the registry does?
+    """``(ok, differences)``: is ``assets.json`` the only opinion about the assets?
 
-    The bridge between A's registry and B's catalogue is only honest while the two
-    files agree about the assets the exporter actually uses; this is what lets a
-    test say so after every write, instead of hoping two writers stayed in step.
+    The editor writes **one** registry, because that is the file the exporter reads
+    first, and this is the guard that says so after every write instead of hoping two
+    writers stayed in step.  Three things have to hold:
+
+    * a project with no registry at all is a pre-registry project: the catalogue is
+      then the single truth and the exporter's fallback path is what reads it;
+    * every asset the catalogue still names must be **in the registry**, with the same
+      path - otherwise removing the bridge would have orphaned an asset the exporter
+      used to find;
+    * a voice must be recorded **in the registry**: it used to live only in
+      ``media.json``, and losing it silently is exactly the "voice was substituted"
+      failure this project forbids.
+
+    A ``media.json`` that agrees is inert, not a problem: it is left on disk because
+    deleting a member's file is not this function's business.
     """
     folder = Path(folder)
-    registry = AssetIndex.load(folder / ASSETS_FILENAME)
-    catalog = catalog_module.load_catalog(folder)
+    registry_file = folder / ASSETS_FILENAME
+    catalog_file = folder / catalog_module.CATALOG_FILENAME
+    if not registry_file.is_file():
+        if catalog_file.is_file():
+            return True, []
+        return False, ['assets.json 不存在，media.json 也不存在']
     problems = []
+    registry = AssetIndex.load(registry_file)
+    catalog = {}
+    if catalog_file.is_file():
+        try:
+            catalog = dict(catalog_module.load_catalog(folder))
+        except CatalogError as error:
+            problems.append('media.json 读不出来：%s' % error)
     for ref in registry.refs:
         entry = catalog.get(ref.asset_id)
         if entry is None:
-            if _exported(ref):
-                problems.append('media.json is missing %s' % ref.asset_id)
-        elif Path(entry.path) != Path(ref.path):
-            problems.append('%s: assets.json says %s, media.json says %s'
+            continue
+        if Path(entry.path) != Path(ref.path):
+            problems.append('%s: assets.json 说 %s，media.json 说 %s'
                             % (ref.asset_id, ref.path, entry.path))
+        if entry.voice and entry.voice != (getattr(ref, 'voice', '') or ''):
+            problems.append('%s: 音色只记在 media.json（%s），assets.json 里是 %r'
+                            % (ref.asset_id, entry.voice, getattr(ref, 'voice', '')))
     for asset_id in catalog:
         if not registry.has(asset_id):
-            problems.append('assets.json is missing %s' % asset_id)
+            problems.append('assets.json 缺 %s（media.json 里有，导出器会找不到它）' % asset_id)
     return (not problems), problems
 
 
 def _exported(ref):
-    """Whether the exporter prepares from this ref (speech), or measures it itself."""
+    """Whether the exporter prepares from this ref (speech), or measures it itself.
+
+    Kept because it is the line between "the exporter must find this in the registry"
+    and "the exporter measures this from its own media"; with the bridge gone both
+    kinds live in the same registry, and this remains the only place that decides
+    which is which.
+    """
     return ref.kind in ('', 'audio')
 
 
@@ -167,7 +200,7 @@ class ProjectFolder:
 
     @property
     def catalog_path(self):
-        """B's catalogue: the exporter reads this one today."""
+        """B's catalogue: **read-only**, and only for a pre-registry project."""
         return self.path / catalog_module.CATALOG_FILENAME
 
     @property
@@ -178,9 +211,10 @@ class ProjectFolder:
     def preview_dir(self):
         return self.path / PREVIEW_DIRNAME
 
-    def index(self):
+    def index(self, refs=None):
         """The registry as A's :class:`AssetIndex`, folder-relative paths included."""
-        return AssetIndex.of(tuple(self.refs[key] for key in sorted(self.refs)),
+        refs = self.refs if refs is None else refs
+        return AssetIndex.of(tuple(refs[key] for key in sorted(refs)),
                              project_id=self.project.project_id, folder=str(self.path))
 
     def to_dict(self):
@@ -192,7 +226,13 @@ class ProjectFolder:
     # -- opening and creating --------------------------------------------
     @classmethod
     def open(cls, path):
-        """Read a folder; a missing registry is tolerated and reported, not fatal."""
+        """Read a folder; a missing registry is tolerated and reported, not fatal.
+
+        The catalogue is read here for one reason only: a project written before the
+        registry existed keeps its voices in ``media.json``, and opening it must not
+        lose them.  They are written back into the registry on the next save
+        (:meth:`registry_refs`), which is the migration - this method only reads.
+        """
         folder = cls(path, load_project(path))
         if folder.assets_path.is_file():
             registry = AssetIndex.load(folder.assets_path)
@@ -208,7 +248,7 @@ class ProjectFolder:
 
     @classmethod
     def create(cls, path, project, refs=None, voices=None, delivery=None):
-        """Write a new folder: document, registry, catalogue and delivery settings."""
+        """Write a new folder: document, registry and delivery settings."""
         folder = cls(path, project, refs, voices, delivery)
         Path(path).mkdir(parents=True, exist_ok=True)
         folder.save_project()
@@ -223,23 +263,67 @@ class ProjectFolder:
         return save_project(self.project, self.project_path)
 
     def save_assets(self):
-        """Write both registries from one list, in one call.
+        """Write ``assets.json`` - the one document that names an asset - once.
 
-        They are two documents because two layers own two formats, not because the
-        editor has two opinions: ``assets.json`` is the registry A's resolver reads
-        and carries every asset, and ``media.json`` is written from the same refs
-        for the exporter, which prepares speech from it.  Non-speech refs (the
-        intro's picture) are left out of the exporter's catalogue on purpose: it
-        measures the intro from the plan itself, and its audio-first measurement of
-        a packetised track is not a window anybody should cut media on.
+        Voices travel *inside* the registry (``AssetRef.voice``), which is what made
+        the second file unnecessary: the exporter reads the registry first and takes
+        each asset's voice from the same entry as its path, so there is no window in
+        which one document says what the other has not been told yet.
+
+        A project written before the registry existed still has its ``media.json``;
+        that file's entries are **adopted** into the registry here rather than left
+        behind, because the exporter stops consulting the catalogue the moment a
+        registry exists.
         """
-        self.index().save(self.assets_path)
-        assets = {asset_id: Asset(asset_id=asset_id, path=ref.path,
-                                  voice=self.voices.get(asset_id, ''))
-                  for asset_id, ref in self.refs.items() if _exported(ref)}
-        if assets:
-            catalog_module.save_catalog(assets, self.path)
+        refs = self.registry_refs()
+        self.refs = refs
+        self.index(refs).save(self.assets_path)
         return self.assets_path
+
+    def registry_refs(self):
+        """What the one registry must name: the registered assets, then a legacy catalogue's.
+
+        Two rules, and both are about the file the exporter reads first:
+
+        * a registered asset is written with its **voice** and its measurement, so one
+          entry carries everything the exporter needs about one file;
+        * an entry a legacy ``media.json`` still names is **adopted and measured** -
+          adopting the path without measuring it would trade a working fallback
+          (B measures the catalogue itself) for a registry entry that refuses with
+          ``UNKNOWN_DURATION``.  Probing belongs to the media layer, so it goes through
+          the same :meth:`_probe` a repair uses.
+
+        Assets that are neither registered nor in a catalogue stay out on purpose: an
+        id-as-path fallback written into the registry would turn "this asset is not
+        registered yet" (which has a one-click repair) into "this registered file is
+        missing" (which does not).
+        """
+        refs = {asset_id: replace(ref, voice=self.voices.get(asset_id)
+                                  or getattr(ref, 'voice', ''))
+                for asset_id, ref in self.refs.items()}
+        for asset_id, asset in self._legacy_catalog().items():
+            self.voices.setdefault(asset_id, asset.voice)
+            voice = self.voices.get(asset_id, '') or asset.voice
+            if asset_id in refs:
+                refs[asset_id] = replace(refs[asset_id],
+                                         voice=refs[asset_id].voice or asset.voice)
+                continue
+            known = self.extra.get(asset_id)
+            ref = (known if known is not None and Path(known.path) == Path(asset.path)
+                   else AssetRef(asset_id=asset_id, path=asset.path))
+            if not ref.measured:
+                ref = self._probe(ref)
+            refs[asset_id] = replace(ref, voice=voice or getattr(ref, 'voice', ''))
+        return refs
+
+    def _legacy_catalog(self):
+        """``media.json``'s assets, or ``{}`` when there is nothing to migrate."""
+        if not self.catalog_path.is_file():
+            return {}
+        try:
+            return dict(catalog_module.load_catalog(self.path))
+        except CatalogError:
+            return {}
 
     def save_delivery(self):
         from word_video.media import atomic_json
@@ -313,6 +397,10 @@ class ProjectFolder:
 
     def set_voice(self, asset_id, voice):
         """Repair action: record the voice an existing file was made with."""
+        if asset_id not in self.refs:
+            # A pre-registry project keeps its assets in the catalogue until the next
+            # save; adopting them here is what lets a voice be recorded at all.
+            self.refs = self.registry_refs()
         if asset_id not in self.refs:
             raise KeyError(asset_id)
         self.voices[asset_id] = str(voice)
