@@ -46,6 +46,92 @@ def _sources():
             for role in ('female', 'male', 'chinese')}
 
 
+class IntroLayerTests(unittest.TestCase):
+    """`wv-project@2`: the intro is part of the plan, not an exporter parameter.
+
+    Five cases: the clip and its stage come from the plan, a caller cannot override
+    them, a silent clip sounds nothing, a standalone fallback is what the mixer is
+    given, and a project with no intro layer keeps the reserved-seconds fallback.
+    """
+
+    VIDEO = 'D:/fixtures/intro.mp4'
+    FALLBACK = 'D:/fixtures/intro-fallback.wav'
+
+    def _intro_project(self, *, seconds=1.5, sound_asset=None, sound_source='FROM_CLIP',
+                       from_clip=True, fallback='', intro=True, **overrides):
+        from dataclasses import replace
+
+        from word_video.domain import IntroMeasurement, MediaSlice
+
+        record = Record(id='w1', word='apple', phonetic='/ˈæpəl/', meaning='n. 苹果',
+                        spoken_meaning='苹果', index=1)
+        media = {'w1:%s' % role: MediaInfo('w1:%s' % role, 48000)
+                 for role in ('female', 'male', 'chinese')}
+        settings = dict(project_id='intro-export', intro_s=2.0, fps_num=60)
+        settings.update(overrides)
+        measurement = IntroMeasurement(
+            asset_id=self.VIDEO, seconds=seconds,
+            sound_asset=self.VIDEO if sound_asset is None else sound_asset,
+            sound_source=sound_source, from_clip=from_clip,
+            picture_seconds=max(seconds, 1.5))
+        template = (replace(DEFAULT_LESSON_TEMPLATE, intro=True) if intro
+                    else DEFAULT_LESSON_TEMPLATE)
+        project = instantiate(template, (record,), media, Project(**settings),
+                              intro=MediaSlice(self.VIDEO, 0, 112) if intro else None,
+                              intro_audio=fallback,
+                              intro_measure=measurement if intro else None)
+        self._measurement = measurement if intro else None
+        return project
+
+    def _manifest(self, project, **kwargs):
+        media = {key: MediaInfo(key, 48000) for key in _sources()}
+        solution = solve(project, media, self._measurement)
+        return build_manifest(solution.render, project, _sources(),
+                              background='bg.mp4', styles=STYLES, **kwargs)
+
+    def test_the_clip_and_its_stage_come_from_the_plan(self):
+        project = self._intro_project(seconds=1.5)
+        view = self._manifest(project)
+        self.assertEqual(90, view.intro_frames)          # 1.5 s at 60 fps
+        self.assertEqual(self.VIDEO, view.intro_video)
+        self.assertEqual(self.VIDEO, view.intro_audio)   # the clip's own sound
+
+    def test_an_exporter_parameter_cannot_override_the_plan(self):
+        project = self._intro_project(seconds=1.5)
+        view = self._manifest(project, intro_video='D:/somewhere/else.mp4',
+                              intro_audio='D:/somewhere/else.wav')
+        self.assertEqual(self.VIDEO, view.intro_video)
+        self.assertEqual(self.VIDEO, view.intro_audio)
+
+    def test_a_silent_clip_takes_its_length_from_the_picture_and_sounds_nothing(self):
+        project = self._intro_project(seconds=1.5, sound_asset='',
+                                      sound_source='SILENT_CLIP_NO_INTRO_AUDIO',
+                                      from_clip=False)
+        view = self._manifest(project)
+        self.assertEqual('', view.intro_audio)
+        self.assertEqual(90, view.intro_frames)
+
+    def test_a_standalone_fallback_is_what_the_mixer_is_given(self):
+        project = self._intro_project(seconds=0.4, sound_asset=self.FALLBACK,
+                                      sound_source='FROM_INTRO_AUDIO',
+                                      from_clip=False, fallback=self.FALLBACK)
+        view = self._manifest(project)
+        self.assertEqual(self.FALLBACK, view.intro_audio)
+        self.assertEqual(24, view.intro_frames)          # 0.4 s at 60 fps
+        # A caller passing its own file must not win over the plan's verdict.
+        again = self._manifest(project, intro_audio='D:/ignored.wav')
+        self.assertEqual(self.FALLBACK, again.intro_audio)
+
+    def test_a_project_without_an_intro_layer_keeps_the_reserved_seconds(self):
+        """The `@1` shape: no clip, so the caller's parameters still apply."""
+        project = self._intro_project(intro=False)
+        view = self._manifest(project, intro_video='D:/given/clip.mp4',
+                              intro_audio='D:/given/sound.wav')
+        self.assertEqual(120, view.intro_frames)         # intro_s 2.0 at 60 fps
+        self.assertEqual('D:/given/clip.mp4', view.intro_video)
+        self.assertEqual('D:/given/sound.wav', view.intro_audio)
+
+
 class FrameRateRefusalTests(unittest.TestCase):
     def test_2997_is_refused_rather_than_rounded_to_30(self):
         """1001/30000 is representable on the tick grid, but not as an mp4 rate."""

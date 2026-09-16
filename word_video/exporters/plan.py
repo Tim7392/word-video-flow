@@ -123,6 +123,12 @@ def build_manifest(plan, project, sources, *, background, intro_video='',
     ``sources`` maps ``asset_id`` -> :class:`SourceMedia`; every speech item must
     have one, because the renderer mixes real files and a missing path would fail
     much later with a message about the mixer rather than about the plan.
+
+    **The intro comes from the plan** (``wv-project@2``): its stage length, its clip
+    and the file that sounds are all properties of the solved intro layer, so the
+    exporter no longer decides any of them.  ``intro_video``/``intro_audio`` remain
+    only as a caller's override for a project that has *no* intro layer - the
+    "seconds without media" case, which keeps the legacy picture working.
     """
     fps_num, fps_den = _rate(plan, fps)
     if fps_den != 1:
@@ -137,7 +143,13 @@ def build_manifest(plan, project, sources, *, background, intro_video='',
     first = words[0]['index'] if first_index is None else first_index
     last = words[-1]['index'] if last_index is None else last_index
     total_frames = frame_at(plan.total_ticks, fps_num)
-    intro_frames = frame_at(project.intro_ticks, fps_num)
+    clip, sound, plan_audio, intro_frames = _intro_from_plan(plan, project, fps_num)
+    if clip is None:
+        intro_video, intro_audio = str(intro_video or ''), str(intro_audio or '')
+    else:
+        # The plan's own clip and sound win over any parameter: the caller's
+        # arguments are the no-intro-layer fallback, not a second source of truth.
+        intro_video, intro_audio = clip, plan_audio
     for block in words:
         if block['end_frame'] > total_frames:
             raise ProjectionError('word %r ends after the timeline' % block['index'])
@@ -147,11 +159,35 @@ def build_manifest(plan, project, sources, *, background, intro_video='',
         first_index=first, last_index=last, fps=fps_num,
         width=plan.width, height=plan.height, speed=project.speed,
         intro_frames=intro_frames, total_frames=total_frames,
-        background=str(background), intro_audio=str(intro_audio or ''),
-        intro_video=str(intro_video or ''), video_codec=video_codec,
+        background=str(background), intro_audio=intro_audio,
+        intro_video=intro_video, video_codec=video_codec,
         styles=dict(styles or {}), words=words, audio=audio)
     verify_manifest(view, plan, project)
     return view
+
+
+def _intro_from_plan(plan, project, fps_num):
+    """``(clip, sound, intro_audio, intro_frames)`` from the solved intro layer.
+
+    A project without an intro layer keeps the verified engine's own fallback -
+    ``project.intro_ticks`` reserved in front of the lesson with no clip - so an
+    ``@1`` document still renders exactly as it did.
+    """
+    item = plan.intro_item
+    if item is None:
+        return None, None, '', frame_at(project.intro_ticks, fps_num)
+    if item.source is None:
+        raise ProjectionError('the intro layer %s has no media' % item.clip_id)
+    sound = item.sound
+    if sound is not None and not sound.silent and sound.asset_id:
+        # The file that sounds: the clip's own soundtrack, or the standalone
+        # fallback the project declared.  Which one won is the resolver's verdict,
+        # already recorded in ``sound.source`` - the exporter does not re-decide it.
+        intro_audio = sound.asset_id
+    else:
+        intro_audio = ''
+    return (item.source.asset_id, sound, intro_audio,
+            frame_at(item.end_ticks, fps_num))
 
 
 def _rate(plan, fps):
@@ -234,6 +270,17 @@ def verify_manifest(view, plan, project):
       which the manifest has no field to express.
     """
     fps = view.fps
+    if plan.intro_item is not None:
+        # The intro's own stage must survive the projection: a caller who passes a
+        # different clip or length would move every word in the picture.
+        if frame_at(plan.intro_item.end_ticks, fps) != view.intro_frames:
+            raise ProjectionError('intro stage %d frames != plan %d'
+                                  % (view.intro_frames,
+                                     frame_at(plan.intro_item.end_ticks, fps)))
+        if plan.intro_item.source is not None \
+                and view.intro_video != plan.intro_item.source.asset_id:
+            raise ProjectionError('intro clip %r != plan %r'
+                                  % (view.intro_video, plan.intro_item.source.asset_id))
     for item in view.audio:
         solved = next((candidate for candidate in plan.audio
                        if candidate.role == item['role']
