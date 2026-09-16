@@ -70,6 +70,12 @@
 | 短名 TEMP 的测试脆弱点（H0 复现，已转 B） | 条件：`TEMP` 为 8.3 短名（`C:\Users\ADMINI~1\...`）。`tests/test_wv_media_intro.py` 2 项失败：`resolve_intro_audio()` 返回 resolve 后的长名，测试拿短名字符串比。已要求 B：① 比较前统一 resolve 并留短名 TEMP 回归；② 审计生产侧是否还有"片头路径文本相等"比较（短名机器上会表现为片头音源判断错） |
 | 进行中 | A=asset_id→路径解析接口（`wv-assets@1`）；B=片头 flip 到只读计划 + W07 旧声音导入；C=W06 编辑器主体；QA=v2 判定 + 重建包复验 |
 
+| **Tim 三项决定（2026-09-16）** | ① **预览档位冻结：720p30 预览 / 1080p60 成片**（成片规格不变；目标核显机未实测前不宣称低配已验）——已写入 `AGENTS.md`；② 生产节奏：**先跑 251-300 一批，看产物再决定**（已挂上跑）；③ GitHub：**继续只本地提交**，等 owner/repo |
+| **A-5 资产解析（已合并 `980c836`）** | `wv-assets@1`（`<工程目录>/assets.json`，与 `project.json` 共用原子写/严格读）；`AssetIndex.resolve(project, folder=…)` → `ref/path/media_info/media_map/problems`；错误码 `MISSING_ASSET`/`DUPLICATE_ASSET`/`ASSET_FILE_MISSING`/`UNKNOWN_DURATION`（`problems()` 一次列全部坏引用，供 W06 做可点修复）；无登记表时「asset_id 即路径」兜底、登记表优先；探测仍由媒体层注入。A 自测 8 项 |
+| **B 的 W07（已合并 `c766f87`）** | ① **短名 TEMP 修复 + 生产侧审计**：`TEMP=C:\Users\ADMINI~1\…` 下 `test_wv_media_intro.py` 12 passed（原 2 failed）；审计结论：intro/background/font 路径在生产代码里**没有被当文本比较**（唯一命中是"resolve 后放进集合"，安全方向）。② **旧缓存导入**：扫描 32 个 cache 根 / 2868 token 目录，可用原件 **2310**（jianying 923 + parallel 1387），跳过 558（kind=local 本无原件），全机歧义 0；按 `spec.timeline_route` 取文件（实测两路 1.160s vs 1.248s，取错会打死作业）；**TTS 调用 = 0 双重锁定**（计数假 route + 断网子进程）；重复导入 `published_new=0/reused=9`、字节数不变。③ **导入后真实出片**：1080p、19.7s、`accept_range --pixels all` **PASS 八面全 0**、与归档**逐帧一致**（词边界 112/171/229/308…）。④ **片头 flip**：导出器只读计划，`@2` 工程**不带任何片头参数**即可出片（`intro_frames=112`，八面全 0，`intro_audible=true`）。回归 **501 passed** |
+| **QA-3（已合并 `d24be1a`）** | v2 判定：**v2 批与 legacy 批都 PASS**；且用**外部推导的期望表**（`--spoken-file`，报告记录表来源）判定，负向对照"故意写错一个词"立刻 FAIL（wordlist/srt/timing 三面命中）。**口径四数独立复核与我完全一致**（291/290/4/0），并定位差 1 行 = 第 1626 行 `goodness`（旧核心 `\b` 在"n.天"处失效，留下 `int.`）。差异面：legacy 批与归档 timeline 0 差异、五轨 SRT 逐字节相同；v2 批差异**只在 6 个词的 spoken_meaning**，五轨仅 `_05` 变，**总帧数仍 10956、时间一帧未动** |
+| H0 裁定（QA 报的两处规则边界） | QA 问 `pl.`（#705 `(pl. phenomena)`）与 `/` 后的 `aux.`（#1228/#1440）是否算词性标注。**裁定：算，必须去掉**——已批准规则文本与 A-2 派工单都明确把这些列在词性标记清单里；因此**不改实现**。旧核心保留它们只是旧实现的表更窄，属已记录的 4 行 legacy 边界（不影响已交付范围 1-200/501-700） |
+
 ### 待决/风险（不阻塞当前开发）
 - GitHub owner/repo 仍未提供 → 只本地提交。
 - 预览档位（720p30/540p30）未批准冻结，实测后再请 Tim 确认。
