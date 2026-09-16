@@ -172,31 +172,60 @@ def poll_job(package, db, job, environment, timeout):
     return {'final': last, 'states_observed': observed, 'timeout_seconds': timeout}
 
 
+def batch_manifests(root):
+    """Batch ``complete.json`` files.
+
+    The audio cache keeps one ``complete.json`` marker per cached utterance (with an
+    empty file list), so a plain rglob would count those as batches; a batch manifest
+    is the one that carries the ``batch`` block written by ``jobs.work``.
+    """
+    manifests = []
+    for path in sorted(Path(root).rglob('complete.json')):
+        if 'audio-cache' in path.relative_to(root).parts:
+            continue
+        try:
+            saved = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            continue
+        if 'batch' in saved:
+            manifests.append((path, saved))
+    return manifests
+
+
 def check_artifacts(package, output_root, job, job_result):
     """Three products, the file manifest, and a re-read of the MP4 by the packaged ffprobe."""
     root = Path(output_root) / job
-    report = {'job_directory': str(root), 'complete_files': [], 'problems': []}
-    completed = sorted(root.rglob('complete.json'))
-    report['complete_json_count'] = len(completed)
-    if not completed:
-        report['problems'].append('no complete.json')
+    report = {'job_directory': str(root), 'batch_manifests': [], 'problems': []}
+    manifests = batch_manifests(root)
+    report['batch_count'] = len(manifests)
+    if not manifests:
+        report['problems'].append('no batch complete.json under %s' % root)
         return report
-    expected = {item['path'] for item in job_result.get('files', [])}
-    for marker in completed:
-        saved = json.loads(marker.read_text(encoding='utf-8'))
+    # The CLI's stdout contract deliberately reports only SRT/MP4/draft files, while
+    # complete.json is the full manifest, so the two are compared one way only.
+    reported = [item['path'] for item in job_result.get('files', [])]
+    report['reported_files'] = len(reported)
+    report['reported_file_count'] = job_result.get('file_count')
+    for marker, saved in manifests:
         listed = saved.get('files', [])
-        report['complete_files'].append({'complete': str(marker), 'files': len(listed),
-                                         'batch': saved.get('batch', {}).get('video_check') is not None})
+        records = {item['path']: item['sha256'] for item in listed}
+        report['batch_manifests'].append({
+            'complete': str(marker), 'files': len(listed),
+            'video_check': saved.get('batch', {}).get('video_check') is not None,
+            'batch': saved.get('batch', {}).get('first')})
         if not listed:
             report['problems'].append('%s lists no files' % marker)
-        for item in listed:
-            path = Path(item['path'])
-            if not path.is_file():
+        for path, digest in records.items():
+            if not Path(path).is_file():
                 report['problems'].append('missing %s' % path)
-            elif sha256_file(path) != item['sha256']:
+            elif sha256_file(path) != digest:
                 report['problems'].append('changed %s' % path)
-            if item['path'] not in expected:
-                report['problems'].append('%s is not in the job result' % path)
+        absent = [path for path in reported if path not in records]
+        if absent:
+            report['problems'].append('reported but not in the manifest: %s' % ', '.join(absent))
+        if job_result.get('file_count') != len(records):
+            report['problems'].append('CLI file_count=%s but the manifest lists %d'
+                                      % (job_result.get('file_count'), len(records)))
         folder = marker.parent
         srts = sorted((folder / 'srt').glob('*.srt'))
         report['srt_files'] = [item.name for item in srts]
@@ -227,6 +256,8 @@ def check_artifacts(package, output_root, job, job_result):
                                          'size': '%sx%s' % (video_stream.get('width'),
                                                             video_stream.get('height')),
                                          'codec': video_stream.get('codec_name')}
+                if kinds.count('video') != 1 or kinds.count('audio') != 1:
+                    report['problems'].append('unexpected MP4 streams: %s' % kinds)
         draft = folder / 'editable-draft'
         resources = list((draft / 'Resources').glob('*')) if (draft / 'Resources').is_dir() else []
         report['draft'] = {'draft_content': (draft / 'draft_content.json').is_file(),
@@ -236,6 +267,7 @@ def check_artifacts(package, output_root, job, job_result):
         if not (report['draft']['draft_content'] and report['draft']['draft_meta']):
             report['problems'].append('editable draft is incomplete')
     report['ok'] = not report['problems']
+    report['problems'] = report['problems'][:20]
     return report
 
 
@@ -328,7 +360,9 @@ def main(argv=None):
                               'artifacts_before_worker': (output_root / job / 'complete.json').exists()}
         print('[verify] start returned in %.2fs, worker pid=%s'
               % (started['seconds'], worker.get('pid')), file=sys.stderr)
+        job_started = time.monotonic()
         poll = poll_job(package, db, job, environment, args.timeout)
+        evidence['job_seconds'] = round(time.monotonic() - job_started, 1)
         final = (poll['final'].get('json') or {}).get('result') or {}
         evidence['poll'] = {'states_observed': poll['states_observed'],
                             'final_state': final.get('state'), 'seconds': poll['final']['seconds'],
