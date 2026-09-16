@@ -575,24 +575,28 @@ def speech_assets(project):
     return found
 
 
-#: Layers a member may split today (A's ``SPLITTABLE_ROLES``) whose pieces the
-#: exporter's projection cannot draw yet - it still carries one window per layer.
-SPLIT_GATED_ROLES = ('background', 'intro')
+#: Layers A lets a member split whose *pieces* the exporter cannot all draw.
+#: Since B-5 a split **background** is delivered in full (one segment per piece,
+#: each looping inside its own stage), so only the intro is gated: the countdown in
+#: front of the lesson is one picture, and B's projection refuses two of them by
+#: name (``_intro_from_plan``) rather than half-drawing it.
+SPLIT_GATED_ROLES = ('intro',)
 
 
 def split_layer_notices(project):
-    """A split media layer blocks the *delivery*, not the editing.
+    """A split intro blocks the *delivery*, not the editing.
 
     Reported here rather than in the timeline because it is a property of the
-    delivery: the member may split the intro or the background and keep working,
-    but publishing now would draw only one of the halves - a film that silently
-    disagrees with the project, which is exactly what this product refuses to do.
+    delivery: the member may cut the countdown and keep working, but publishing now
+    would be refused by the exporter - and it is better to say which clip and why
+    before a thirty-second render than to surface B's projection error afterwards.
+    A split background is **not** gated any more: B-5 draws every piece.
     """
     found = []
     for role in SPLIT_GATED_ROLES:
         clips = tuple(clip.id for clip in project.clips if clip.role == role)
         if len(clips) > 1:
-            found.append(notices.split_layer_notice(project, role, clips))
+            found.append(notices.split_intro_notice(project, clips))
     return found
 
 

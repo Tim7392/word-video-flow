@@ -327,10 +327,11 @@ def test_splitting_the_intro_layer_works_and_undo_puts_it_back(window, app, area
     assert clip.id in intros
     assert sum(1 for key in before if key not in after) == 0
 
-    # And the delivery is blocked, loudly, until B's projection draws both halves.
+    # And the delivery is blocked, loudly, until the cut is undone: this build
+    # delivers one intro (B refuses two by name), so the editor says so first.
     from desktop.editor_export import blocking_notices
     blockers = blocking_notices(editor.folder, editor.state.project)
-    assert [notice.code for notice in blockers] == ['SPLIT_LAYER_NOT_EXPORTABLE']
+    assert [notice.code for notice in blockers] == ['SPLIT_INTRO_NOT_EXPORTABLE']
     assert blockers[0].clip_id in intros
     assert editor.export() is None
     assert editor.diagnostics()['exporting'] is False

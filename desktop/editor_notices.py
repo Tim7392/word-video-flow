@@ -464,23 +464,23 @@ def split_refused_notice(project, clip_id, at_ticks, check):
                  detail={'at_ticks': int(at_ticks)})
 
 
-def split_layer_notice(project, role, clip_ids):
-    """A split media layer, which the exporter cannot draw in two pieces yet.
+def split_intro_notice(project, clip_ids):
+    """The countdown is cut in two; this build delivers one intro.
 
-    Reported at the *delivery*, not at the edit: a member may split the intro or
-    the background and keep working, but the projection still renders one window
-    per layer, so delivering now would publish a film that draws only one half -
-    and that is precisely the kind of silent difference this product refuses.
+    Reported at the *delivery*, not at the edit: a member may split the intro and
+    keep working and saving, but B's projection refuses two intros by naming the
+    second item rather than half-drawing the countdown.  Saying so here - with the
+    clip named and an undo offered - is cheaper than surfacing that refusal after a
+    render, and it cannot be mistaken for a silent success.
     """
-    clip_id = clip_ids[0] if clip_ids else ''
-    return _base(project, 'SPLIT_LAYER_NOT_EXPORTABLE',
-                 '%s图层被拆成了 %d 段，成片的投影目前只能画一段'
-                 % (role_label(role), len(clip_ids)), severity=SEVERITY_BLOCK,
-                 object_path='clip:%s' % clip_id,
-                 hint='B 把投影改成多段之前，先撤销这次拆分再导出；工程本身可以保留拆分',
+    clip_id = clip_ids[1] if len(clip_ids) > 1 else (clip_ids[0] if clip_ids else '')
+    return _base(project, 'SPLIT_INTRO_NOT_EXPORTABLE',
+                 '片头不支持拆分：现在有 %d 段片头，这一版只能出一段' % len(clip_ids),
+                 severity=SEVERITY_BLOCK, object_path='clip:%s' % clip_id,
+                 hint='撤销这次拆分后再导出；工程本身可以保留拆分（背景拆分是可以出片的）',
                  actions=(Action(ACTION_UNDO, '撤销最近一次编辑'),
                           _select(clip_id, project=project)),
-                 detail={'role': role, 'clip_ids': list(clip_ids)})
+                 detail={'role': 'intro', 'clip_ids': list(clip_ids)})
 
 
 def split_unsupported_notice(project, clip_id, at_ticks):

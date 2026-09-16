@@ -149,6 +149,86 @@ def test_the_intro_window_is_the_picture_and_a_cut_lands_inside_it(area):
     assert halves[1].source.source_end == clip.source.source_end
 
 
+def test_a_split_background_is_deliverable_and_a_split_intro_is_not(area):
+    """B-5 draws every background piece; the countdown stays single by design.
+
+    The two halves of acceptance item 3 for the two splittable layers: a cut
+    background must **not** be blocked (one segment per piece, each looping inside
+    its own stage), and a cut intro must be refused with the clip named - because
+    the exporter would otherwise reject it after a render.
+    """
+    from dataclasses import replace
+    from word_video.application import expand
+    from word_video.domain.compile import IntroMeasurement
+    from word_video.domain.lesson import DEFAULT_LESSON_TEMPLATE
+    from word_video.domain.model import MediaSlice, Project
+    from word_video.exporters.catalog import Asset
+    from word_video.storage.assets import AssetRef
+
+    folder, state = tiny_state(area / 'project')
+    # The background is *longer* than the lesson, which is the case a cut can be
+    # expressed in: the piece's source window is proportional to what it plays.  A
+    # background shorter than the lesson is looped, and A's SplitClip refuses a cut
+    # it cannot map onto the source window (reported, not worked around here).
+    background = write_test_video(area / 'background.mp4', 20.0, 30, '160x120')
+    intro = write_test_video(area / 'intro.mp4', 2.0, 30, '160x120')
+    # Registered on the same grid the slices use, exactly as the importer registers
+    # the countdown: a video layer's window is its picture, in milliseconds, and the
+    # solver refuses a clip whose grid disagrees with the registry's measurement.
+    # The intro's id is its path because the exporter measures that layer from the
+    # id itself (``measure_project_intro``), which is the documented id-as-path case.
+    for asset_id, path in (('layer:background', background), (str(intro), intro)):
+        units = 20000 if asset_id == 'layer:background' else 2000
+        folder.refs[asset_id] = AssetRef(asset_id=asset_id, path=str(path), units=units,
+                                         unit_num=1, unit_den=1000, kind='video')
+    folder.save_assets()
+    folder._measured = True
+    background_slice = MediaSlice(asset_id='layer:background', source_start=0,
+                                  source_end=20000, unit_num=1, unit_den=1000)
+    intro_slice = MediaSlice(asset_id=str(intro), source_start=0,
+                             source_end=2000, unit_num=1, unit_den=1000)
+    project = expand(replace(DEFAULT_LESSON_TEMPLATE, intro=True),
+                     state.project.records, folder.media_table(),
+                     Project(project_id='split-layers', fps_num=60, intro_s=1.0,
+                             speed=1.25, width=640, height=360),
+                     background=background_slice, intro=intro_slice,
+                     intro_measure=IntroMeasurement(asset_id=str(intro), seconds=2.0,
+                                                    picture_seconds=2.0))
+    folder.save_project(project)
+    state = EditorState(project, media=folder.media_table(),
+                        intro=folder.intro_measurement(), path=folder.project_path)
+    assert state.plan() is not None, state.plan_error
+    assert state.cues_error is None
+    assert blocking_notices(folder, project) == ()
+
+    background_clip = next(clip for clip in project.clips if clip.role == 'background')
+    intro_clip = project.intro_clip()
+    assert state.split_check(background_clip.id).ok is True
+    assert state.split_check(intro_clip.id).ok is True
+
+    cut_background = state.split_at_ticks(background_clip.id,
+                                          background_clip.duration_ticks // 2)
+    assert cut_background.changed is True, [n.code for n in cut_background.notices]
+    pieces = [clip for clip in state.project.clips if clip.role == 'background']
+    assert len(pieces) == 2
+    # Two background pieces are a delivery this build can produce: not blocked.
+    assert blocking_notices(folder, state.project) == ()
+    assert state.cues_error is None
+
+    cut_intro = state.split_at_ticks(intro_clip.id, intro_clip.duration_ticks // 2)
+    assert cut_intro.changed is True, [n.code for n in cut_intro.notices]
+    blockers = blocking_notices(folder, state.project)
+    assert [notice.code for notice in blockers] == ['SPLIT_INTRO_NOT_EXPORTABLE']
+    assert blockers[0].clip_id == 'layer.intro.2' or blockers[0].clip_id == 'layer.intro'
+    assert '片头不支持拆分' in blockers[0].message
+    assert notices.ACTION_UNDO in [action.kind for action in blockers[0].actions]
+
+    # Undoing the intro cut makes the project deliverable again, background cut and all.
+    state.undo()
+    assert blocking_notices(folder, state.project) == ()
+    assert len([clip for clip in state.project.clips if clip.role == 'background']) == 2
+
+
 def test_the_spoken_text_comes_from_the_audio_side_not_the_word_list(area):
     """What sounds wins: the caption has to match the file, not the other way round."""
     _, tones = assets_of(area, count=3)
