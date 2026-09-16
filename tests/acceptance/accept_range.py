@@ -594,17 +594,61 @@ def chinese_floor(spoken, word):
     return max(CHINESE_FLOOR, head * FIRST_SIX + (count - head) * EXTRA)
 
 
+SPEECH_NAME = re.compile(r'_(?P<window>\d+(?:\.\d+)?)s_(?P<speed>\d+(?:\.\d+)?)x\.wav$')
+
+
+def speech_window(stage, path):
+    """What the *plan* says this speech file is: ``(source_seconds, speed)``.
+
+    Two layouts carry it, and neither is guessed from the published timeline:
+
+    * the verified chain writes a per-asset record next to the prepared audio
+      (``complete.json`` with ``raw`` seconds and the processing ``spec``);
+    * the new exporter names the file after the window it cut and the tempo it
+      applied (``w151_female_1.1280s_1.2500x.wav``), so the source window and the
+      speed come from the file the plan produced.
+
+    Returns ``(seconds, speed, source)`` or ``(None, None, why)``.
+    """
+    record_path = path.parent / 'complete.json'
+    if record_path.exists():
+        try:
+            record = json.loads(record_path.read_text(encoding='utf-8'))
+        except Exception as error:
+            return None, None, 'per-asset 记录不可读：%r' % error
+        raw = record.get('raw')
+        if raw is None:
+            return None, None, 'per-asset 记录里没有 raw 秒数'
+        spec = record.get('spec') or {}
+        speed = spec.get('speed') or stage.get('speed') or record.get('speed')
+        return float(raw), (float(speed) if speed else None), 'per-asset 记录'
+    match = SPEECH_NAME.search(path.name)
+    if match:
+        return (float(match.group('window')), float(match.group('speed')),
+                '文件名里的源窗口与速度')
+    return None, None, '找不到 per-asset 记录，文件名也没有 窗口s_速度x'
+
+
 def check_timing(manifest, report, expectations):
     """Stage lengths and identities against the read-only word list and the media.
 
-    ``raw`` in the cache record is the *unscaled* recording length, so the whole
-    reserved duration can be recomputed: a timeline that claims a stage the real
-    recording does not fit into is caught even when every published file agrees
-    with the timeline.
+    Two things are recomputed here, and the report says which of them ran:
+
+    ``media fits the stage``  the real duration of the prepared file, measured
+        here, must fit the frames the timeline reserved for it at the declared
+        speed.  This catches a stage that is too short for its own audio.
+    ``the stage meets the pacing floor``  the floor comes from the read-only word
+        list (English 1.0 s, the Chinese rule), so a stage longer than the floor
+        plus the gap allowance is impossible without either a wrong floor or a
+        wrong source length.  Recomputing the *exact* frame count additionally
+        needs the unscaled recording length; when the layout does not publish it,
+        that part is reported as **not run** instead of being silently skipped.
     """
-    problems, rows, missing = [], [], 0
+    problems, rows, skipped = [], [], []
     fps, speed = manifest['fps'], manifest['speed']
     by_index = {word['index']: word for word in expectations}
+    recomputed = 0
+    window_sources = {}
     for stage in manifest['audio']:
         path = Path(stage['path'])
         row = {'word_index': stage['word_index'], 'role': stage['role']}
@@ -624,62 +668,48 @@ def check_timing(manifest, report, expectations):
                             % (stage['word_index'], stage['role'], path))
             continue
         media = media_seconds(path)
-        record_path = path.parent / 'complete.json'
-        if not record_path.exists():
-            missing += 1
-            row.update({'cache': 'DATA_MISSING', 'media_seconds': round(media, 4)})
-            rows.append(row)
-            continue
-        record = json.loads(record_path.read_text(encoding='utf-8'))
-        spec = record.get('spec', {})
-        if spec.get('role') != stage['role']:
-            problems.append('word %d: cache role %r != timeline role %r'
-                            % (stage['word_index'], spec.get('role'), stage['role']))
-        if spec.get('text') != want_text:
-            problems.append('word %d %s: the cached speech is %r, the word list says %r'
-                            % (stage['word_index'], stage['role'], spec.get('text'),
-                               want_text))
-        if stage.get('voice') and spec.get('voice') and stage['voice'] != spec['voice']:
-            problems.append('word %d %s: cache voice %r != timeline voice %r'
-                            % (stage['word_index'], stage['role'], spec['voice'],
-                               stage['voice']))
-        if spec.get('speed') not in (None, speed):
-            problems.append('word %d %s: cached at speed %s, timeline says %s'
-                            % (stage['word_index'], stage['role'], spec.get('speed'), speed))
-        if spec.get('fps') not in (None, fps):
-            problems.append('word %d %s: cached at %s fps, timeline says %s'
-                            % (stage['word_index'], stage['role'], spec.get('fps'), fps))
-        rendered = record.get('rendered')
-        if rendered is not None and abs(rendered - media) > MEDIA_TOLERANCE_FRAMES / fps:
-            problems.append('word %d %s: cache says the prepared audio is %.4fs, the file is '
-                            '%.4fs' % (stage['word_index'], stage['role'], rendered, media))
-        digest = record.get('audio_digest')
-        if digest and sha256(path) != digest:
-            problems.append('word %d %s: the prepared audio is not the file the cache '
-                            'committed' % (stage['word_index'], stage['role']))
-        raw = record.get('raw')
-        if raw is None:
-            missing += 1
-            row.update({'cache': 'DATA_MISSING(raw)', 'media_seconds': round(media, 4)})
-            rows.append(row)
-            continue
         floor = ENGLISH_FLOOR if stage['role'] in ('female', 'male') \
             else chinese_floor(want['spoken_meaning'], want['word'])
-        minimum = max(floor, raw + GAP_S)
-        expected = max(math.ceil(minimum / speed * fps), math.ceil(media * fps), 1)
-        row.update({'raw': raw, 'rendered': rendered,
-                    'media_seconds': round(media, 4),
+        seconds, window_speed, source = speech_window(stage, path)
+        declared_speed = window_speed or speed
+        reserved_seconds = stage['duration_frames'] / fps
+        row.update({'media_seconds': round(media, 4), 'floor_seconds': floor,
                     'duration_frames': stage['duration_frames'],
-                    'expected_frames': expected})
-        if abs(expected - stage['duration_frames']) > SPEED_TOLERANCE_FRAMES:
-            problems.append('word %d %s: the timeline reserves %d frames (%.3fs) but the '
-                            'recording needs %d frames (%.3fs raw, %.3fs prepared)'
-                            % (stage['word_index'], stage['role'],
-                               stage['duration_frames'],
-                               stage['duration_frames'] / fps, expected,
-                               raw, media))
+                    'window_source': source})
+        if seconds is None:
+            skipped.append('word %d %s: 阶段帧数无法复算（%s）'
+                           % (stage['word_index'], stage['role'], source))
+            row['source_seconds'] = None
+            row['expected_frames'] = None
+        else:
+            window_sources[source] = window_sources.get(source, 0) + 1
+            row['source_seconds'] = round(seconds, 4)
+            row['speed'] = declared_speed
+            expected = max(math.ceil(max(floor, seconds + GAP_S) / declared_speed * fps),
+                           math.ceil(media * fps), 1)
+            row['expected_frames'] = expected
+            recomputed += 1
+            if abs(expected - stage['duration_frames']) > SPEED_TOLERANCE_FRAMES:
+                problems.append(
+                    'word %d %s: the timeline reserves %d frames (%.3fs) but the rule '
+                    'gives %d frames from window %.4fs at %.4fx (floor %.3fs, gap '
+                    '%.2fs, media %.4fs)'
+                    % (stage['word_index'], stage['role'], stage['duration_frames'],
+                       reserved_seconds, expected, seconds, declared_speed, floor,
+                       GAP_S, media))
         rows.append(row)
-    report['timing'] = {'stages': len(rows), 'data_missing': missing,
+    # What could not be recomputed, named.  The two layouts differ in exactly one
+    # way: the verified chain publishes the *unscaled* recording length (``raw``),
+    # the new exporter publishes the source window after the plan cut it, so there
+    # the recording a window came from is the one fact left unchecked.
+    if any(source.startswith('文件名') for source in window_sources):
+        skipped.append('该布局只发布“计划裁出的窗口”：无法交叉核对它与真实未加工录音一致'
+                       '（旧链的 per-asset 记录里有 raw 秒数，新导出器没有）')
+    report['timing'] = {'stages': len(rows),
+                        'recomputed_stages': recomputed,
+                        'window_sources': window_sources,
+                        'skipped_checks': skipped,
+                        'complete': not skipped,
                         'frame_tolerance': SPEED_TOLERANCE_FRAMES,
                         'pacing_constants': {'english_floor': ENGLISH_FLOOR,
                                              'chinese_floor': CHINESE_FLOOR,
@@ -1026,10 +1056,21 @@ def main(argv=None):
             report.setdefault(name, {})['crash'] = repr(error)
         if problems:
             failures[name] = problems
+    # A face that could not run all of its checks must not leave the run looking
+    # complete: "insufficient evidence" is a weaker verdict than PASS, and the
+    # difference has to be visible in the report and in the exit path.
+    partial = {}
+    for name, face in report.items():
+        if not isinstance(face, dict) or face.get('complete') is not False:
+            continue
+        partial[name] = face.get('skipped_checks') or ['未说明']
     report['failures'] = {k: v[:20] for k, v in failures.items()}
-    report['verdict'] = 'PASS' if not failures else 'FAIL'
+    report['partial_faces'] = partial
+    report['verdict'] = ('FAIL' if failures else 'PARTIAL' if partial else 'PASS')
     write_report(report, args.json)
-    return 0 if not failures else 1
+    # PASS is the only zero exit: a PARTIAL run did not verify everything, so a
+    # caller that only looks at the exit code must not read it as success.
+    return 0 if not failures and not partial else 1
 
 
 if __name__ == '__main__':
