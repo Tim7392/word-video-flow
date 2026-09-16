@@ -18,6 +18,7 @@ needed, so this stays in the default suite.
 import json
 import math
 from pathlib import Path
+import re
 import struct
 import sys
 import wave
@@ -36,6 +37,7 @@ GAP = 0.1
 WINDOW = 1.128            # the published source window for word 151 female
 FLOOR = 1.0               # English floor from the read-only word list
 HANZI_MEANING = '证明；证实'   # 4 Hanzi -> 1.6 s floor by the approved rule
+SPEED_NAME = re.compile(r'_(?P<window>\d+(?:\.\d+)?)s_')
 
 
 def write_wav(path, seconds, rate=48000):
@@ -111,7 +113,7 @@ def judge(batch, cleaning='v2'):
     manifest = json.loads((batch / 'timeline.json').read_text(encoding='utf-8'))
     expectations = accept_range.load_expectations(require_wordlist(), 151, 151,
                                                   cleaning)['words']
-    problems = accept_range.check_timing(manifest, report, expectations)
+    problems = accept_range.check_timing(manifest, report, expectations, batch)
     return report['timing'], problems
 
 
@@ -156,14 +158,83 @@ def test_the_published_prepared_audio_must_fit_its_stage(tmp_path):
     assert any('the rule gives' in line for line in problems), problems
 
 
-def test_a_layout_without_any_plan_data_is_partial_not_pass(tmp_path):
-    """No record and no window in the name: the stage cannot be checked at all."""
+def test_a_layout_without_any_plan_data_is_a_problem_not_a_pass(tmp_path):
+    """No record, no speech.json and no window in the name: that is a failure.
+
+    A batch that publishes nothing to check the pacing against must not be able to
+    end in PASS by skipping the face - which is exactly what the old
+    ``data_missing -> PASS`` behaviour did.
+    """
     batch = make_batch(tmp_path / 'no-plan-data', layout='bare')
     timing, problems = judge(batch)
-    assert not problems, problems
+    assert problems, '缺计时来源必须报问题'
+    assert any('没有任何可用的计时记录' in line for line in problems), problems
     assert timing['recomputed_stages'] == 0
     assert timing['complete'] is False
     assert len(timing['skipped_checks']) == 3, timing['skipped_checks']
+
+
+def write_speech_json(batch, records=None):
+    """The run's own account of what it prepared (wv-speech@1)."""
+    import hashlib
+    timeline = json.loads((batch / 'timeline.json').read_text(encoding='utf-8'))
+    rows = []
+    for stage in timeline['audio']:
+        path = Path(stage['path'])
+        window = float(SPEED_NAME.search(path.name).group('window'))
+        rows.append({
+            'asset_id': 'w151:%s' % stage['role'], 'record_id': '151',
+            'role': stage['role'], 'clip_id': 'w151.%s' % stage['role'],
+            'text': stage['text'], 'voice': stage.get('voice', ''),
+            'path': str(path), 'raw_seconds': window,
+            'rendered_seconds': window / SPEED,
+            'source_seconds': window,
+            'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+            'start_frame': stage['start_frame'],
+            'end_frame': stage['start_frame'] + stage['duration_frames'],
+            'duration_ticks': stage['duration_frames'] * (720000 // FPS),
+            'start_ticks': stage['start_frame'] * (720000 // FPS),
+            'end_ticks': (stage['start_frame'] + stage['duration_frames'])
+            * (720000 // FPS),
+            'stage_seconds': stage['duration_frames'] / FPS})
+    document = {'schema': 'wv-speech@1', 'mode': 'filename', 'fps': FPS,
+                'sample_rate': 48000, 'speed': SPEED,
+                'total_frames': timeline['total_frames'], 'records': rows}
+    if records is not None:
+        document['records'] = records
+    (batch / 'speech.json').write_text(json.dumps(document, ensure_ascii=False),
+                                       encoding='utf-8')
+    return document
+
+
+def test_a_speech_json_run_is_recomputed_and_complete(tmp_path):
+    """With the run's own speech.json the face is complete: every check runs."""
+    batch = make_batch(tmp_path / 'speech-json', layout='filename')
+    write_speech_json(batch)
+    timing, problems = judge(batch)
+    assert not problems, problems
+    assert timing['speech_json'] is True
+    assert timing['recomputed_stages'] == 3
+    assert timing['digests_checked'] == 3
+    assert timing['complete'] is True
+    assert timing['skipped_checks'] == []
+    assert timing['window_sources'] == {'speech.json 记录': 3}
+
+
+def test_a_speech_json_record_that_contradicts_the_timeline_is_caught(tmp_path):
+    """The record is the run's account; a timeline that disagrees is a problem."""
+    import hashlib
+    batch = make_batch(tmp_path / 'speech-json-bad', layout='filename')
+    document = write_speech_json(batch)
+    # Same files, but the record claims a different stage length and a wrong hash.
+    for row in document['records']:
+        row['stage_seconds'] = row['stage_seconds'] + 0.5
+        row['sha256'] = '0' * 64
+    (batch / 'speech.json').write_text(json.dumps(document, ensure_ascii=False),
+                                       encoding='utf-8')
+    timing, problems = judge(batch)
+    assert any('阶段时长' in line for line in problems), problems
+    assert any('sha256 不符' in line for line in problems), problems
 
 
 def test_the_partial_verdict_reaches_the_report(tmp_path):

@@ -597,58 +597,130 @@ def chinese_floor(spoken, word):
 SPEECH_NAME = re.compile(r'_(?P<window>\d+(?:\.\d+)?)s_(?P<speed>\d+(?:\.\d+)?)x\.wav$')
 
 
-def speech_window(stage, path):
-    """What the *plan* says this speech file is: ``(source_seconds, speed)``.
+def speech_window(stage, path, records=None):
+    """What the *plan* says this speech file is: ``(source_seconds, speed)`` and
+    optionally the record that proves it.
 
-    Two layouts carry it, and neither is guessed from the published timeline:
+    Three layouts carry it, and none of them is guessed from the published
+    timeline:
 
+    * ``speech.json`` in the batch root (``wv-speech@1``): one record per speech
+      asset with the raw and rendered seconds, the digest and the stage it belongs
+      to.  It is written *before* ``complete.json``, so a run that failed earlier
+      does not claim to be complete.  This is also what makes the record the plan
+      of record: the timeline has to agree with it, not the other way round.
     * the verified chain writes a per-asset record next to the prepared audio
       (``complete.json`` with ``raw`` seconds and the processing ``spec``);
-    * the new exporter names the file after the window it cut and the tempo it
-      applied (``w151_female_1.1280s_1.2500x.wav``), so the source window and the
-      speed come from the file the plan produced.
+    * the earlier exporter named the file after the window it cut and the tempo it
+      applied (``w151_female_1.1280s_1.2500x.wav``).
 
-    Returns ``(seconds, speed, source)`` or ``(None, None, why)``.
+    Returns ``(seconds, speed, source, record)``; ``seconds`` is ``None`` when the
+    layout publishes nothing, and ``record`` is the ``speech.json`` entry when one
+    matched.
     """
+    if records:
+        record = records.get((int(stage['word_index']), stage['role']))
+        if record:
+            window = record.get('source_seconds')
+            if window is None:
+                window = record.get('raw_seconds')
+            speed = record.get('speed') or stage.get('speed')
+            return ((float(window) if window is not None else None),
+                    return_speed(speed, record), 'speech.json 记录', record)
     record_path = path.parent / 'complete.json'
     if record_path.exists():
         try:
             record = json.loads(record_path.read_text(encoding='utf-8'))
         except Exception as error:
-            return None, None, 'per-asset 记录不可读：%r' % error
+            return None, None, 'per-asset 记录不可读：%r' % error, None
         raw = record.get('raw')
         if raw is None:
-            return None, None, 'per-asset 记录里没有 raw 秒数'
+            return None, None, 'per-asset 记录里没有 raw 秒数', None
         spec = record.get('spec') or {}
         speed = spec.get('speed') or stage.get('speed') or record.get('speed')
-        return float(raw), (float(speed) if speed else None), 'per-asset 记录'
+        return float(raw), (float(speed) if speed else None), 'per-asset 记录', record
     match = SPEECH_NAME.search(path.name)
     if match:
         return (float(match.group('window')), float(match.group('speed')),
-                '文件名里的源窗口与速度')
-    return None, None, '找不到 per-asset 记录，文件名也没有 窗口s_速度x'
+                '文件名里的源窗口与速度', None)
+    return None, None, '找不到 speech.json / per-asset 记录，文件名也没有 窗口s_速度x', None
 
 
-def check_timing(manifest, report, expectations):
+def return_speed(speed, record):
+    """The tempo a record implies: its own speed, or rendered/raw."""
+    if speed:
+        return float(speed)
+    raw, rendered = record.get('raw_seconds'), record.get('rendered_seconds')
+    if raw and rendered:
+        return float(raw) / float(rendered)
+    return None
+
+
+def load_speech_records(batch):
+    """``{(word_index, role): record}`` from ``speech.json``, or ``{}``.
+
+    The file is the run's own account of what it prepared.  It is read as the
+    *actual* input of the timing face - never as the expectation, which stays the
+    word list plus the hand-checked rhythm constants.
+    """
+    path = Path(batch) / 'speech.json'
+    if not path.exists():
+        return {}, None
+    try:
+        document = json.loads(path.read_text(encoding='utf-8'))
+    except Exception as error:
+        return {}, 'speech.json 不可读：%r' % error
+    records = {}
+    for item in document.get('records') or document.get('assets') or []:
+        index = item.get('record_id', item.get('word_index'))
+        role = item.get('role')
+        if role is None:
+            continue
+        try:
+            records[(int(index), role)] = dict(item,
+                                               speed=item.get('speed')
+                                               or document.get('speed'))
+        except (TypeError, ValueError):
+            continue
+    return records, None
+
+
+def check_timing(manifest, report, expectations, batch=None):
     """Stage lengths and identities against the read-only word list and the media.
 
-    Two things are recomputed here, and the report says which of them ran:
+    The frame count of a teaching stage is a rule, not a preference::
 
-    ``media fits the stage``  the real duration of the prepared file, measured
-        here, must fit the frames the timeline reserved for it at the declared
-        speed.  This catches a stage that is too short for its own audio.
-    ``the stage meets the pacing floor``  the floor comes from the read-only word
-        list (English 1.0 s, the Chinese rule), so a stage longer than the floor
-        plus the gap allowance is impossible without either a wrong floor or a
-        wrong source length.  Recomputing the *exact* frame count additionally
-        needs the unscaled recording length; when the layout does not publish it,
-        that part is reported as **not run** instead of being silently skipped.
+        frames = max(ceil(max(floor, source_seconds + gap) / speed * fps),
+                     ceil(media * fps), 1)
+
+    with the floor from the read-only word list (English 1.0 s, the Chinese rule),
+    ``source_seconds`` the window the plan cut and ``speed`` the tempo applied
+    once.  Where those come from depends on the layout, and the report names it:
+    ``speech.json`` (``wv-speech@1``, one record per asset), the verified chain's
+    per-asset ``complete.json``, or the earlier file-name convention.  The media
+    duration is measured here with ffprobe and a recorded ``sha256`` is rechecked
+    against the file.
+
+    A ``speech.json`` record is the run's account of what it prepared, so the
+    timeline has to agree with it - it is never the expectation.  Every
+    expectation below still comes from the word list, the project settings and the
+    constants restated at the top of this module.
+
+    Coverage is reported, not implied: ``recomputed_stages`` counts the stages
+    whose frame count was actually recomputed, ``skipped_checks`` names every
+    sub-check that could not run, and a face with skipped checks reports
+    ``complete: false`` so the run cannot end in PASS.  A layout that publishes no
+    timing source at all is a problem, not an exemption.
     """
     problems, rows, skipped = [], [], []
     fps, speed = manifest['fps'], manifest['speed']
     by_index = {word['index']: word for word in expectations}
+    records, records_error = load_speech_records(batch) if batch else ({}, None)
+    if records_error:
+        problems.append(records_error)
     recomputed = 0
     window_sources = {}
+    digest_checked = 0
     for stage in manifest['audio']:
         path = Path(stage['path'])
         row = {'word_index': stage['word_index'], 'role': stage['role']}
@@ -670,46 +742,88 @@ def check_timing(manifest, report, expectations):
         media = media_seconds(path)
         floor = ENGLISH_FLOOR if stage['role'] in ('female', 'male') \
             else chinese_floor(want['spoken_meaning'], want['word'])
-        seconds, window_speed, source = speech_window(stage, path)
+        window, window_speed, source, record = speech_window(stage, path, records)
         declared_speed = window_speed or speed
-        reserved_seconds = stage['duration_frames'] / fps
-        row.update({'media_seconds': round(media, 4), 'floor_seconds': floor,
-                    'duration_frames': stage['duration_frames'],
-                    'window_source': source})
-        if seconds is None:
+        reserved_frames = stage['duration_frames']
+        reserved_seconds = reserved_frames / fps
+        row.update({'media_seconds': round(media, 4), 'floor_seconds': round(floor, 4),
+                    'duration_frames': reserved_frames, 'window_source': source})
+        if record is not None:
+            # The record is the run's own account: what it states about this stage
+            # has to agree with the timeline and with the file on disk.
+            if record.get('text') not in (None, stage.get('text')):
+                problems.append('word %d %s: speech.json 记的是 %r，时间线写的是 %r'
+                                % (stage['word_index'], stage['role'],
+                                   record.get('text'), stage.get('text')))
+            if record.get('role') not in (None, stage['role']):
+                problems.append('word %d: speech.json 的角色是 %r，时间线是 %r'
+                                % (stage['word_index'], record.get('role'),
+                                   stage['role']))
+            rendered = record.get('rendered_seconds')
+            if rendered is not None and \
+                    abs(float(rendered) - media) > MEDIA_TOLERANCE_FRAMES / fps:
+                problems.append('word %d %s: speech.json 说成品语音是 %.4fs，文件是 %.4fs'
+                                % (stage['word_index'], stage['role'],
+                                   float(rendered), media))
+            digest = record.get('sha256')
+            if digest:
+                digest_checked += 1
+                if sha256(path) != digest:
+                    problems.append('word %d %s: 语音文件与 speech.json 的 sha256 不符'
+                                    % (stage['word_index'], stage['role']))
+            for field, wanted in (('start_frame', stage.get('start_frame')),
+                                  ('end_frame', stage.get('start_frame', 0)
+                                   + reserved_frames)):
+                if record.get(field) is not None and int(record[field]) != int(wanted):
+                    problems.append('word %d %s: speech.json 的 %s=%s，时间线推出的是 %s'
+                                    % (stage['word_index'], stage['role'], field,
+                                       record[field], wanted))
+            stage_seconds = record.get('stage_seconds')
+            if stage_seconds is not None and \
+                    abs(float(stage_seconds) - reserved_seconds) > \
+                    MEDIA_TOLERANCE_FRAMES / fps:
+                problems.append('word %d %s: speech.json 的阶段时长 %.4fs，时间线是 %.4fs'
+                                % (stage['word_index'], stage['role'],
+                                   float(stage_seconds), reserved_seconds))
+        if window is None:
             skipped.append('word %d %s: 阶段帧数无法复算（%s）'
                            % (stage['word_index'], stage['role'], source))
             row['source_seconds'] = None
             row['expected_frames'] = None
         else:
             window_sources[source] = window_sources.get(source, 0) + 1
-            row['source_seconds'] = round(seconds, 4)
+            row['source_seconds'] = round(window, 4)
             row['speed'] = declared_speed
-            expected = max(math.ceil(max(floor, seconds + GAP_S) / declared_speed * fps),
+            expected = max(math.ceil(max(floor, window + GAP_S) / declared_speed * fps),
                            math.ceil(media * fps), 1)
             row['expected_frames'] = expected
             recomputed += 1
-            if abs(expected - stage['duration_frames']) > SPEED_TOLERANCE_FRAMES:
+            if abs(expected - reserved_frames) > SPEED_TOLERANCE_FRAMES:
                 problems.append(
                     'word %d %s: the timeline reserves %d frames (%.3fs) but the rule '
                     'gives %d frames from window %.4fs at %.4fx (floor %.3fs, gap '
                     '%.2fs, media %.4fs)'
-                    % (stage['word_index'], stage['role'], stage['duration_frames'],
-                       reserved_seconds, expected, seconds, declared_speed, floor,
+                    % (stage['word_index'], stage['role'], reserved_frames,
+                       reserved_seconds, expected, window, declared_speed, floor,
                        GAP_S, media))
         rows.append(row)
-    # What could not be recomputed, named.  The two layouts differ in exactly one
-    # way: the verified chain publishes the *unscaled* recording length (``raw``),
-    # the new exporter publishes the source window after the plan cut it, so there
-    # the recording a window came from is the one fact left unchecked.
+    # What could not be recomputed, named.  A per-asset record (or speech.json)
+    # states the unscaled recording length; the earlier naming convention states
+    # only the window the plan cut, so there the recording a window came from is the
+    # one fact left unchecked.
     if any(source.startswith('文件名') for source in window_sources):
         skipped.append('该布局只发布“计划裁出的窗口”：无法交叉核对它与真实未加工录音一致'
-                       '（旧链的 per-asset 记录里有 raw 秒数，新导出器没有）')
+                       '（speech.json / per-asset 记录里有 raw 秒数）')
+    if not window_sources:
+        problems.append('没有任何可用的计时记录（speech.json / per-asset 记录 / 文件名'
+                        '窗口都没有）：阶段帧数一条也没有复算')
     report['timing'] = {'stages': len(rows),
                         'recomputed_stages': recomputed,
                         'window_sources': window_sources,
+                        'digests_checked': digest_checked,
+                        'speech_json': bool(records),
                         'skipped_checks': skipped,
-                        'complete': not skipped,
+                        'complete': not skipped and bool(window_sources),
                         'frame_tolerance': SPEED_TOLERANCE_FRAMES,
                         'pacing_constants': {'english_floor': ENGLISH_FLOOR,
                                              'chinese_floor': CHINESE_FLOOR,
@@ -1046,7 +1160,8 @@ def main(argv=None):
                 problems = function(batch, manifest, report, expected_words, args.cleaning)
             elif name in ('draft', 'timing'):
                 problems = function(batch, manifest, report, expected_words) \
-                    if name != 'timing' else function(manifest, report, expected_words)
+                    if name != 'timing' \
+                    else function(manifest, report, expected_words, batch)
             elif name == 'pixels':
                 problems = function(batch, manifest, report, expected_words, args.pixels)
             else:
