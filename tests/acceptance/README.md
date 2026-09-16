@@ -14,30 +14,42 @@ cd D:\1\1-AI_workflow\word_video_flow\worktrees\QA
 & D:\1\1-AI_workflow\word_video_flow\runtime\venv\Scripts\python.exe -m pytest -m acceptance_media tests
 ```
 
-它包含三件事，**全部写稳定证据**（不是 pytest tmp——tmp 会被 pytest 收尾删掉，证据被删就等于没有）：
+它包含七件事，**全部写稳定证据**（不是 pytest tmp——tmp 会被 pytest 收尾删掉，证据被删就等于没有）：
 
-| 步骤 | 测试 | 内容 | 实测耗时 |
+| 步骤 | 测试 | 内容 | 实测耗时（单独跑） |
 |---|---|---|---|
 | 媒体矩阵 | `tests/test_acceptance_fault_matrix.py`（18 项） | 好样本必须 PASS + 14 类坏批次/坏归档必须 FAIL 且命中指定的面 | 约 13 分钟 |
 | 归档复现 | `tests/test_gate_reproduction.py`（1 项） | 用归档自己的 timeline 造请求（`provider.kind=local` 指未加工音频）重跑 50 词，与归档逐字段 / 五轨 SRT 逐字节 / 172 文件 sha256 对照 | 首次约 100 s；源码未变则复用 |
-| 策略判定 | `tests/test_gate_policy.py`（1 项） | 同一输入出 v2 与 legacy 两批，分别用 `--cleaning v2 --spoken-file 我的表` 与 `--cleaning legacy` 判 PASS，并逐字段说明两批只差朗读文本 | 首次约 3 分钟；源码未变则复用 |
+| 策略判定 | `tests/test_gate_policy.py`（1 项） | 同一输入出 v2 与 legacy 两批，分别用 `--cleaning v2 --spoken-file 我的表` 与 `--cleaning legacy` 判 PASS，并逐字段说明两批只差朗读文本 | 首次约 6 分钟；源码未变则复用 |
+| 采样数独立复算 | `tests/test_acceptance_audio_samples.py`（1 项） | 解码 AAC 后数样本，验证引擎的 `audio_sample_count` 与"包数×帧长"不是同一个数 | < 1 s |
+| 多段背景 | `tests/test_acceptance_background_segments.py`（6 项） | 计划两段 / 像素证明两段都进片 / 草稿可编辑对象且源区间不越界 / 段间留洞拒绝 / 段间重叠拒绝 / 片头拆分拒绝 | 约 10 s |
+| 归档扫描（B 提供） | `tests/test_wv_import_cache.py`（2 项） | 全归档每条记录与它指向的文件一致 | 约 140 s |
+| 协调器端到端（A 提供） | `tests/test_wv_coordinator_e2e.py`（1 项） | 真实批次走协调器并发布 | 约 4 s |
+
+**门禁共 30 项。** 实测一次完整门禁：**30 passed / 墙钟 2056 s（约 34 分钟）**——但那次是
+**与 A、B、C 三个 Agent 并行**跑的（16 逻辑核，负载 71%），媒体矩阵被拖到 25 分钟。同一台机器
+空闲时媒体矩阵实测 13 分钟，所以**独占槽位时预期 19–20 分钟，拥挤时 34 分钟是上界**。
+报这个数字时请连负载一起报。默认套件不受影响（`pytest.ini` 已经是 `-m "not acceptance_media"`）。
 
 **证据路径**（固定，报告里请带这个路径）：
 
 ```
 D:\1\1-AI_workflow\word_video_flow\out\reports\
-    gate-matrix-<日期>.json              媒体矩阵汇总（15 行判定表 + 命中的面）
+    gate-matrix-<日期>.json              媒体矩阵汇总（15 行判定表 + 命中的面 + _evidence 路径）
     gate-matrix-out-<日期>\range-*.json  每个样本的完整八面报告
     reproduction-vs-archive.json         复现批次 vs 归档的字段/SRT/哈希对照
     reproduction-request.json            本次复现用的请求（证据可复现）
+    reproduction-batch.txt               本次复现批次目录（复用时指向上次的批次）
     policy-accept-v2.json / policy-accept-legacy.json
     policy-legacy-vs-archive.json         legacy 批必须仍等于归档
     policy-v2-vs-legacy.json              两批差异面（只允许朗读文本 + 05 轨）
+    gate-aac-samples.json                 采样数三种口径的复算
     stamp-*.json                          指纹：哪次运行的源码/输入与这份证据对应
 ```
 
 `out\reports` 不可写时会**响亮退化**到 `runtime\tmp\QA\gate`，并在证据里记 `warning`；
-`run_fault_matrix.py` 的 `--json` 一律给稳定路径，不要只留在 pytest tmp。
+**所有** 步骤（含媒体矩阵）的 `--json` 都写这里，不允许只留在 pytest tmp——tmp 会被 pytest
+收尾删掉，等于没有证据。
 
 ## 复用规则（为什么第二次跑很快）
 
