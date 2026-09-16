@@ -45,6 +45,7 @@ class PreviewCanvas(QtWidgets.QWidget):
         self._image = None
         self._frame_kept_alive = None
         self._presentation = None
+        self.selection = ()
         self.paints = 0
         self.frames_drawn = 0
         self.last_text_error = ''
@@ -75,6 +76,17 @@ class PreviewCanvas(QtWidgets.QWidget):
     def presentation(self):
         """The last snapshot, for a caller that wants the numbers, not the pixels."""
         return self._presentation
+
+    def set_selection(self, clip_ids):
+        """Outline the placements of the selected clips (the editor's 选中态).
+
+        The canvas is still told *what* to draw by the layout; this only adds a
+        box around the geometry the layout already returned, so selecting a clip
+        cannot move a glyph.  An empty selection draws nothing extra.
+        """
+        self.selection = tuple(clip_ids or ())
+        self.update()
+        return self.selection
 
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
@@ -129,6 +141,26 @@ class PreviewCanvas(QtWidgets.QWidget):
                                   top + line.baseline)
                 painter.fillPath(path, QtGui.QColor(placed.color))
                 painter.restore()
+            if placed.clip_id in self.selection:
+                self._draw_selection_box(painter, placed, rect)
+
+    def _draw_selection_box(self, painter, placed, rect):
+        """A dashed box around a selected placement, from the layout's own lines."""
+        if not placed.lines:
+            return
+        left = min(line.x * rect.width() - line.width * rect.width() / 2.0
+                   for line in placed.lines)
+        right = max(line.x * rect.width() + line.width * rect.width() / 2.0
+                    for line in placed.lines)
+        top = min((line.y - line.height / 2.0) * rect.height() for line in placed.lines)
+        bottom = max((line.y + line.height / 2.0) * rect.height() for line in placed.lines)
+        pen = QtGui.QPen(QtGui.QColor('#ffd166'), 1, QtCore.Qt.DashLine)
+        painter.save()
+        painter.setPen(pen)
+        painter.setBrush(QtCore.Qt.NoBrush)
+        painter.drawRect(QtCore.QRectF(left - 4, top - 3, (right - left) + 8,
+                                       (bottom - top) + 6))
+        painter.restore()
 
     def _font_for(self, placed):
         """The face the layout measured, loaded once and addressed by pixel size."""

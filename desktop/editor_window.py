@@ -1,0 +1,1009 @@
+"""The editor window: canvas, timeline, property panel, notices, delivery, export.
+
+Layout, and why
+---------------
+* the **canvas** is W04's independent :class:`~desktop.preview_canvas.PreviewCanvas`
+  over one :class:`~preview.session.PreviewSession`.  Exactly one preview session
+  exists at a time: an edit rebuilds it (close, then open) at the position the
+  member was looking at, so a committed edit costs one open (~1 s measured in W04)
+  and never a re-encode of the lesson;
+* the **timeline** is :class:`~desktop.timeline_widget.TimelineWidget`, fed the
+  solved plan - the same ranges the canvas and the exporter use;
+* the **property panel** edits the selected clip through
+  :class:`~desktop.editor_model.EditorState`, which goes to A's commands.  A field
+  the member cannot change yet (the font size of a role, say) is *shown read-only*
+  rather than faked;
+* the **notices panel** is where a refusal lands, with a button per repair.  There
+  is no dialog that only says 确定;
+* the **delivery panel** holds what is not document content: background, intro
+  clip, codec.  B's exporter takes exactly these as parameters, so the panel and
+  the delivery cannot drift apart.
+
+The window owns no edit logic.  Everything it does to the project it does by
+calling one method on the state, and every message it shows comes from
+:mod:`desktop.editor_notices`.
+"""
+from dataclasses import dataclass
+from pathlib import Path
+
+from PySide6 import QtCore, QtGui, QtWidgets
+
+from word_video.domain.errors import ProjectError
+from word_video.exporters.catalog import CatalogError
+
+from . import editor_notices as notices
+from .editor_export import blocking_notices, export_folder
+from .editor_model import MODE_ADVANCED, MODE_TEMPLATE, EditorState
+from .editor_project import ProjectFolder
+from .preview_canvas import PreviewCanvas
+from .timeline_widget import TimelineWidget
+
+__all__ = ['EditorWindow', 'ExportWorker']
+
+
+class ExportWorker(QtCore.QObject):
+    """Runs one export off the UI thread; the project is already saved."""
+
+    finished = QtCore.Signal(object)
+    progress = QtCore.Signal(object)
+
+    def __init__(self, folder, state, output=''):
+        super().__init__()
+        self.folder = folder
+        self.state = state
+        self.output = output
+
+    @QtCore.Slot()
+    def run(self):
+        try:
+            outcome = export_folder(self.folder, self.state, output=self.output,
+                                    progress=self.progress.emit, save=False)
+        except Exception as error:                      # noqa: BLE001 - reported to the UI
+            import traceback
+            from .editor_export import ExportOutcome
+            outcome = ExportOutcome(ok=False, notices=(
+                notices.Notice(code=type(error).__name__, message='导出线程异常：%s' % error,
+                               severity=notices.SEVERITY_BLOCK,
+                               detail={'traceback': traceback.format_exc()[-4000:]}),))
+        self.finished.emit(outcome)
+
+
+@dataclass
+class WindowState:
+    """What the window is currently showing; kept in one place for tests."""
+
+    folder: object = None
+    state: object = None
+    session: object = None
+    position_ticks: int = 0
+    preview_error: str = ''
+    preview_builds: int = 0
+
+
+class EditorWindow(QtWidgets.QMainWindow):
+    """The member-facing window."""
+
+    def __init__(self, folder=None, state=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('单词教学视频 — 编辑器')
+        self.showing = WindowState()
+        self._exporting = False
+        self._thread = None
+        self._worker = None
+        self._last_notices = ()
+        self.last_export = None
+        #: The last edit's outcome (command type, moved ids, notes).  Kept because
+        #: "which command did this gesture become" is the question a member's
+        #: support call - and the acceptance measurement - actually asks.
+        self.last_outcome = None
+        self._build_ui()
+        self._build_menus()
+        if folder is not None:
+            self.attach(folder, state)
+        self._timer = QtCore.QTimer(self)
+        # 20 Hz: the canvas pulls at 60 Hz for the picture, and a position label
+        # does not need to be redrawn three times per displayed frame.
+        self._timer.setInterval(50)
+        self._timer.timeout.connect(self._tick)
+
+    # ------------------------------------------------------------------ UI
+    def _build_ui(self):
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+        outer = QtWidgets.QVBoxLayout(central)
+        self.splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        outer.addWidget(self.splitter)
+
+        top = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self.splitter.addWidget(top)
+
+        picture = QtWidgets.QWidget()
+        picture_box = QtWidgets.QVBoxLayout(picture)
+        picture_box.setContentsMargins(0, 0, 0, 0)
+        self.canvas_holder = QtWidgets.QWidget()
+        self.canvas_layout = QtWidgets.QVBoxLayout(self.canvas_holder)
+        self.canvas_layout.setContentsMargins(0, 0, 0, 0)
+        self.canvas = None
+        picture_box.addWidget(self.canvas_holder, 1)
+        self.transport = QtWidgets.QHBoxLayout()
+        self.play_button = QtWidgets.QPushButton('播放')
+        self.play_button.clicked.connect(self.toggle_play)
+        self.position_label = QtWidgets.QLabel('0.000s')
+        self.state_label = QtWidgets.QLabel('未打开工程')
+        self.transport.addWidget(self.play_button)
+        self.transport.addWidget(self.position_label)
+        self.transport.addWidget(self.state_label, 1)
+        picture_box.addLayout(self.transport)
+        top.addWidget(picture)
+
+        side = QtWidgets.QTabWidget()
+        side.addTab(self._build_property_panel(), '属性')
+        side.addTab(self._build_delivery_panel(), '交付设置')
+        side.setMinimumWidth(300)
+        self.side_tabs = side
+        top.addWidget(side)
+        top.setSizes([900, 320])
+
+        bottom = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.timeline = TimelineWidget()
+        self.timeline.clipSelected.connect(self.on_clip_selected)
+        self.timeline.selectionCleared.connect(self.on_selection_cleared)
+        self.timeline.clipsMoved.connect(self.on_clips_moved)
+        self.timeline.clipTrimmed.connect(self.on_clip_trimmed)
+        self.timeline.splitRequested.connect(self.on_split_requested)
+        self.timeline.playheadMoved.connect(self.on_playhead_moved)
+        bottom.addWidget(self.timeline)
+        bottom.addWidget(self._build_notice_panel())
+        bottom.setSizes([260, 200])
+        self.splitter.addWidget(bottom)
+        self.splitter.setSizes([420, 420])
+
+        self.status = self.statusBar()
+        self.status.showMessage('就绪')
+
+    def _build_property_panel(self):
+        panel = QtWidgets.QWidget()
+        form = QtWidgets.QFormLayout(panel)
+        self.property_labels = {}
+        for key, title in (('clip', '片段'), ('role', '角色'), ('word', '词'),
+                           ('range', '时间'), ('duration', '时长'),
+                           ('text', '文本'), ('source', '媒体'),
+                           ('style', '字体/字号（只读）')):
+            label = QtWidgets.QLabel('—')
+            label.setWordWrap(True)
+            label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+            self.property_labels[key] = label
+            form.addRow(title, label)
+        self.start_edit = QtWidgets.QDoubleSpinBox()
+        self.start_edit.setDecimals(3)
+        self.start_edit.setRange(0.0, 100000.0)
+        self.start_edit.setSuffix(' s')
+        self.end_edit = QtWidgets.QDoubleSpinBox()
+        self.end_edit.setDecimals(3)
+        self.end_edit.setRange(0.001, 100000.0)
+        self.end_edit.setSuffix(' s')
+        form.addRow('起始', self.start_edit)
+        form.addRow('结束', self.end_edit)
+        self.apply_button = QtWidgets.QPushButton('应用时间（经 A 的命令）')
+        self.apply_button.clicked.connect(self.on_apply_time)
+        form.addRow(self.apply_button)
+        self.speed_edit = QtWidgets.QDoubleSpinBox()
+        self.speed_edit.setDecimals(3)
+        self.speed_edit.setRange(0.5, 2.0)
+        self.speed_edit.setSingleStep(0.05)
+        self.speed_edit.setValue(1.0)
+        self.speed_button = QtWidgets.QPushButton('应用速度（只作用于本片段）')
+        self.speed_button.clicked.connect(self.on_apply_speed)
+        form.addRow('速度', self.speed_edit)
+        form.addRow(self.speed_button)
+        # The font size IS editable now (A's SetStyle); it was read-only while the
+        # project had no style layer, and the label says where it applies so a
+        # member does not read it as this clip's private property.
+        self.size_edit = QtWidgets.QDoubleSpinBox()
+        self.size_edit.setDecimals(1)
+        self.size_edit.setRange(1.0, 2000.0)
+        self.size_edit.setSingleStep(10.0)
+        self.size_button = QtWidgets.QPushButton('应用字号（该角色的全部片段）')
+        self.size_button.clicked.connect(self.on_apply_size)
+        self.size_reset = QtWidgets.QPushButton('恢复默认字号/样式')
+        self.size_reset.clicked.connect(self.on_clear_style)
+        form.addRow('字号', self.size_edit)
+        form.addRow(self.size_button)
+        form.addRow(self.size_reset)
+        self.bind_button = QtWidgets.QPushButton('显式跟随…（绑定到另一片段）')
+        self.bind_button.clicked.connect(self.on_bind)
+        self.unbind_button = QtWidgets.QPushButton('解绑（改为绝对位置）')
+        self.unbind_button.clicked.connect(self.on_unbind)
+        self.restore_button = QtWidgets.QPushButton('恢复语音长度（取消截断）')
+        self.restore_button.clicked.connect(self.on_restore_length)
+        self.split_button = QtWidgets.QPushButton('在播放头处拆分')
+        self.split_button.clicked.connect(self.on_split_at_playhead)
+        for button in (self.bind_button, self.unbind_button, self.restore_button,
+                       self.split_button):
+            form.addRow(button)
+        self.mode_box = QtWidgets.QComboBox()
+        self.mode_box.addItems(['模板模式', '高级模式'])
+        self.mode_box.currentIndexChanged.connect(self.on_mode_changed)
+        form.addRow('模式', self.mode_box)
+        return panel
+
+    def _build_delivery_panel(self):
+        panel = QtWidgets.QWidget()
+        form = QtWidgets.QFormLayout(panel)
+        self.delivery_edits = {}
+        for key, title in (('background', '背景视频'), ('intro_video', '片头视频'),
+                           ('intro_audio', '片头音轨'), ('video_codec', '编码')):
+            row = QtWidgets.QWidget()
+            box = QtWidgets.QHBoxLayout(row)
+            box.setContentsMargins(0, 0, 0, 0)
+            edit = QtWidgets.QLineEdit()
+            edit.setReadOnly(key == 'video_codec')
+            box.addWidget(edit, 1)
+            if key != 'video_codec':
+                button = QtWidgets.QPushButton('选择…')
+                button.clicked.connect(lambda _=False, name=key: self.choose_delivery_file(name))
+                box.addWidget(button)
+            self.delivery_edits[key] = edit
+            form.addRow(title, row)
+        save = QtWidgets.QPushButton('保存交付设置')
+        save.clicked.connect(self.save_delivery)
+        form.addRow(save)
+        hint = QtWidgets.QLabel('背景与片头是交付参数（B 的导出器按参数渲染），'
+                                '不是工程内容；改了这里预览与成片一起变。')
+        hint.setWordWrap(True)
+        form.addRow(hint)
+        return panel
+
+    def _build_notice_panel(self):
+        panel = QtWidgets.QWidget()
+        box = QtWidgets.QVBoxLayout(panel)
+        box.setContentsMargins(4, 4, 4, 4)
+        header = QtWidgets.QHBoxLayout()
+        header.addWidget(QtWidgets.QLabel('检查与提示'))
+        self.recheck_button = QtWidgets.QPushButton('重新检查')
+        self.recheck_button.clicked.connect(self.refresh_notices)
+        header.addWidget(self.recheck_button)
+        box.addLayout(header)
+        self.notice_area = QtWidgets.QScrollArea()
+        self.notice_area.setWidgetResizable(True)
+        self.notice_host = QtWidgets.QWidget()
+        self.notice_layout = QtWidgets.QVBoxLayout(self.notice_host)
+        self.notice_layout.setAlignment(QtCore.Qt.AlignTop)
+        self.notice_area.setWidget(self.notice_host)
+        box.addWidget(self.notice_area, 1)
+        return panel
+
+    def _build_menus(self):
+        file_menu = self.menuBar().addMenu('文件')
+        self.action_open = file_menu.addAction('打开工程…', self.choose_open)
+        self.action_import = file_menu.addAction('从请求导入三词工程…', self.choose_import)
+        file_menu.addSeparator()
+        self.action_save = file_menu.addAction('保存', self.save, 'Ctrl+S')
+        self.action_export = file_menu.addAction('导出三产物', self.export, 'Ctrl+E')
+        file_menu.addSeparator()
+        file_menu.addAction('退出', self.close)
+        edit_menu = self.menuBar().addMenu('编辑')
+        self.action_undo = edit_menu.addAction('撤销', self.undo, 'Ctrl+Z')
+        self.action_redo = edit_menu.addAction('重做', self.redo, 'Ctrl+Y')
+        edit_menu.addSeparator()
+        self.action_reload = edit_menu.addAction('放弃改动并重新读取', self.reload)
+        view_menu = self.menuBar().addMenu('视图')
+        view_menu.addAction('时间线适应窗口', self.timeline.fit)
+        view_menu.addAction('重新构建预览', lambda: self.refresh(rebuild_preview=True))
+        self._update_actions()
+
+    # ------------------------------------------------------------- binding
+    def attach(self, folder, state=None):
+        """Adopt a folder and its editor state, and build the first preview."""
+        self.close_preview()
+        self.showing = WindowState(folder=folder)
+        self.showing.state = state if state is not None else EditorState(
+            folder.project, media=folder.media_table(), path=folder.project_path)
+        self.setWindowTitle('单词教学视频 — %s' % folder.path)
+        self._fill_delivery()
+        self.mode_box.setCurrentIndex(0 if self.showing.state.mode == MODE_TEMPLATE else 1)
+        self.refresh(rebuild_preview=True, keep_position=False)
+        return self.showing.state
+
+    @property
+    def state(self):
+        return self.showing.state
+
+    @property
+    def folder(self):
+        return self.showing.folder
+
+    def _require_state(self):
+        if self.state is None or self.folder is None:
+            self.status.showMessage('先打开或导入一个工程')
+            return False
+        return True
+
+    # -------------------------------------------------------------- refresh
+    def refresh(self, *, rebuild_preview=True, keep_position=True, reason=''):
+        """Re-solve, redraw the timeline, rebuild the preview, re-list the notices."""
+        if not self._require_state():
+            return
+        position = self.showing.position_ticks if keep_position else 0
+        self.state.set_media_table(self.folder.media_table())
+        self.state.set_intro(self.folder.intro_measurement())
+        plan = self.state.plan()
+        self.timeline.frame_ticks = self.state.project.frame_ticks
+        self.timeline.set_plan(plan, selection=self.state.selection,
+                               playhead=position)
+        self._update_property_panel()
+        self.refresh_notices()
+        if rebuild_preview:
+            self._rebuild_preview(position)
+        self._update_actions()
+        self._update_title()
+        if reason:
+            self.status.showMessage(reason)
+
+    def _rebuild_preview(self, position):
+        """One session at a time: close the old one, open the new revision."""
+        self.close_preview()
+        plan = self.state.plan()
+        if plan is None:
+            self.showing.preview_error = self.state.plan_error and str(self.state.plan_error) or ''
+            self.state_label.setText('时间线无法求解：%s' % self.showing.preview_error)
+            return
+        from .editor_project import with_background
+        background = self.folder.background_slice(self.state.project)
+        preview_plan = with_background(plan, self.state.project, background)
+        assets = self.folder.preview_assets(self.state.project)
+        if background is not None:
+            assets['layer:background'] = self.folder.delivery.background
+        try:
+            from desktop.audio_qt import QtAudioOutput
+            from preview.clock import NullAudioOutput
+            from preview.session import DEFAULT_CANVAS_HEIGHT, PreviewSession, canvas_size_for
+            output = (QtAudioOutput(rate=plan.sample_rate) if QtAudioOutput.available()
+                      else NullAudioOutput(rate=plan.sample_rate))
+            display = self._build_display(preview_plan, canvas_size_for(
+                preview_plan, DEFAULT_CANVAS_HEIGHT))
+            session = PreviewSession(preview_plan, assets, output=output, display=display,
+                                     temp_root=self.folder.preview_dir,
+                                     canvas_height=DEFAULT_CANVAS_HEIGHT)
+            session.open()
+        except Exception as error:                      # noqa: BLE001 - shown, not raised
+            self.showing.preview_error = '%s: %s' % (type(error).__name__, error)
+            self.state_label.setText('预览不可用：%s' % self.showing.preview_error)
+            return
+        self.showing.session = session
+        self.showing.preview_error = ''
+        self.showing.preview_builds += 1
+        self.canvas = PreviewCanvas(session)
+        self.canvas.set_selection(self.state.selection)
+        self.canvas_layout.addWidget(self.canvas)
+        if position:
+            session.seek(position)
+        self.canvas.start()
+        self._timer.start()
+        self.state_label.setText('预览已就绪 · %s · 画布 %dx%d'
+                                 % (plan.project_id, session.canvas_width,
+                                    session.canvas_height))
+
+    def close_preview(self):
+        self._timer.stop()
+        if self.canvas is not None:
+            self.canvas.stop()
+            self.canvas_layout.removeWidget(self.canvas)
+            self.canvas.deleteLater()
+            self.canvas = None
+        if self.showing.session is not None:
+            try:
+                self.showing.session.close()
+            except Exception:                           # noqa: BLE001 - teardown must finish
+                pass
+            self.showing.session = None
+
+    def _build_display(self, plan, canvas):
+        """The layout port the canvas draws through, at the *canvas*'s own size.
+
+        Two decisions are load-bearing here and both were handed to the editor by
+        the layout's owner:
+
+        * the styles come from ``merged_styles(plan.style_table())``, **not** from
+          the project's bare overrides.  ``LayoutSurface`` has a neutral fallback of
+          its own, so handing it only the overrides silently resets every role the
+          project did not touch - the trap A measured (english quietly becoming 240);
+        * the surface is built at the canvas size, not the plan size, because a
+          placement's ``size`` and ``baseline`` are pixels.  The fractions (``x``,
+          ``y``) are canvas-independent, so text lands in the same relative place at
+          720p and at 4K, which is what makes the preview and the export agree.
+        """
+        from preview.layout import LayoutSurfaceDisplay, LayoutUnavailable
+        styles = self.state.styles()
+        try:
+            from word_video.application.styles import style_fonts
+            font_paths, font_names = style_fonts(styles)
+            return LayoutSurfaceDisplay.from_plan(
+                plan, width=canvas[0], height=canvas[1], styles=styles,
+                fonts=font_names, font_paths=font_paths)
+        except LayoutUnavailable as error:
+            self.showing.preview_error = str(error)
+            return None
+
+    def _tick(self):
+        """Read the canvas's last snapshot for the label and the playhead.
+
+        The canvas pulls at 60 Hz on its own timer; this only *reads*, so the
+        preview is not asked for two snapshots per frame and the window cannot
+        make the preview drop a frame by being busy.
+        """
+        if self.showing.session is None or self.canvas is None:
+            return
+        presentation = self.canvas.presentation()
+        if presentation is None:
+            return
+        self.showing.position_ticks = presentation.position_ticks
+        self.position_label.setText('%.3fs · gen %d · %s'
+                                    % (presentation.position_seconds,
+                                       presentation.generation, presentation.state))
+        self.timeline.set_playhead(presentation.position_ticks)
+
+    def _update_title(self):
+        if self.state is None:
+            return
+        mark = '*' if self.state.dirty else ''
+        self.setWindowTitle('单词教学视频 — %s%s（rev %d）'
+                            % (self.folder.path, mark, self.state.revision))
+
+    def _update_actions(self):
+        ready = self.state is not None
+        for action in (getattr(self, 'action_save', None),
+                       getattr(self, 'action_export', None)):
+            if action is not None:
+                action.setEnabled(ready and not self._exporting)
+        if getattr(self, 'action_undo', None) is not None:
+            self.action_undo.setEnabled(bool(ready and self.state.can_undo)
+                                        and not self._exporting)
+            self.action_redo.setEnabled(bool(ready and self.state.can_redo)
+                                        and not self._exporting)
+
+    # ------------------------------------------------------------ transport
+    def toggle_play(self):
+        if self.showing.session is None:
+            self.refresh(rebuild_preview=True)
+            return
+        from preview.clock import PlaybackState
+        if self.showing.session.clock.state == PlaybackState.PLAYING:
+            self.showing.session.pause()
+            self.play_button.setText('播放')
+        else:
+            self.showing.session.play()
+            self.play_button.setText('暂停')
+
+    def on_playhead_moved(self, ticks):
+        if self.showing.session is not None:
+            self.showing.session.seek(ticks)
+        self.showing.position_ticks = int(ticks)
+        self.timeline.set_playhead(ticks)
+
+    def seek(self, ticks):
+        self.on_playhead_moved(ticks)
+
+    # --------------------------------------------------------------- edits
+    def on_clip_selected(self, clip_id, additive):
+        if not self._require_state():
+            return
+        if additive:
+            self.state.toggle(clip_id)
+        else:
+            self.state.select(clip_id)
+        self.after_edit(rebuild_preview=False)
+
+    def on_selection_cleared(self):
+        if not self._require_state():
+            return
+        self.state.clear_selection()
+        self.after_edit(rebuild_preview=False)
+
+    def on_clips_moved(self, clip_ids, delta_ticks):
+        if not self._require_state():
+            return
+        self.state.set_selection(clip_ids)
+        outcome = self.state.move_selection(delta_ticks, snap=False, clip_ids=clip_ids)
+        self.last_outcome = outcome
+        self.after_edit(reason=self._describe(outcome, '移动'))
+
+    def on_clip_trimmed(self, clip_id, edge, ticks):
+        if not self._require_state():
+            return
+        outcome = self.state.trim(clip_id, edge, ticks, snap=False)
+        self.last_outcome = outcome
+        self.after_edit(reason=self._describe(outcome, '修剪'))
+
+    def on_split_requested(self, clip_id, at_ticks):
+        if not self._require_state():
+            return
+        outcome = self.state.split_at_ticks(clip_id, at_ticks)
+        self.last_outcome = outcome
+        self.after_edit(reason=self._describe(outcome, '拆分'))
+
+    def on_apply_time(self):
+        if not self._require_state():
+            return
+        clip_id = self._selected_id()
+        if not clip_id:
+            return
+        start = self.state.ticks_from_seconds(self.start_edit.value(), snap=False)
+        end = self.state.ticks_from_seconds(self.end_edit.value(), snap=False)
+        first = self.state.trim(clip_id, 'start', start, snap=False)
+        if first.changed:
+            self.state.trim(clip_id, 'end', end, snap=False)
+        self.after_edit(reason='已按面板时间修剪')
+
+    def on_apply_speed(self):
+        clip_id = self._selected_id()
+        if not clip_id:
+            return
+        self.state.set_media(clip_id, speed=float(self.speed_edit.value()))
+        self.after_edit(reason='已应用速度（只作用一次）')
+
+    def on_restore_length(self):
+        clip_id = self._selected_id()
+        if not clip_id:
+            return
+        outcome = self.state.trim_to_source_length(clip_id)
+        self.after_edit(reason=self._describe(outcome, '恢复语音长度'))
+
+    def on_apply_size(self):
+        """Set the selected role's font size through A's ``SetStyle``."""
+        clip_id = self._selected_id()
+        if not clip_id:
+            return
+        clip = self.state.project.clip(clip_id)
+        outcome = self.state.set_style(clip.role, size=float(self.size_edit.value()))
+        self.after_edit(reason=self._describe(outcome, '字号'))
+
+    def on_clear_style(self):
+        clip_id = self._selected_id()
+        if not clip_id:
+            return
+        clip = self.state.project.clip(clip_id)
+        outcome = self.state.clear_style(clip.role)
+        self.after_edit(reason=self._describe(outcome, '恢复默认样式'))
+
+    def on_unbind(self):
+        clip_id = self._selected_id()
+        if not clip_id:
+            return
+        outcome = self.state.unbind_start(clip_id)
+        self.after_edit(reason=self._describe(outcome, '解绑'))
+
+    def on_bind(self):
+        clip_id = self._selected_id()
+        if not clip_id or not self._require_state():
+            return
+        options = [item.id for item in self.state.project.clips if item.id != clip_id]
+        if not options:
+            return
+        chosen, accepted = QtWidgets.QInputDialog.getItem(
+            self, '显式跟随', '让 %s 从哪个片段的结束端点开始？' % clip_id, options, 0, False)
+        if not accepted or not chosen:
+            return
+        outcome = self.state.bind_start(clip_id, chosen, edge='end')
+        self.after_edit(reason=self._describe(outcome, '绑定'))
+
+    def on_split_at_playhead(self):
+        clip_id = self._selected_id()
+        if not clip_id:
+            return
+        ticks = self.timeline.snap(self.showing.position_ticks, exclude=(clip_id,))
+        outcome = self.state.split_at_ticks(clip_id, ticks)
+        self.after_edit(reason=self._describe(outcome, '拆分'))
+
+    def on_mode_changed(self, index):
+        if not self._require_state():
+            return
+        before = self.state.project.to_dict()
+        mode = MODE_TEMPLATE if index == 0 else MODE_ADVANCED
+        self.state.set_mode(mode)
+        same = self.state.project.to_dict() == before
+        self.status.showMessage('模式切换为 %s；业务数据%s'
+                                % (mode, '逐字不变' if same else '被改动了（这是缺陷）'))
+
+    def undo(self):
+        if not self._require_state():
+            return
+        outcome = self.state.undo()
+        self.after_edit(rebuild_preview=outcome.changed, reason='已撤销')
+
+    def redo(self):
+        if not self._require_state():
+            return
+        outcome = self.state.redo()
+        self.after_edit(rebuild_preview=outcome.changed, reason='已重做')
+
+    def reload(self):
+        if not self._require_state():
+            return
+        try:
+            self.folder = ProjectFolder.open(self.folder.path)
+        except ProjectError as error:
+            self.state.last_notices = (notices.notice_from_error(self.state.project, error),)
+            self.refresh_notices()
+            return
+        self.attach(self.folder)
+
+    def after_edit(self, *, rebuild_preview=True, reason=''):
+        """Redraw everything after an edit, without rebuilding the preview if unneeded."""
+        self.state.set_media_table(self.folder.media_table())
+        self.state.set_intro(self.folder.intro_measurement())
+        plan = self.state.plan()
+        self.timeline.set_plan(plan, selection=self.state.selection,
+                               playhead=self.showing.position_ticks)
+        self.canvas_selection()
+        self._update_property_panel()
+        self.refresh_notices()
+        self._update_actions()
+        self._update_title()
+        if rebuild_preview:
+            self._rebuild_preview(self.showing.position_ticks)
+        if reason:
+            self.status.showMessage(reason)
+
+    def canvas_selection(self):
+        if self.canvas is not None:
+            self.canvas.set_selection(self.state.selection)
+
+    def _describe(self, outcome, verb):
+        if not outcome.changed:
+            return '%s没有改动' % verb
+        extra = '；'.join(notice.message for notice in outcome.notices)
+        return '%s完成%s' % (verb, ('：' + extra) if extra else '')
+
+    def save(self):
+        if not self._require_state():
+            return None
+        path = self.state.save()
+        self._update_title()
+        self._update_actions()
+        self.status.showMessage('已保存 %s（rev %d）' % (path, self.state.revision))
+        return path
+
+    def _selected_id(self):
+        if not self.state.selection:
+            self.status.showMessage('先在时间线上点选一个片段')
+            return ''
+        return self.state.selection[0]
+
+    # ------------------------------------------------------------- panels
+    def _update_property_panel(self):
+        if self.state is None:
+            return
+        clip_id = self.state.selection[0] if self.state.selection else ''
+        clip = self.state.project.clip(clip_id) if clip_id else None
+        labels = self.property_labels
+        if clip is None:
+            for key in ('clip', 'role', 'word', 'range', 'duration', 'text', 'source',
+                        'style'):
+                labels[key].setText('—')
+            return
+        record = self.state.project.record(clip.record_id) if clip.record_id else None
+        found = self.state.clip_range(clip.id)
+        labels['clip'].setText('%s%s' % (clip.id, '（已选中 %d 个）' % len(self.state.selection)
+                                         if len(self.state.selection) > 1 else ''))
+        labels['role'].setText(notices.role_label(clip.role))
+        labels['word'].setText('%s（%s）' % (record.word, record.id) if record else '—')
+        labels['range'].setText('%.3fs → %.3fs' % (found[0] / 720000.0, found[1] / 720000.0)
+                                if found else '未求解')
+        labels['duration'].setText('%.3fs' % ((found[1] - found[0]) / 720000.0)
+                                   if found else '—')
+        labels['text'].setText(clip.text or '—')
+        labels['source'].setText('%s · 源 %d..%d · %.3fx · %.1fdB'
+                                 % (clip.source.asset_id, clip.source.source_start,
+                                    clip.source.source_end, clip.source.speed,
+                                    clip.source.gain_db) if clip.source else '无媒体')
+        labels['style'].setText(self._style_text(clip.role))
+        if found:
+            self.start_edit.setValue(found[0] / 720000.0)
+            self.end_edit.setValue(found[1] / 720000.0)
+        if clip.source:
+            self.speed_edit.setValue(float(clip.source.speed))
+        style = self.state.styles().get(clip.role) or {}
+        if style.get('size'):
+            self.size_edit.setValue(float(style['size']))
+        self.size_edit.setEnabled(bool(style))
+        self.size_button.setEnabled(bool(style))
+        self.size_reset.setEnabled(clip.role in self.state.styles())
+        check = self.state.split_check(clip.id)
+        self.split_button.setEnabled(bool(check and check.ok))
+        self.split_button.setToolTip('' if (check is None or check.ok)
+                                     else '%s：%s' % (check.code, check.reason))
+        self.split_button.setText('在播放头处拆分' if (check is None or check.ok)
+                                  else '该片段不可拆分（%s）' % (check.code or 'N/A'))
+
+    def _style_text(self, role):
+        """The resolved style of a role, and whether it is the default or an override.
+
+        Read from the *merged* table this revision renders with, so the number here
+        is the number the canvas and the export use - and it says explicitly when the
+        project overrides it, because "why is this one different" is the question a
+        style layer raises.
+        """
+        styles = self.state.styles()
+        style = styles.get(role)
+        if not style:
+            return '该角色无字形（声音）' if role in ('female', 'male', 'chinese') \
+                else '无样式'
+        overridden = role in (self.state.plan().style_table() if self.state.plan() else {})
+        return '%s · 字号 %s（2160 高设计尺度）· %s%s' % (
+            style.get('font_name') or '?', style.get('size'),
+            'Bold' if style.get('bold') else 'Regular',
+            '（本工程已改）' if overridden else '（默认）')
+
+    def _fill_delivery(self):
+        delivery = self.folder.delivery
+        for key, edit in self.delivery_edits.items():
+            edit.setText(str(getattr(delivery, key) or ''))
+
+    def choose_delivery_file(self, name):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, '选择文件', '', '媒体 (*.mp4 *.mov *.mkv *.wav *.mp3 *.ogg)')
+        if path:
+            self.delivery_edits[name].setText(path)
+
+    def save_delivery(self):
+        if not self._require_state():
+            return
+        values = {key: edit.text().strip() for key, edit in self.delivery_edits.items()}
+        self.folder.set_delivery(**values)
+        self.status.showMessage('交付设置已保存')
+        self.refresh(rebuild_preview=True)
+
+    # ------------------------------------------------------------- notices
+    def refresh_notices(self, extra=()):
+        """Rebuild the notice list: what the member has to decide, and what to click."""
+        while self.notice_layout.count():
+            item = self.notice_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        if self.state is None:
+            return ()
+        found = list(extra)
+        found += list(self.folder.diagnostics(self.state.project))
+        found += list(self.state.document_notices())
+        seen, unique = set(), []
+        for notice in found:
+            key = (notice.code, notice.clip_id, notice.message)
+            if key not in seen:
+                seen.add(key)
+                unique.append(notice)
+        for notice in unique:
+            self.notice_layout.addWidget(self._notice_card(notice))
+        if not unique:
+            label = QtWidgets.QLabel('没有待处理的问题')
+            label.setStyleSheet('color:#8aa')
+            self.notice_layout.addWidget(label)
+        self._last_notices = tuple(unique)
+        return self._last_notices
+
+    def _notice_card(self, notice):
+        card = QtWidgets.QFrame()
+        card.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        colour = {notices.SEVERITY_BLOCK: '#5b1f22',
+                  notices.SEVERITY_WARN: '#5b4a1f',
+                  notices.SEVERITY_INFO: '#1f3a5b'}.get(notice.severity, '#333')
+        card.setStyleSheet('QFrame { background:%s; border-radius:4px; }' % colour)
+        box = QtWidgets.QVBoxLayout(card)
+        head = QtWidgets.QLabel('%s [%s]' % (notice.headline(), notice.code))
+        head.setWordWrap(True)
+        box.addWidget(head)
+        if notice.hint:
+            hint = QtWidgets.QLabel(notice.hint)
+            hint.setWordWrap(True)
+            hint.setStyleSheet('color:#dfe3ea')
+            box.addWidget(hint)
+        if notice.actions:
+            row = QtWidgets.QHBoxLayout()
+            for action in notice.actions:
+                button = QtWidgets.QPushButton(action.label)
+                button.clicked.connect(lambda _=False, item=action: self.run_action(item))
+                row.addWidget(button)
+            row.addStretch(1)
+            box.addLayout(row)
+        return card
+
+    def run_action(self, action):
+        """Perform one repair.  Every branch goes through the same edit path."""
+        if not self._require_state():
+            return
+        state = self.state
+        if action.kind == notices.ACTION_SELECT_CLIP:
+            state.select(action.clip_id)
+            self.after_edit(rebuild_preview=False, reason='已定位到 %s' % action.clip_id)
+        elif action.kind == notices.ACTION_SELECT_RECORD:
+            clips = state.project.clips_of(action.record_id)
+            if clips:
+                state.select(clips[0].id)
+                self.after_edit(rebuild_preview=False)
+        elif action.kind == notices.ACTION_UNDO:
+            self.undo()
+        elif action.kind == notices.ACTION_UNBIND:
+            state.unbind_start(action.clip_id)
+            self.after_edit(reason='已解绑 %s' % action.clip_id)
+        elif action.kind == notices.ACTION_TRIM_TO_SOURCE:
+            state.trim_to_source_length(action.clip_id)
+            self.after_edit(reason='已恢复到语音长度')
+        elif action.kind == notices.ACTION_TRIM_TO_TICKS:
+            state.trim(action.clip_id, 'end', action.ticks, snap=False)
+            self.after_edit(reason='已修剪到切口')
+        elif action.kind == notices.ACTION_DO_SPLIT:
+            outcome = state.split_at_ticks(action.clip_id, action.ticks)
+            self.after_edit(reason=self._describe(outcome, '拆分'))
+        elif action.kind == notices.ACTION_RELOAD:
+            self.reload()
+        elif action.kind == notices.ACTION_CHOOSE_ASSET:
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, '为 %s 选择配音文件' % action.asset_id, '',
+                '音频 (*.ogg *.wav *.mp3 *.m4a *.aac);;所有文件 (*)')
+            if path:
+                self.folder.set_asset_file(action.asset_id, path)
+                self.refresh(rebuild_preview=True, reason='已更换 %s 的文件' % action.asset_id)
+        elif action.kind == notices.ACTION_CHOOSE_VOICE:
+            voice = self._ask_voice(action.asset_id)
+            if voice:
+                self.folder.set_voice(action.asset_id, voice)
+                self.refresh(rebuild_preview=False, reason='已记录音色 %s' % voice)
+        elif action.kind == notices.ACTION_SHOW_FONT_FOLDER:
+            folder = str(Path(action.path).parent) if action.path else ''
+            if folder:
+                QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(folder))
+        elif action.kind == notices.ACTION_OPEN_DELIVERY:
+            self.parent_tabs().setCurrentIndex(1)
+        elif action.kind == notices.ACTION_OPEN_FOLDER:
+            if action.path:
+                QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(action.path))
+        elif action.kind == notices.ACTION_RECHECK:
+            # "重新检查" means re-measure too: the cheap file check runs on every
+            # redraw, but an ffprobe pass is what this button is for.
+            self.folder.media_table(refresh=True)
+            self.refresh(rebuild_preview=True, reason='已重新检查与测量')
+
+    def parent_tabs(self):
+        """The side panel, so a notice can bring the delivery settings forward."""
+        return self.side_tabs
+
+    def _ask_voice(self, asset_id):
+        """Pick from the voices this machine has actually used (read-only scan)."""
+        choices = []
+        try:
+            from word_video.voices import discover
+            choices = [item['speaker'] for item in discover()['voices']]
+        except Exception:                               # noqa: BLE001 - a scan may fail
+            choices = []
+        if not choices:
+            return ''
+        chosen, accepted = QtWidgets.QInputDialog.getItem(
+            self, '选择音色', '%s 的配音是哪个音色？' % asset_id, choices, 0, False)
+        return chosen if accepted else ''
+
+    # -------------------------------------------------------------- export
+    def export(self, output=''):
+        if not self._require_state():
+            return None
+        blockers = blocking_notices(self.folder, self.state.project)
+        if blockers:
+            self.refresh_notices(extra=blockers)
+            self.status.showMessage('导出被拦下：先处理第一张卡片')
+            return None
+        if self.state.dirty:
+            self.save()
+        self._exporting = True
+        self._update_actions()
+        self.status.showMessage('导出中…（不阻塞编辑，编辑不会等整段重编码）')
+        self._thread = QtCore.QThread(self)
+        self._worker = ExportWorker(self.folder, self.state, output=output)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.progress.connect(self._on_export_progress)
+        self._worker.finished.connect(self._on_export_finished)
+        self._thread.start()
+        return self._thread
+
+    def _on_export_progress(self, payload):
+        if isinstance(payload, dict):
+            stage = payload.get('stage') or ''
+            fraction = payload.get('fraction')
+            self.status.showMessage('导出中… %s %s' % (
+                stage, '' if fraction is None else '%.0f%%' % (float(fraction) * 100)))
+
+    def _on_export_finished(self, outcome):
+        self._exporting = False
+        if self._thread is not None:
+            self._thread.quit()
+            self._thread.wait(5000)
+            self._thread = None
+        self._worker = None
+        extra = list(outcome.notices)
+        if outcome.ok:
+            extra.insert(0, notices.Notice(
+                code='EXPORT_OK',
+                message='三产物已发布：%s（%.1fs）' % (outcome.run_dir, outcome.seconds),
+                severity=notices.SEVERITY_INFO,
+                hint='MP4 + 五轨 SRT + 可编辑剪映草稿',
+                actions=(notices.Action(notices.ACTION_OPEN_FOLDER, '打开输出目录',
+                                        path=outcome.run_dir),),
+                detail=outcome.to_dict()))
+            self.status.showMessage('导出完成：%s' % outcome.run_dir)
+        else:
+            self.status.showMessage('导出失败：见下方提示')
+        self.refresh_notices(extra=extra)
+        self._update_actions()
+        self.last_export = outcome
+        return outcome
+
+    def last_notice_texts(self):
+        return tuple(notice.headline() for notice in getattr(self, '_last_notices', ()))
+
+    # ------------------------------------------------------------- dialogs
+    def choose_open(self):
+        path = QtWidgets.QFileDialog.getExistingDirectory(self, '打开工程目录')
+        if not path:
+            return None
+        return self.open_folder(path)
+
+    def open_folder(self, path):
+        try:
+            folder = ProjectFolder.open(path)
+        except (ProjectError, ValueError) as error:
+            notice = notices.stale_document_notice(str(error), path=str(path))
+            self.refresh_notices(extra=(notice,))
+            self.status.showMessage('打不开 %s：%s' % (path, error))
+            return None
+        self.attach(folder)
+        self.status.showMessage('已打开 %s（rev %d）' % (folder.path, folder.project.revision))
+        return folder
+
+    def choose_import(self):
+        request, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, '选择请求 JSON（词表 + 已有配音）', '', '请求 (*.json)')
+        if not request:
+            return None
+        target = QtWidgets.QFileDialog.getExistingDirectory(self, '选择工程目录（将写入其中）')
+        if not target:
+            return None
+        return self.import_request(request, target)
+
+    def import_request(self, request, target):
+        from .editor_import import import_request
+        try:
+            folder = import_request(request, target)
+        except (ValueError, CatalogError, ProjectError, OSError) as error:
+            notice = notices.Notice(code=type(error).__name__,
+                                    message='导入失败：%s' % error,
+                                    severity=notices.SEVERITY_BLOCK,
+                                    hint='检查请求 JSON、词表路径与配音文件是否都在本机')
+            self.refresh_notices(extra=(notice,))
+            self.status.showMessage('导入失败：%s' % error)
+            return None
+        self.attach(folder)
+        self.status.showMessage('已导入 %d 个词到 %s'
+                                % (len(folder.project.records), folder.path))
+        return folder
+
+    # ----------------------------------------------------------- lifecycle
+    def closeEvent(self, event):
+        self.close_preview()
+        if self._thread is not None:
+            self._thread.quit()
+            self._thread.wait(5000)
+        super().closeEvent(event)
+
+    def diagnostics(self):
+        """The window's own state, for a test or a support call - not pixels."""
+        return {'folder': None if self.folder is None else str(self.folder.path),
+                'revision': None if self.state is None else self.state.revision,
+                'dirty': None if self.state is None else self.state.dirty,
+                'selection': [] if self.state is None else list(self.state.selection),
+                'mode': None if self.state is None else self.state.mode,
+                'preview_builds': self.showing.preview_builds,
+                'preview_error': self.showing.preview_error,
+                'has_session': self.showing.session is not None,
+                'timeline': self.timeline.diagnostics(),
+                'notices': [notice.code for notice in getattr(self, '_last_notices', ())],
+                'exporting': self._exporting,
+                'scale': self.devicePixelRatioF()}
