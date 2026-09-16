@@ -1,0 +1,6 @@
+# Pure generation only. Do not install or call UI controller dependencies.
+pyJianYingDraft==0.3.0
+pymediainfo==7.0.1
+python-docx==1.2.0
+lxml==6.0.2
+typing_extensions==4.15.0

@@ -1,0 +1,35 @@
+# 运行时/缓存/临时（默认都在工作根下，不进版本库）
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.sqlite3
+*.sqlite3.wv-*.lock
+*.worker.log
+audio-cache/
+word_video_work/
+worktrees/
+runtime/
+data/
+logs/
+out/
+recovery/
+*.log
+
+# 真实素材/成片/字体（无分发依据，不进 GitHub）
+*.mp4
+*.mov
+*.mkv
+*.wav
+*.mp3
+*.ogg
+*.m4a
+*.otf
+*.ttf
+*.ttc
+*.docx
+*.zip
+
+# 例外：测试用的小夹具可以进库
+!tests/fixtures/**
+!tests/fixtures/*.txt
