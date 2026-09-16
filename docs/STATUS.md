@@ -120,6 +120,8 @@
 
 | **GitHub 已绑定并完成首次推送（Tim 2026-09-16 提供 owner）** | 仓库 **`https://github.com/Tim7392/word-video-flow`（私有）**；推送前扫描：**228 文件 / 2.15 MB**，扩展名仅 `.py(187)/.md(30)/.txt(2)/.ini/.gitignore/.json`，**无媒体/字体/缓存/sqlite**，6 类敏感形态（`VOLC_TTS_API_KEY=`、`api_key`/`secret`/`token` 赋值、PEM 私钥、AKIA）**全部 0 命中**，历史新增文件里**从未出现** `.env/.pem/.key/.wav/.mp4/.otf/.docx/.zip/.sqlite3` 等可疑扩展名。未登录访问该 URL 返回 **404**（与"私有"一致）。`git push -u origin main` 成功（7.2s），**远端 `refs/heads/main` = 本地 HEAD `d11afa93…`**。提交身份保持 `H0 <h0@local>`（Tim 确认）。**规则**：只推 `main`（`task/*` 留本地）、H0 统一推送、子 Agent 不 push/不强推、每次推送前扫描 |
 
+| **P1 人工门禁：剪映草稿可编辑性 —— 人验收通过（Tim，2026-09-16）** | Tim 在对话中确认"**剪映草稿验收通过**"。**适用范围严格限定**：这一台机器 + 本机剪映 **11.4.2.14459**（product 11.4.2.f0a65bde0d6，H0 从 `%LOCALAPPDATA%\JianyingPro\Apps\` 探测得到）+ 草稿目录里本项目的那份副本。**如实记录未留证的部分**：Tim 以一句话确认通过，未逐步留证（哪几步做了、导出文件路径与时长、"看起来能改其实改了没用"的情况）；草稿副本有三份（`单词速记_生产251-300待验_20260916`、`单词速记_P1三词待验_20260916`、`单词速记_M0三词待验_20260916`），**未指定具体是哪一份**（已在对话中追问）。**跨机、跨剪映版本仍需分别复验**；"永久支持任何最新版"不作承诺 |
+
 ### 待决/风险（不阻塞当前开发）
 - **两个子 Agent 崩溃留下的未提交工作（已保全，未丢）**：① `worktrees\A`（分支 `task/A7`）留了 W08 进行中的改动（`application/packages.py`、`storage/batches.py`、`storage/delivery.py`、`tests/test_wv_batch_packages.py` 及 4 个文件的修改）——**已原样保留**，并派新 Agent 在同一 worktree **复核后继续**（明确要求"不要默认上个 Agent 的代码是对的"）。② `worktrees\Ctests`（分支 `task/Ctests`）留了测试隔离/降本的改动（`tests/conftest.py` 与 3 个编辑器测试文件）——**暂缓**，因为当前已有 3 个开发位（A/B/C）在用，按"最多 3 开发 + 1 QA"不再新开；该分支保留待后续接手。
 - **顺序相关失败当前未复现**：A-7 合并后全套 **710 passed / 0 failed / 2 分 55 秒**，那条编辑器用例的偶发失败没有再出现（属负载/顺序相关）；`Ctests` 的根因工作保留，不视为已解决。
