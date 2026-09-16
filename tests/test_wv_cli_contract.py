@@ -99,6 +99,32 @@ def test_needs_input_carries_actionable_fixes(tmp_path):
     assert code == 2 and document['error']['code'] == 'NEEDS_INPUT'
 
 
+def test_stdout_is_utf8_even_where_the_console_code_page_cannot_hold_it(tmp_path):
+    """A character the code page lacks must not turn the JSON into a traceback.
+
+    The phonetic field carries IPA (``ˈæpl``), which a GBK console cannot encode:
+    writing it after a successful action would raise *after* the work was done, so
+    the caller would see a crash instead of the answer it asked for.
+    """
+    prepare(tmp_path)
+    project = tmp_path / 'projects' / 'golden' / 'project.json'
+    document = json.loads(project.read_text(encoding='utf-8'))
+    document['records'][0]['word'] = 'ˈæpl'         # U+02C8 is not in GBK
+    project.write_text(json.dumps(document, ensure_ascii=False), encoding='utf-8')
+    program = (
+        'import sys\n'
+        'sys.path.insert(0, sys.argv[1])\n'
+        'from word_video.cli.main import main\n'
+        'raise SystemExit(main(sys.argv[2:]))\n')
+    result = subprocess.run(
+        [sys.executable, '-c', program, str(Path(__file__).resolve().parents[1]),
+         '--root', str(tmp_path), 'project', 'show', '--project', 'golden'],
+        capture_output=True, cwd=str(Path(__file__).resolve().parents[1]))
+    assert result.returncode == 0, result.stderr.decode('utf-8', 'replace')
+    payload = json.loads(result.stdout.decode('utf-8'))     # bytes, not locale text
+    assert payload['result']['records'][0]['word'] == 'ˈæpl'
+
+
 # ---------------------------------------------------------------------------
 # Plan writes nothing; submit freezes; receipts are checkable
 # ---------------------------------------------------------------------------
