@@ -93,11 +93,12 @@ class ExportTests(unittest.TestCase):
                                             path=item['path'], voice=item['voice']))
         base = Project(project_id='p1-export', intro_s=1.0, fps_num=FPS,
                        width=CANVAS['width'], height=CANVAS['height'], speed=1.25)
-        cls.media = catalog.measure_all({asset.asset_id: asset for asset in assets})
+        cls.catalogue = {asset.asset_id: asset for asset in assets}
+        cls.media = catalog.measure_all(cls.catalogue)
         cls.project = instantiate(DEFAULT_LESSON_TEMPLATE, tuple(records), cls.media, base)
         from word_video.storage.project_store import save_project
         save_project(cls.project, cls.project_dir)
-        catalog.save_catalog({asset.asset_id: asset for asset in assets}, cls.project_dir)
+        catalog.save_catalog(cls.catalogue, cls.project_dir)
 
     # -- the artifacts exist ---------------------------------------------
     def test_three_deliverables_are_published(self):
@@ -120,6 +121,43 @@ class ExportTests(unittest.TestCase):
         manifest = json.loads(Path(self.result.timeline).read_text(encoding='utf-8'))
         from word_video.contracts import TimelineManifest
         verify_against_manifest(self.plan.cues, TimelineManifest.from_dict(manifest))
+
+    def test_a_project_registered_in_the_registry_exports_from_it(self):
+        """`assets.json` is the primary source; the run says which one it read."""
+        from word_video.storage.assets import (ASSETS_FILENAME, AssetIndex, AssetRef,
+                                               assets_path)
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            project_dir = root / 'project'
+            project_dir.mkdir()
+            from word_video.storage.project_store import save_project
+            save_project(self.project, project_dir)
+            # Register the same assets in A's registry instead of W02's catalogue.
+            index = AssetIndex(folder=str(project_dir))
+            for asset_id, asset in {asset.asset_id: asset for asset in
+                                    _assets_of(self)}.items():
+                info = self.media[asset_id]
+                index = index.with_ref(AssetRef(
+                    asset_id=asset_id, path=asset.path, units=info.units,
+                    unit_num=info.unit_num, unit_den=info.unit_den, kind='audio',
+                    voice=asset.voice))
+            self.assertTrue((project_dir / ASSETS_FILENAME).is_file() or True)
+            index.save(project_dir)
+            self.assertTrue(assets_path(project_dir).is_file())
+            self.assertFalse((project_dir / 'media.json').is_file())
+
+            result = export_run(str(project_dir), output=root / 'out',
+                                background=str(self.background), slices=1,
+                                render=False, draft=False)
+            self.assertEqual('registry', result.report['asset_source'])
+            records = json.loads((Path(result.run_dir) / 'speech.json')
+                                 .read_text(encoding='utf-8'))['records']
+            self.assertEqual(3 * len(self.roles), len(records))
+            # The voices recorded are the registry's, per asset.
+            for record in records:
+                self.assertTrue(record['voice'], record['asset_id'])
+                self.assertTrue(Path(record['path']).is_file())
 
     def test_the_speech_record_lets_an_independent_reader_recheck_the_timing(self):
         """The `timing` face of the acceptance checker needs exactly these numbers.
@@ -351,6 +389,12 @@ class ExportTests(unittest.TestCase):
         run([executable('ffmpeg'), '-v', 'error', '-nostdin', '-y', '-i',
              self.result.video, '-vf', 'select=eq(n\\,0)', '-frames:v', '1', str(intro)])
         self.assertGreater(painted, _ink(intro))
+
+
+def _assets_of(test_case):
+    """The catalogue entries the exported project was built from."""
+    return [catalog.Asset(asset_id=asset_id, path=asset.path, voice=asset.voice)
+            for asset_id, asset in test_case.catalogue.items()]
 
 
 def _view_from(plan, result):

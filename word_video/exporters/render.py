@@ -142,10 +142,11 @@ def _asset_source(base):
     """Where this project's assets come from: the registry, else the catalogue.
 
     One document is the goal, and it is A's ``assets.json`` (``wv-assets@1``): the
-    editor registers an asset once and both the solver and this exporter read it.
-    ``media.json`` (W02's catalogue) stays supported so a project built before the
-    registry existed keeps exporting; when both are present the registry wins, and
-    which one was read is reported rather than left to guesswork.
+    editor registers an asset once, and the solver, the renderer and this exporter
+    all read that one file.  ``media.json`` (W02's catalogue) is still accepted for
+    a project written before the registry existed - the manifest is measured from
+    the files either way - and which document was read is reported in the run, so a
+    reader never has to guess where the assets came from.
     """
     from ..storage.assets import ASSETS_FILENAME, AssetIndex
 
