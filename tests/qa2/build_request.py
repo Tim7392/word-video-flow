@@ -48,6 +48,30 @@ def styles_from(timeline):
     return {role: dict(style) for role, style in timeline.get('styles', {}).items()}
 
 
+def config(**overrides):
+    """The same knobs as the CLI, as a mapping that also answers attribute access.
+
+    Tests and tools use this instead of argparse's Namespace, so there is exactly
+    one definition of the defaults.
+    """
+    settings = {'archive': None, 'wordlist': None, 'out': None, 'output': None,
+                'key': 'qa2-replay-from-archive-r1', 'first': 151, 'last': 200,
+                'background': None, 'intro': None, 'intro_s': 1.0, 'width': 1920,
+                'height': 1080, 'fps': 60, 'speed': 1.25, 'video_codec': None,
+                'concurrency': 1, 'source_mode': False, 'policy': None,
+                'spoken_file': None}
+    settings.update(overrides)
+
+    class Config(dict):
+        def __getattr__(self, name):
+            try:
+                return self[name]
+            except KeyError:
+                raise AttributeError(name) from None
+
+    return Config(settings)
+
+
 def build_request(args):
     timeline = json.loads(Path(args.archive).read_text(encoding='utf-8')
                           if args.archive.endswith('.json')
