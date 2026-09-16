@@ -44,7 +44,7 @@ repo/
   word_video/            # 现引擎：contracts timing tts original_tts jianying_tts jobs draft
                          #           template media srt_export voices validate reference
                          #           render/{__init__,ass,mix}
-  legacy_subtitle/       # 旧字幕工厂 6 文件，逐字复制未改（C 的适配器只以子进程调用）
+  legacy_subtitle 6 文件 + legacy_tests/  # 平铺在仓库根目录（逐字复制未改，见 docs/LEGACY_SUBTITLE.md）
   word_video_cli.py      # 现 headless JSON CLI（14 个 action，stdout 单 JSON）
   word_video_package.py  # 打包入口
   tests/                 # 19 个测试文件；默认离线（conftest 阻断非回环连接）

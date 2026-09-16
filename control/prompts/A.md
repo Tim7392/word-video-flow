@@ -16,6 +16,16 @@
 同一业务规则要供 UI / CLI / 导出共同消费；接口复杂度、保存与幂等、局部复算 **不能让其他模块
 重复实现，也不能让成员多操作**。局部越快越好不等于整体最优。
 
+## 隔离事实（2026-09-16 探针实测）
+
+子 Agent 默认 cwd 是 `D:\1\1-AI_workflow`（**不是**你的 worktree），
+但用绝对路径可以正常写入自己的 worktree，无需额外授权。因此：
+
+- **只用绝对路径写文件**；禁止相对路径写入，禁止写 `D:\1\1-AI_workflow` 下的任何位置
+  （那是会话工作区，不属于本项目）。
+- 你的唯一写入根是 `D:\1\1-AI_workflow\word_video_flow\worktrees\A`；临时文件放
+  `D:\1\1-AI_workflow\word_video_flow\runtime\tmp\A`。
+
 ## 纪律
 
 - 先交消费者真正需要的**小而稳定**接口（Project/Clip/TimeExpr/MediaSlice/RenderPlan/CuePlan）

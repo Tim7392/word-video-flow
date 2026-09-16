@@ -11,6 +11,17 @@
 `tests/acceptance/`、性能测试入口、验收结果。任务：W11 + 贯穿每次集成的反例。
 **你没有生产实现的写权限**：不能为了通过而修改生产代码。
 
+## 隔离事实（2026-09-16 探针实测）
+
+子 Agent 默认 cwd 是 `D:\1\1-AI_workflow`（**不是**你的 worktree），
+但用绝对路径可以正常写入自己的 worktree，无需额外授权。因此：
+
+- **只用绝对路径写文件**；禁止相对路径写入，禁止写 `D:\1\1-AI_workflow` 下的任何位置。
+- 你的唯一写入根是 `D:\1\1-AI_workflow\word_video_flow\worktrees\QA`；临时文件放
+  `D:\1\1-AI_workflow\word_video_flow\runtime\tmp\QA`。
+- 旧归档只读：造坏样本必须复制/硬链接到自己的 tmp，且**绝不能写回原归档**
+  （M0 事故：硬链接 + 原地写 `complete.json` 写穿了原件）。
+
 ## 关键要求
 
 - 期望值来自**原词表、真实媒体和固定手算**，不能全用生产的 `solve()` 生成。

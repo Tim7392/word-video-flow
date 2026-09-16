@@ -45,7 +45,9 @@ QA 复核集成影响。重要取舍在提交或 `docs/STATUS.md` 短记"整体�
 
 迁入方式：`C:\...\PythonSRT` 的 `word_video/`、`tests/`、`word_video_cli.py`、
 `word_video_package.py`、`requirements-word-video.txt` 已**复制**到 `repo\`；
-原字幕工厂 5 个模块 + `word.py` 已复制到 `repo\legacy_subtitle\`（逐字未改）。
+原字幕工厂 5 个模块 + `word.py` 已复制到 `repo\` **根目录**（逐字未改，平铺布局；
+原因见 `docs/LEGACY_SUBTITLE.md`：旧模块用平铺 import，放进子目录会让 `word_video/jobs.py`
+直接 import 失败）。旧测试复制在 `repo\legacy_tests\`（默认不跑，状态见同文档）。
 M0 验收/工具脚本复制在 `tools\m0\`。原件一律不动。
 
 ## 环境（只由 H0 更新，子 Agent 不改共享环境）
@@ -62,8 +64,10 @@ M0 验收/工具脚本复制在 `tools\m0\`。原件一律不动。
 # 快速回归（在 repo 目录下）
 & D:\1\1-AI_workflow\word_video_flow\runtime\venv\Scripts\python.exe -m pytest -q tests
 
-# 三词烟测（真实媒体，本地缓存优先，不联网）
-& D:\1\1-AI_workflow\word_video_flow\runtime\venv\Scripts\python.exe word_video_cli.py start --request <request.json>
+# 三词烟测（真实媒体，本地缓存优先，不联网；--db 指到 work root）
+& D:\1\1-AI_workflow\word_video_flow\runtime\venv\Scripts\python.exe word_video_cli.py `
+    --db D:\1\1-AI_workflow\word_video_flow\data\jobs\p1.sqlite3 `
+    submit --request D:\1\1-AI_workflow\word_video_flow\data\fixtures\p1-有片头.json
 ```
 
 ## 角色边界（详见 `docs/DIVISION.md`）
