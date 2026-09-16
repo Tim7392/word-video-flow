@@ -1,4 +1,4 @@
-"""H0 工具：用旧归档批次的 timeline.json + 缓存音频，构造"离线复现 50 词"请求。
+﻿"""H0 工具：用旧归档批次的 timeline.json + 缓存音频，构造"离线复现 50 词"请求。
 
 目的：在迁入后的新仓库里用**完全离线**的真实媒体与已缓存真实配音，复现归档批次 0151-0200，
 从而拿到两条证据：
@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 
 
-def build(archive_batch: Path, output: Path, key: str, fixture: Path):
+def build(archive_batch: Path, output: Path, key: str, fixture: Path, wordlist: Path = None):
     timeline = json.loads((archive_batch / 'timeline.json').read_text(encoding='utf-8'))
     entries = []
     for word in timeline['words']:
@@ -78,6 +78,12 @@ def build(archive_batch: Path, output: Path, key: str, fixture: Path):
         request['lesson']['intro'] = {'video': timeline['intro_video']}
     if timeline.get('intro_audio'):
         request['lesson']['intro_audio'] = timeline['intro_audio']
+    # 编辑器导入要求请求里带 source.path（词表）+ range：它按索引重读词条。
+    # 带 entries 的请求本身是自洽的，但这里补上来源便于任何消费者复算。
+    if wordlist is not None:
+        request['source'] = {'path': str(wordlist)}
+        request['range'] = {'start': timeline['words'][0]['index'],
+                            'end': timeline['words'][-1]['index']}
     fixture.parent.mkdir(parents=True, exist_ok=True)
     fixture.write_text(json.dumps(request, ensure_ascii=False, indent=1), encoding='utf-8')
     report = {
@@ -102,9 +108,10 @@ def main():
     parser.add_argument('--output', required=True)
     parser.add_argument('--key', default='p1-replay-151-200-offline')
     parser.add_argument('--fixture', required=True)
+    parser.add_argument('--wordlist', default=None, help='词表路径（写进请求的 source.path，编辑器导入需要）')
     parser.add_argument('--report')
     args = parser.parse_args()
-    report = build(Path(args.archive_batch), Path(args.output), args.key, Path(args.fixture))
+    report = build(Path(args.archive_batch), Path(args.output), args.key, Path(args.fixture), Path(args.wordlist) if args.wordlist else None)
     text = json.dumps(report, ensure_ascii=False, indent=1)
     if args.report:
         Path(args.report).write_text(text, encoding='utf-8')
@@ -114,3 +121,4 @@ def main():
 
 if __name__ == '__main__':
     raise SystemExit(main())
+
