@@ -30,6 +30,27 @@ def intro_audio_seconds(path):
     raise ValueError('Intro sound has no usable duration: %s' % path)
 
 
+def _stage_owner(manifest, start_sample):
+    """Which stage begins at (or before) a sample, named as the member sees it.
+
+    A mix error without the word and the role sends the reader back to the
+    timeline to work out which of 150 stages failed; this answers that directly
+    and stays silent about what it cannot identify (an intro stage, which has no
+    word).
+    """
+    for item in manifest.audio:
+        frame = (item['start_frame'] * 48000 + manifest.fps // 2) // manifest.fps
+        if frame <= start_sample < frame + 48000 * 60:
+            if start_sample < _sample(manifest, item['start_frame']
+                                      + item['duration_frames']):
+                return 'word %s %s' % (item.get('word_index'), item['role'])
+    return 'the intro or a stage before the lesson body'
+
+
+def _sample(manifest, frame):
+    return frame * 48000 // manifest.fps
+
+
 def build_mix(manifest, target, cancel=None, intro_audio=None):
     target = Path(target).resolve()
     if target.exists():
@@ -86,15 +107,30 @@ def build_mix(manifest, target, cancel=None, intro_audio=None):
             for start, stop, path in events:
                 check()
                 if start < previous or stop <= start or stop > end:
-                    raise ValueError('Overlapping or out-of-range audio stage')
+                    raise ValueError(
+                        'audio stage %.3fs-%.3fs (file %s) is out of order or past the '
+                        'timeline end %.3fs; the track that starts before %.3fs is %s'
+                        % (start / 48000, stop / 48000, path, end / 48000,
+                           previous / 48000, _stage_owner(manifest, previous)))
                 zeros(start - previous)
                 with wave.open(str(path), 'rb') as source:
                     if (source.getnchannels(), source.getsampwidth(),
                             source.getframerate()) != (1, 2, 48000):
-                        raise ValueError('Prepared speech must be mono 48kHz signed16 PCM')
+                        raise ValueError(
+                            'prepared speech %s is %dch/%dbit/%dHz; the mixer needs mono '
+                            '48kHz signed 16-bit PCM (provider.kind=local prepares this)'
+                            % (path, source.getnchannels(), source.getsampwidth() * 8,
+                               source.getframerate()))
                     available = source.getnframes(); capacity = stop - start
                     if available > capacity + 1:
-                        raise ValueError('Speech longer than allocated stage')
+                        owner = _stage_owner(manifest, start)
+                        raise ValueError(
+                            '%s: speech is %.3fs but the stage holds %.3fs '
+                            '(%d vs %d samples) - %.3fs too long; file %s; if this audio '
+                            'has not been tempo-adjusted to the project speed, reuse it '
+                            'through provider.kind=local, which re-times it for you'
+                            % (owner, available / 48000, capacity / 48000, available,
+                               capacity, (available - capacity) / 48000, path))
                     remaining = min(available, capacity)
                     while remaining:
                         check()
