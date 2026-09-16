@@ -619,7 +619,7 @@ def speech_window(stage, path, records=None):
     matched.
     """
     if records:
-        record = records.get((int(stage['word_index']), stage['role']))
+        record = records.get((subject_key(stage['word_index']), stage['role']))
         if record:
             window = record.get('source_seconds')
             if window is None:
@@ -656,8 +656,22 @@ def return_speed(speed, record):
     return None
 
 
+def subject_key(value):
+    """The key a record or a timeline stage is about: ``151`` or ``w151``.
+
+    A published ``speech.json`` names its records by ``record_id`` (``w151``)
+    while the timeline's audio items carry ``word_index`` (``151``); both name the
+    same subject, so they are normalised to one key.
+    """
+    text = str(value).strip()
+    digits = text[1:] if text[:1].lower() == 'w' else text
+    if digits.lstrip('-').isdigit():
+        return int(digits)
+    return text
+
+
 def load_speech_records(batch):
-    """``{(word_index, role): record}`` from ``speech.json``, or ``{}``.
+    """``{(subject, role): record}`` from ``speech.json``, or ``{}``.
 
     The file is the run's own account of what it prepared.  It is read as the
     *actual* input of the timing face - never as the expectation, which stays the
@@ -674,14 +688,10 @@ def load_speech_records(batch):
     for item in document.get('records') or document.get('assets') or []:
         index = item.get('record_id', item.get('word_index'))
         role = item.get('role')
-        if role is None:
+        if role is None or index is None:
             continue
-        try:
-            records[(int(index), role)] = dict(item,
-                                               speed=item.get('speed')
-                                               or document.get('speed'))
-        except (TypeError, ValueError):
-            continue
+        records[(subject_key(index), role)] = dict(
+            item, speed=item.get('speed') or document.get('speed'))
     return records, None
 
 
