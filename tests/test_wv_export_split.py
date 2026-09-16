@@ -231,6 +231,78 @@ class SplitBackgroundTests(unittest.TestCase):
         self.assertGreaterEqual(joined + 0.1, expected)
         self.assertLessEqual(joined, expected + 1.0)
 
+    def _frames(self, path):
+        out = run([executable('ffprobe'), '-v', 'error', '-count_frames',
+                   '-select_streams', 'v:0', '-show_entries', 'stream=nb_read_frames',
+                   '-of', 'csv=p=0', path])
+        return int(out.decode('utf-8').strip())
+
+    def test_a_stage_that_is_not_a_whole_number_of_frames_still_exports(self):
+        """QA's counter-example: 3.55 s of stage is 106.5 frames at 30 fps.
+
+        ``round(106.5)`` is 106 in Python while the plan's half-up conversion asks for
+        107, so the piece came out a frame short of the range the draft handed to
+        剪映 - which then refused the whole draft ("读取媒体时间范围超出媒体时长")
+        before a single picture was drawn.  A half frame is the only rounding where
+        the two rules disagree, and the two-record lesson splits into exactly it:
+        5112000 ticks, 213 frames, 2556000 per piece.
+        """
+        from dataclasses import replace
+
+        from word_video.draft import export_draft
+        from word_video.exporters.plan import frame_at
+
+        project, media = self._project(record_count=2)
+        total = project.clip('layer.background').duration_ticks
+        self.assertEqual(2556000, total // 2)      # 106.5 frames at 30 fps
+        project = apply(project, SplitClip('layer.background', total // 2)).project
+        solution = solve(project, media)
+        # Speech the draft can copy and re-time; its content plays no part here.
+        speech = self.root / 'speech.wav'
+        run([executable('ffmpeg'), '-v', 'error', '-nostdin', '-n', '-f', 'lavfi',
+             '-i', 'sine=frequency=440:duration=0.2', '-ar', '48000', '-ac', '1',
+             str(speech)])
+        sources = {'%s:%s' % (record.id, role): SourceMedia(path=str(speech),
+                                                            voice='V_%s' % role)
+                   for record in project.records
+                   for role in ('female', 'male', 'chinese')}
+        sources['layer.background'] = SourceMedia(path=str(self.clip))
+        view = build_manifest(solution.render, project, sources,
+                              background=str(self.clip), styles=default_styles())
+        self.assertEqual(213, view.total_frames)   # 7.1 s
+        pieces = background_segments(solution.render, sources)
+        wanted = [frame_at(piece.end_ticks, view.fps)
+                  - frame_at(piece.start_ticks, view.fps) for piece in pieces]
+        self.assertEqual([107, 106], wanted)
+        built = []
+        for index, piece in enumerate(pieces, start=1):
+            target = self.root / ('piece-%d.mp4' % index)
+            build_background_track([piece], target, fps=view.fps,
+                                   size=(view.width, view.height))
+            # The file carries the frames the plan reserves - 107 for the half that
+            # lands on a half frame, not the 106 the nearest-even rounding gave.
+            self.assertEqual(wanted[index - 1], self._frames(target), piece.clip_id)
+            built.append(dict(piece.to_dict(), path=str(target)))
+        # And the product that refused it - the editable draft - now takes it: one
+        # segment per piece, each inside its own material, ending on the timeline.
+        draft = self.root / 'editable-draft'
+        export_draft(replace(view, background_segments=built), draft)
+        document = json.loads((draft / 'draft_content.json').read_text(encoding='utf-8'))
+        track = next(item for item in document['tracks'] if item['name'] == '背景')
+        ranges = [(segment['target_timerange']['start'],
+                   segment['target_timerange']['duration'])
+                  for segment in track['segments']]
+        self.assertEqual([(0, 3566667), (3566667, 3533333)], ranges)
+        self.assertEqual(2, len({segment['material_id'] for segment in track['segments']}))
+        self.assertEqual(7100000, ranges[-1][0] + ranges[-1][1])   # 213 frames
+        durations = {material['id']: material['duration']
+                     for material in document['materials']['videos']}
+        for segment in track['segments']:
+            span = segment['source_timerange']
+            self.assertLessEqual(span['start'] + span['duration'],
+                                 durations[segment['material_id']],
+                                 'the draft asks a piece for more than its file holds')
+
 
 class SplitIntroTests(unittest.TestCase):
     """A split intro is refused, not half-drawn.

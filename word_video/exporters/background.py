@@ -23,6 +23,9 @@ import uuid
 
 from ..domain.model import TICKS_PER_SECOND
 
+__all__ = ['BackgroundError', 'BackgroundSegment', 'background_segments',
+           'build_background_track', 'segment_frames']
+
 
 class BackgroundError(Exception):
     """The background cannot be assembled without inventing something."""
@@ -113,6 +116,23 @@ def _require_contiguous(segments):
                 % (left.clip_id, right.clip_id, right.start_ticks - left.end_ticks))
 
 
+def segment_frames(segment, fps):
+    """Frames the *consumer* will ask this segment for, on the frame grid.
+
+    Half up on both ends, exactly like the projection's ``frame_at`` and the draft's
+    tick->frame conversion.  Using ``round(stage_seconds * fps)`` instead was the
+    defect QA found: a stage of 2556000 ticks is 106.5 frames at 30 fps, so ``round``
+    gives 106 while the draft asks for 107 - and the draft then refuses the file for
+    being shorter than the range it needs ("读取媒体时间范围超出媒体时长").  The
+    builder and the consumer have to round the same way, from the same ticks.
+    """
+    from .plan import frame_at
+    frames = frame_at(segment.end_ticks, fps) - frame_at(segment.start_ticks, fps)
+    if frames <= 0:
+        raise BackgroundError('%s covers no frame at %d fps' % (segment.clip_id, fps))
+    return frames
+
+
 def build_background_track(segments, target, *, fps, size, timeout=1800):
     """Loop each segment inside its own stage and join them into one file.
 
@@ -120,6 +140,10 @@ def build_background_track(segments, target, *, fps, size, timeout=1800):
     the behaviour the verified engine gives a single background, applied piece by
     piece.  ``size`` is ``(width, height)``; every segment is scaled and cropped to
     it so the joined stream has one geometry.
+
+    Each piece is produced with **exactly** the frames the consumer will request for
+    it (:func:`segment_frames`), so the picture has no hole and no piece is shorter
+    than the range the draft hands to the editor.
     """
     from ..media import executable, run
 
@@ -134,13 +158,23 @@ def build_background_track(segments, target, *, fps, size, timeout=1800):
         for index, segment in enumerate(segments):
             piece = work / ('.bg-%d-%s.mp4' % (index, uuid.uuid4().hex[:8]))
             pieces.append(piece)
-            frames = max(1, int(round(segment.stage_seconds * fps)))
+            frames = segment_frames(segment, fps)
+            # ``-frames:v`` is the count; ``-t`` is only the stop that keeps a bad
+            # filter graph from looping for ever.  Both were set to the same length
+            # before, and ``-t`` won: with ``-ss`` (an item whose window starts
+            # *between* two frames, e.g. 29600/48000 s at 30 fps) ffmpeg's output
+            # timeline is offset by up to a frame, so the exact ``-t`` cut the last
+            # frame ``-frames:v`` had asked for: 105 frames where the plan reserved
+            # 106 (measured - the same command without ``-ss``, and with the slack
+            # below, both give 106).  Two frames of slack cost nothing and leave the
+            # count to the flag that means it.
+            seconds = (frames + 2) / float(fps)
             args = [executable('ffmpeg'), '-v', 'error', '-nostdin', '-n',
                     '-stream_loop', '-1']
             if segment.source_start:
                 args += ['-ss', '%.9f' % (segment.source_start * segment.unit_num
                                           / float(segment.unit_den))]
-            args += ['-i', segment.path, '-t', '%.9f' % segment.stage_seconds]
+            args += ['-i', segment.path, '-t', '%.9f' % seconds]
             filters = []
             if segment.speed != 1.0:
                 filters.append('setpts=PTS/%.9f' % float(segment.speed))

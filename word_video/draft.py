@@ -133,7 +133,22 @@ def export_draft(manifest, output_dir):
             for piece in pieces:
                 material = lib.materials.VideoMaterial(material_file(piece['path']))
                 start = us(frames_of(piece['start_ticks']))
-                length = us(frames_of(piece['end_ticks'])) - start
+                wanted = us(frames_of(piece['end_ticks'])) - start
+                # The piece file is built to the frame the plan asks for, so these
+                # agree; a material that disagrees by up to a frame is a rounding
+                # artifact of the container, and clamping to what is really there
+                # keeps the draft editable.  More than that is a wrong file, and
+                # silently drawing less of the background would be the defect this
+                # whole path exists to avoid - so it fails, naming the piece.
+                available = material.duration
+                tolerance = 1000000 // manifest.fps
+                if wanted > available + tolerance:
+                    raise ValueError(
+                        'background piece %s is %.3fs but the plan reserves %.3fs '
+                        '(%.3fs missing); the piece file %s does not cover its stage'
+                        % (piece.get('clip_id'), available / 1e6, wanted / 1e6,
+                           (wanted - available) / 1e6, piece['path']))
+                length = min(wanted, available)
                 script.add_segment(lib.video.VideoSegment(
                     material, lib.timer.Timerange(start, length), volume=0), refs['背景'])
         else:
