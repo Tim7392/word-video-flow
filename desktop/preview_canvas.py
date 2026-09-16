@@ -101,10 +101,26 @@ class PreviewCanvas(QtWidgets.QWidget):
                     painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
                     painter.drawImage(rect, self._image)
                     self.frames_drawn += 1
+            elif self._presentation is not None and self._presentation.preparing:
+                # A prepared-on-demand picture: the session is encoding the segment
+                # this position needs.  Saying so is the difference between "the
+                # editor is thinking" and "the editor is broken" - and a black canvas
+                # silently showing nothing is the one thing this must not do.
+                self._draw_preparing(painter, self._presentation.preparing, rect)
             if self._presentation is not None:
                 self._draw_text(painter, self._presentation.placements, rect)
         finally:
             painter.end()
+
+    def _draw_preparing(self, painter, text, rect):
+        font = QtGui.QFont()
+        font.setPixelSize(max(12, int(rect.height() / 28)))
+        painter.save()
+        painter.setFont(font)
+        painter.setPen(QtGui.QColor('#f4e2b8'))
+        painter.drawText(rect.adjusted(16, 0, -16, 0),
+                         QtCore.Qt.AlignCenter | QtCore.Qt.TextWordWrap, text)
+        painter.restore()
 
     def _image_for(self, frame):
         """Wrap the decoded buffer; keep it alive for as long as the image lives."""
@@ -192,4 +208,6 @@ class PreviewCanvas(QtWidgets.QWidget):
         return {'paints': self.paints, 'frames_drawn': self.frames_drawn,
                 'fonts_loaded': len([value for value in self._font_families.values()
                                      if value]),
+                'preparing': (None if self._presentation is None
+                              else self._presentation.preparing),
                 'last_text_error': self.last_text_error}

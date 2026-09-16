@@ -30,9 +30,9 @@ from pathlib import Path
 from word_video.media.proxy import PROXY_PRESETS, proxy_video
 from word_video.media.streams import video_stream
 
-__all__ = ['PreviewSource', 'SOURCE_WINDOW_PREROLL', 'preview_proxy_height',
-           'proxy_cache_dir', 'prune_proxies', 'resolve_preview_source',
-           'source_seconds', 'windowed_copy']
+__all__ = ['PreviewSource', 'SOURCE_WINDOW_PREROLL', 'clear_resolution_cache',
+           'preview_proxy_height', 'proxy_cache_dir', 'prune_proxies',
+           'resolve_preview_source', 'source_seconds', 'windowed_copy']
 
 #: Default disk budget for preview proxies.  2 GB holds several minutes of 720p
 #: proxy at the measured crf and is small enough to be unremarkable on D:.
@@ -115,12 +115,60 @@ def resolve_preview_source(path, height, cache_dir=None, budget=DEFAULT_PROXY_BU
     ``needed_seconds`` is how much of the picture the lesson actually plays.  When
     it is a small part of a long source, only that part is proxied; see
     :func:`windowed_copy`.
+
+    The answer is **remembered** (:data:`_RESOLVED`), because the editor rebuilds a
+    session on every committed edit and the question it asks is the same one every
+    time: measured 2026-09-16, re-answering it for the 150 speech assets of a 50-word
+    lesson cost 24 s per rebuild, all of it ffprobe on files whose answer is "not a
+    picture, use it as it is".  The key carries the file's size and modification time
+    - the same identity a proxy's own name uses - and a remembered proxy that has
+    since been pruned is re-made rather than returned.
     """
     source = Path(path).resolve(strict=True)
     if not proxy or cache_dir is None:
         # Nothing to decide, so do not spend an ffprobe finding out a height we
         # are not going to compare against anything.
         return PreviewSource(str(source), 0, False, str(source))
+    key = _resolution_key(source, height, cache_dir, budget, needed_seconds)
+    remembered = _RESOLVED.get(key)
+    if remembered is not None and Path(remembered.path).is_file():
+        return remembered
+    result = _resolve_uncached(source, height, cache_dir, needed_seconds)
+    _remember(key, result)
+    return result
+
+
+#: How the last resolution of each source went; see :func:`resolve_preview_source`.
+#: Bounded because the editor may open many projects in one session, and a preview
+#: cache that only grows is the bug this package's proxy budget exists to avoid.
+_RESOLVED = {}
+_RESOLVED_LIMIT = 512
+
+
+def _resolution_key(source, height, cache_dir, budget, needed_seconds):
+    """A file's identity plus the question asked about it."""
+    stat = source.stat()
+    return (str(source), stat.st_size, int(stat.st_mtime), int(height),
+            str(cache_dir), int(budget),
+            None if not needed_seconds else round(float(needed_seconds), 3))
+
+
+def _remember(key, result):
+    _RESOLVED[key] = result
+    while len(_RESOLVED) > _RESOLVED_LIMIT:
+        _RESOLVED.pop(next(iter(_RESOLVED)))
+
+
+def clear_resolution_cache():
+    """Forget every remembered resolution (tests, and a caller that moved its cache).
+
+    The cache is process-wide on purpose - one editor process, the same files - so a
+    test that wants to observe probing has to be able to start from nothing.
+    """
+    _RESOLVED.clear()
+
+
+def _resolve_uncached(source, height, cache_dir, needed_seconds):
     try:
         source_height = int(video_stream(source)['height'])
     except (OSError, ValueError, KeyError):

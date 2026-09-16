@@ -317,6 +317,30 @@ def test_a_missing_voice_file_fails_the_import_with_the_path_named(area):
     assert 'w2:male' in str(error.value)
 
 
+def test_an_imported_project_records_the_voice_of_every_reading_asset(area):
+    """The voice travels from the request into the registry (H0's import finding).
+
+    Without it an imported project recorded **no** voice at all, so the delivery
+    pre-check - "a reading stage made from existing audio must have its voice recorded"
+    - could never be satisfied by a project the editor itself had just created: the loop
+    H0 spent a morning in, with a repair command that led back to the same refusal.
+    """
+    import json
+
+    _, tones = assets_of(area, count=3)
+    request_path, request = write_request(area, tones=tones)
+    folder = import_request(request_path, area / 'project')
+
+    wanted = {('w%d:%s' % (item['index'], item['role'])): item['voice']
+              for item in request['provider']['items']}
+    assert len(wanted) == 9 and all(wanted.values())
+    registry = json.loads(folder.assets_path.read_text(encoding='utf-8'))
+    stored = {row['asset_id']: row.get('voice', '') for row in registry['assets']}
+    assert {key: stored.get(key, '') for key in wanted} == wanted
+    # The folder agrees, which is what the repair UI and the exporter read.
+    assert {key: folder.voices.get(key, '') for key in wanted} == wanted
+
+
 def test_the_document_is_written_before_the_rest_of_the_folder(area):
     """A folder whose catalogue is missing is still openable and repairable."""
     folder = tiny_folder(area / 'project')

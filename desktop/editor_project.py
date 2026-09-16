@@ -595,37 +595,65 @@ class ProjectFolder:
         return found
 
     # -- preview ---------------------------------------------------------
-    def preview_assets(self, project=None, *, speed=None, refresh=False):
+    def preview_assets(self, project=None, *, speed=None, refresh=False, workers=None):
         """``{asset_id: prepared wav}`` at the project's speed, cached in ``.preview``.
 
         The preview plays files at the *project's* timeline length, so it needs the
         same tempo pass the exporter applies (``export_run._prepared``).  It is done
         here, once per asset, into the project's own cache directory - not into the
         media cache B owns, and never as a second mixdown of the whole lesson.
+
+        The passes run **in parallel** (``workers`` threads, default
+        :func:`default_prepare_workers`): each is one short-lived ffmpeg, and measured
+        2026-09-16 a 50-word lesson's 150 of them cost 47 s of the member's first
+        preview.  Nothing about the result changes - one file per asset id, the same
+        name, the same tempo - only how many of them are in flight at once.  An asset
+        whose pass fails is skipped exactly as before, so a missing or unreadable file
+        still costs that one asset's sound and not the session.
         """
+        from concurrent.futures import ThreadPoolExecutor
         from word_video.media import prepare_audio
+
         project = project if project is not None else self.project
         factor = float(project.speed if speed is None else speed)
         self.preview_dir.mkdir(parents=True, exist_ok=True)
-        resolved = {}
+        wanted = {}
         for clip in project.clips:
             if clip.source is None or clip.role not in ('female', 'male', 'chinese'):
                 continue
             asset_id = clip.source.asset_id
-            if asset_id in resolved:
+            if asset_id in wanted:
                 continue
             path = self.asset_path(asset_id)
-            if not path or not Path(path).is_file():
-                continue
+            if path and Path(path).is_file():
+                wanted[asset_id] = path
+        todo = []
+        for asset_id, path in sorted(wanted.items()):
             target = self.preview_dir / ('%s_%.4fx.wav' % (_safe(asset_id), factor))
             if refresh and target.is_file():
                 target.unlink()
-            if not target.is_file():
-                try:
-                    prepare_audio(Path(path), target, factor, project.fps_num)
-                except (OSError, ValueError, RuntimeError, FileExistsError):
-                    continue
-            resolved[asset_id] = str(target)
+            todo.append((asset_id, Path(path), target))
+
+        def prepare(item):
+            asset_id, path, target = item
+            if target.is_file():
+                return asset_id
+            try:
+                prepare_audio(path, target, factor, project.fps_num)
+            except (OSError, ValueError, RuntimeError, FileExistsError):
+                return None
+            return asset_id
+
+        resolved = {}
+        workers = default_prepare_workers(len(todo)) if workers is None else int(workers)
+        if workers <= 1 or len(todo) <= 1:
+            done = [prepare(item) for item in todo]
+        else:
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='preview-audio') as pool:
+                done = list(pool.map(prepare, todo))
+        for item, asset_id in zip(todo, done):
+            if asset_id is not None:
+                resolved[asset_id] = str(item[2])
         return resolved
 
     def background_slice(self, project=None):
@@ -647,6 +675,18 @@ class ProjectFolder:
         return MediaSlice(asset_id='layer:background', source_start=0,
                           source_end=int(info.units), unit_num=int(info.unit_num),
                           unit_den=int(info.unit_den))
+
+
+def default_prepare_workers(count):
+    """How many tempo passes at once for the preview's own audio cache.
+
+    Each pass is a short-lived ffmpeg over one utterance, so the cost is process
+    startup; eight is the same ceiling the import's probing uses, and it is the member
+    who is waiting for these (measured: 150 passes cost 47 s serially and ~9 s here).
+    """
+    if count <= 1:
+        return 1
+    return max(2, min(8, count))
 
 
 def _safe(asset_id):

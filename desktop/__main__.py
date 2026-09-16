@@ -169,6 +169,11 @@ def window_facts(window, *, seconds_to_window):
                          'width': diagnostics['timeline'].get('width')},
             'preview': {'has_session': diagnostics['has_session'],
                         'open_seconds': None if session is None else session.open_seconds,
+                        'first_frame_seconds': None if session is None
+                                               else session.first_frame_seconds,
+                        'preparing': None if session is None else session.preparing,
+                        'segments': None if session is None
+                                    else (session.report().get('segments')),
                         'canvas': None if session is None else '%dx%d' % (session.canvas_width,
                                                                           session.canvas_height),
                         'error': diagnostics['preview_error']},
@@ -188,7 +193,12 @@ def run_import(window, args):
     fact = {'request': args.request, 'into': args.into, 'open': args.open_dir,
             'seconds': round(time.perf_counter() - started, 3), 'ok': folder is not None,
             'messages': list(window.last_notice_texts())}
-    if folder is not None:
+    if folder is None:
+        # A caller reading this report (a support call, an acceptance run) must not
+        # have to guess: the window's own account of the failure travels with it.
+        fact['failure'] = window.last_import or {'ok': False,
+                                                 'reason': '导入失败，窗口未给出原因'}
+    else:
         fact.update({'project_dir': str(folder.path),
                      'records': len(folder.project.records),
                      'clips': len(folder.project.clips),
