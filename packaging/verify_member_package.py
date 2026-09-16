@@ -71,17 +71,37 @@ def sha256_file(path):
 
 
 def clean_environment(scratch, system_root=r'C:\Windows'):
-    """PATH holds only System32; no Python variable, no venv, no development tools."""
+    """PATH holds only System32; no Python variable, no venv, no development tools.
+
+    ``SystemRoot``/``windir``/``SystemDrive``/``ComSpec`` are set **explicitly**
+    rather than left to inheritance.  A restricted runner (QA's, or a hardened CI
+    image) may start this script without them, and a packaged exe that cannot see
+    ``SystemRoot`` exits 1 with completely empty stderr - which looks exactly like
+    a broken package and costs an hour to tell apart.  Which names the harness
+    supplied, and which of those the parent process did not have, is reported in
+    the evidence as ``environment_provenance`` instead of being assumed.
+    """
     system32 = '%s\\System32' % system_root
     keep = ('USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'HOMEDRIVE', 'HOMEPATH', 'PROGRAMDATA',
             'PUBLIC', 'PROCESSOR_ARCHITECTURE', 'PROCESSOR_IDENTIFIER', 'NUMBER_OF_PROCESSORS')
     environment = {name: os.environ[name] for name in keep if os.environ.get(name)}
-    environment.update({
-        'SystemRoot': system_root, 'windir': system_root, 'SystemDrive': str(Path(system_root).drive),
+    supplied = {
+        'SystemRoot': system_root, 'windir': system_root,
+        'SystemDrive': str(Path(system_root).drive),
         'ComSpec': '%s\\cmd.exe' % system32, 'PATH': system32,
         'PATHEXT': '.COM;.EXE;.BAT;.CMD',
-        'TEMP': str(scratch), 'TMP': str(scratch)})
-    return environment
+        'TEMP': str(scratch), 'TMP': str(scratch)}
+    added = sorted(name for name in supplied if not os.environ.get(name))
+    environment.update(supplied)
+    #: What this harness decided, as opposed to what it merely passed through.
+    environment_provenance = {
+        'inherited': sorted(name for name in keep if name in environment),
+        'set_by_harness': sorted(supplied),
+        'added_by_harness': added,
+        'note': 'added_by_harness lists variables the parent process did not have and '
+                'the harness supplied; a container or restricted runner missing '
+                'SystemRoot/windir is what this prevents'}
+    return environment, environment_provenance
 
 
 def run_launcher(package, arguments, environment, timeout=300):
@@ -294,17 +314,24 @@ def main(argv=None):
         if stale.is_dir() and stale != scratch:
             shutil.rmtree(stale, ignore_errors=True)
     (scratch / 'temp').mkdir(parents=True)
-    environment = clean_environment(scratch / 'temp')
+    environment, provenance = clean_environment(scratch / 'temp')
     evidence = {'package': str(package), 'started': datetime.now().astimezone().strftime(
                     '%Y-%m-%d %H:%M:%S %z'), 'scratch': str(scratch),
                 'clean_environment': {name: environment[name]
-                                      for name in ('PATH', 'TEMP', 'TMP', 'SystemRoot')},
+                                      for name in ('PATH', 'TEMP', 'TMP', 'SystemRoot',
+                                                   'windir', 'ComSpec')},
+                'environment_provenance': provenance,
                 'python_variables_present': [name for name in
                                              ('PYTHONHOME', 'PYTHONPATH', 'PYTHONSTARTUP')
                                              if name in environment],
                 'package_file_count': sum(1 for item in package.rglob('*') if item.is_file()),
                 'package_bytes': sum(item.stat().st_size for item in package.rglob('*')
                                      if item.is_file())}
+    version_file = package / 'VERSION.txt'
+    evidence['built_package'] = (
+        dict(line.split('=', 1) for line in
+             version_file.read_text(encoding='utf-8').splitlines() if '=' in line)
+        if version_file.is_file() else None)
 
     print('[verify] doctor in a PATH=%s environment' % environment['PATH'], file=sys.stderr)
     doctor = run_launcher(package, ['doctor'], environment, timeout=180)

@@ -26,7 +26,7 @@ verify = load('packaging_verify', 'verify_member_package.py')
 
 
 def test_clean_environment_keeps_only_system32_on_path(tmp_path):
-    environment = verify.clean_environment(tmp_path)
+    environment, _ = verify.clean_environment(tmp_path)
     assert environment['PATH'] == 'C:\\Windows\\System32'
     assert environment['TEMP'] == str(tmp_path) == environment['TMP']
     assert not [name for name in environment if name.startswith('PYTHON')]
@@ -34,10 +34,32 @@ def test_clean_environment_keeps_only_system32_on_path(tmp_path):
         assert name not in environment
 
 
-def test_clean_environment_keeps_what_windows_needs(tmp_path):
-    environment = verify.clean_environment(tmp_path)
-    for name in ('SystemRoot', 'windir', 'ComSpec', 'PATHEXT'):
-        assert environment.get(name)
+def test_clean_environment_supplies_what_windows_needs_and_says_so(tmp_path):
+    """A restricted runner without SystemRoot makes a packaged exe exit 1 with empty
+    stderr, which is indistinguishable from a broken package.  The harness therefore
+    *supplies* these names rather than inheriting them, and reports which ones the
+    parent process was missing."""
+    environment, provenance = verify.clean_environment(tmp_path)
+    for name in ('SystemRoot', 'windir', 'SystemDrive', 'ComSpec', 'PATHEXT'):
+        assert environment.get(name), name
+    assert environment['windir'] == environment['SystemRoot'] == 'C:\\Windows'
+    assert 'SystemRoot' in provenance['set_by_harness']
+    assert 'windir' in provenance['set_by_harness']
+    # On an ordinary machine these are inherited too, so the harness adds nothing;
+    # in a stripped container it adds them.  Either way the fact is recorded.
+    assert isinstance(provenance['added_by_harness'], list)
+    assert set(provenance['added_by_harness']) <= set(provenance['set_by_harness'])
+
+
+def test_the_environment_can_be_built_without_systemroot_in_the_parent(tmp_path, monkeypatch):
+    """The regression this guards: QA's restricted run started the packaged exe with
+    no SystemRoot, and the failure looked like a corrupt package."""
+    for name in ('SystemRoot', 'windir', 'SystemDrive', 'ComSpec'):
+        monkeypatch.delenv(name, raising=False)
+    environment, provenance = verify.clean_environment(tmp_path)
+    assert environment['SystemRoot'] == 'C:\\Windows'
+    assert environment['windir'] == 'C:\\Windows'
+    assert set(provenance['added_by_harness']) >= {'SystemRoot', 'windir', 'ComSpec'}
 
 
 def test_ffprobe_is_the_copy_shipped_in_the_package():

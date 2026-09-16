@@ -15,14 +15,13 @@ thin adapter over B's ``word_video.layout.LayoutSurface`` - it calls
 B's own ``PlacedText``/``LineBox`` values, passed through unwrapped, so there is
 no second placement type to keep in step either.
 
-Where the interface stood when this was written
------------------------------------------------
-``word_video.layout`` had not been merged into ``main`` yet, so the import is
-deliberately lazy and its absence is a clear, actionable error rather than an
-ImportError at module load.  Nothing else in :mod:`preview` depends on layout
-being present, which is what let the clock, the queues and the proxy work be
-finished and measured before the layout interface froze.  The concrete interface
-this waits for is::
+Where the interface stands
+--------------------------
+``word_video.layout`` is merged and :class:`LayoutSurfaceDisplay` binds to it; the
+import is lazy so that ``preview`` can still be imported - and unit-tested - in a
+tree or a package that does not carry the layout stack, and so a missing merge
+reports itself as one clear sentence instead of an ImportError three frames down.
+The concrete interface it consumes is::
 
     LayoutSurface(plan, width=..., height=..., styles=..., fonts=...,
                   font_paths=..., dpi=...)
@@ -33,6 +32,8 @@ this waits for is::
                 lines=(LineBox,) box measured_exactly
     LineBox:    text x y width height baseline        # x/y are canvas fractions,
                                                       # y is the line's centre
+
+``preview/verify_layout_binding.py`` is what checks that geometry across canvases.
 """
 from typing import Protocol, Sequence, runtime_checkable
 

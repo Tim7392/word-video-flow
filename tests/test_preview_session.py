@@ -390,14 +390,19 @@ def test_the_preview_refuses_a_rate_the_mix_chain_cannot_serve():
             PreviewSession(replace(plan, sample_rate=44100), assets, proxy=False)
 
 
-def test_asking_for_the_real_layout_says_what_is_missing():
-    """Until B's LayoutSurface is merged the preview must fail with a sentence an
-    engineer can act on, not an ImportError from three frames down."""
-    from preview.layout import LayoutSurfaceDisplay
+def test_the_preview_does_not_depend_on_the_layout_package_being_importable():
+    """The port is a port: a display can be supplied by the caller, and the engine
+    must work without ever importing ``word_video.layout`` itself.  That is what
+    keeps ``preview`` unit-testable headlessly and the packaged headless CLI free
+    of PySide6 and of the layout stack.
+    """
     with scratch() as folder:
         assets = three_tone_assets(folder)
         plan, _ = three_word_plan(assets)
-        with pytest.raises(LayoutUnavailable) as error:
-            LayoutSurfaceDisplay.from_plan(plan, width=320, height=180)
-        assert 'word_video.layout' in str(error.value)
-        assert 'second layout' in str(error.value)
+        session, output = audio_session(plan, assets)
+        try:
+            session.open()
+            # No display at all is a legitimate configuration: text only, or none.
+            assert session.snapshot().placements == ()
+        finally:
+            session.close()

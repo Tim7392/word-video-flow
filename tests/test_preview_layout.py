@@ -137,24 +137,21 @@ def test_the_adapter_answers_by_tick_across_a_real_plan_layout():
     assert [p.clip_id for p in display.placements_at(TICKS_PER_SECOND)] == ['late']
 
 
-def test_the_real_layout_is_addressed_by_a_message_that_says_what_to_do():
-    """While B's layout is not merged, the failure must name the interface and
-    refuse to grow a second one - not raise a bare ImportError three frames down."""
-    assert not _layout_merged(), \
-        'word_video.layout is merged now; delete this test and run the real binding'
-    with scratch() as folder:
-        assets = three_tone_assets(folder)
-        plan, _ = three_word_plan(assets)
-        with pytest.raises(LayoutUnavailable) as error:
-            LayoutSurfaceDisplay.from_plan(plan, width=320, height=180)
-        message = str(error.value)
-        assert 'word_video.layout' in message
-        assert 'second layout' in message
-
-
 def _layout_merged():
     import importlib.util
     return importlib.util.find_spec('word_video.layout') is not None
+
+
+def test_the_real_layout_is_reachable_from_this_checkout():
+    """``LayoutSurface`` is merged, so the adapter must find it without help.
+
+    While W03 was still on its own branch this asserted the opposite - that the
+    failure named the missing interface.  Now the useful assertion is that the
+    binding is live here, and ``preview/verify_layout_binding.py`` checks the
+    geometry it produces.
+    """
+    assert _layout_merged(), ('word_video.layout is not in this tree; pass '
+                              '--layout-tree to preview/verify_layout_binding.py')
 
 
 @pytest.mark.skipif(not _layout_merged(),

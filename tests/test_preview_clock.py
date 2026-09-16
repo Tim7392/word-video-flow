@@ -111,11 +111,13 @@ def test_flush_throws_away_what_was_not_heard_yet():
 
 def test_null_output_paces_itself_instead_of_finishing_instantly():
     """A null sink that reported instant completion would turn a preview into a
-    batch job."""
+    batch job.  The value is wall-clock derived, so the assertion is a bound: it
+    must be nowhere near the full second it was handed, not exactly zero.
+    """
     output = NullAudioOutput(rate=48000, buffer_frames=4800)
     output.start()
     output.write(bytes(2 * 48000))
-    assert output.frames_played() == 0
+    assert output.frames_played() < 48000
     assert output.free_frames() == 0
     output.close()
 

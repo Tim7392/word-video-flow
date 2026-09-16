@@ -184,12 +184,30 @@ def tree_size(root, exclude=()):
 
 
 def git_identity(root):
+    """HEAD plus an explicit dirty *summary*, never a bare boolean.
+
+    A package whose ``VERSION.txt`` says only ``source_dirty=true`` cannot be tied
+    to a revision: a later reader knows it differs from the recorded commit but not
+    how, so the package's verification can only ever be about that one folder.  The
+    changed paths are recorded (bounded) so the difference can be reasoned about -
+    and a clean build, which is the normal case, records none.
+    """
     def run(*args):
         result = subprocess.run(['git', '-C', str(root)] + list(args), capture_output=True,
                                 text=True, encoding='utf-8', errors='replace')
         return result.stdout.strip() if result.returncode == 0 else ''
-    return {'commit': run('rev-parse', 'HEAD') or 'unknown',
-            'dirty': bool(run('status', '--porcelain'))}
+
+    status = run('status', '--porcelain').lstrip('\ufeff')
+    # Split on whitespace rather than slicing at a fixed offset: a leading BOM or a
+    # future porcelain tweak would otherwise silently eat the first character of the
+    # first path, and a truncated path in the evidence is worse than none.
+    changed = [parts[1].strip() for parts in
+               (line.split(None, 1) for line in status.splitlines() if line.strip())
+               if len(parts) > 1]
+    head = run('rev-parse', 'HEAD') or 'unknown'
+    return {'commit': head, 'branch': run('rev-parse', '--abbrev-ref', 'HEAD'),
+            'dirty': bool(changed),
+            'dirty_count': len(changed), 'dirty_files': changed[:25]}
 
 
 def locate_installed(distribution, package):
@@ -405,7 +423,12 @@ def render_version(facts, file_count, byte_count):
              'channel=%s' % CHANNEL,
              'built=%s' % facts['built'],
              'source_commit=%s' % facts['commit'],
+             'source_branch=%s' % (facts.get('branch') or 'unknown'),
              'source_dirty=%s' % str(facts['dirty']).lower(),
+             'source_dirty_count=%d' % facts.get('dirty_count', 0),
+             # Named, not just flagged: a bare "dirty" cannot be tied to a revision.
+             'source_dirty_files=%s' % (', '.join(facts.get('dirty_files') or [])
+                                        or 'none'),
              'built_with=%s' % facts['built_with'],
              'entry=%s (existing headless JSON CLI; argv and stdout contract unchanged)'
              % ENTRY_SCRIPT,
@@ -573,6 +596,10 @@ def build(args):
                        'ffprobe_sha256': sha256_file(ffmpeg_dir / 'ffprobe.exe'),
                        'mediainfo_dll_sha256': sha256_file(mediainfo)}}
     facts.update(git_identity(root))
+    if facts['dirty']:
+        note('WARNING: building from a dirty worktree; %d changed path(s) will be '
+             'named in %s: %s' % (facts['dirty_count'], VERSION_NAME,
+                                  ', '.join(facts['dirty_files'][:5])))
     write_readme(stage, root / readme_template, facts)
 
     scan = scan_package(stage,
