@@ -1,24 +1,24 @@
-"""H0 迁移/保护核对：只在真实边界算哈希，不做全库台账。
+"""H0 保护核对：只在真实边界算哈希，不做全库台账。
 
-1) 把仓库副本与 M0 冻结清单（word_video_m0/baseline/manifest-after.json）逐文件比对：
-   证明"迁入 = 复制"，没有在迁移中改字节。旧测试 4 个文件已按新布局移到 legacy_tests/。
-2) 抽查一个已交付归档批次：用其自身 complete.json 记录的 sha256 复核磁盘现状，
-   证明开发活动没有写穿受保护归档（M0 曾发生硬链接写穿事故）。
+检查两类"不许变"的东西：
+
+1. **受保护的旧字幕核心**：仓库根目录那 6 个旧文件（`subtitle_factory_*.py`、`Words_SRT.py`、
+   `word.py`）必须与 C 盘原树**逐字节相同**——迁入是复制，W10 只做外层适配，不改核心。
+   （迁移期的"引擎源码 = M0 冻结版"检查已完成使命：`word_video/**` 现在本来就该改，
+   见 docs/STATUS.md 的迁移记录，不再作为门禁。）
+2. **受保护的旧归档**：抽查批次用其自身 `complete.json` 记录的 sha256 复核磁盘现状，
+   证明开发活动没有写穿/改写历史产物（M0 曾发生硬链接写穿事故）。
 
 用法：
-  python verify_protection.py --repo <repo> --m0 <word_video_m0> --batch <归档批次目录>
+  python tools/verify_protection.py --repo <repo> --origin <C盘原树> --batch <归档批次目录> [--json out.json]
 """
 import argparse
 import hashlib
 import json
 from pathlib import Path
 
-MOVED = {
-    'tests/test_ai_interface.py': 'legacy_tests/test_ai_interface.py',
-    'tests/test_glass_assets.py': 'legacy_tests/test_glass_assets.py',
-    'tests/test_repair.py': 'legacy_tests/test_repair.py',
-    'tests/test_ui_contract.py': 'legacy_tests/test_ui_contract.py',
-}
+LEGACY = ('subtitle_factory_api.py', 'subtitle_factory_core.py', 'subtitle_factory_cli.py',
+          'subtitle_factory_ui.py', 'Words_SRT.py', 'word.py')
 
 
 def sha256(path):
@@ -29,45 +29,36 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def check_migration(repo, m0, tools=None):
-    manifest = json.loads((Path(m0) / 'baseline' / 'manifest-after.json').read_text(encoding='utf-8'))
-    same = changed = missing = 0
-    problems = []
-    for item in manifest['files']:
-        rel = MOVED.get(item['path'], item['path'])
-        if rel.startswith('word_video_work/'):          # M0 验收器 → tools/m0（仓库外）
-            target = Path(tools or (Path(repo).parent / 'tools' / 'm0')) / Path(rel).name
-        else:
-            target = Path(repo) / rel
-        if not target.exists():
-            missing += 1
-            problems.append('missing: %s' % item['path'])
+def check_legacy(repo, origin):
+    rows, problems = [], []
+    for name in LEGACY:
+        current, original = Path(repo) / name, Path(origin) / name
+        if not current.exists() or not original.exists():
+            problems.append('missing: %s (repo=%s origin=%s)'
+                            % (name, current.exists(), original.exists()))
             continue
-        data = target.read_bytes()
-        if len(data) != item['bytes'] or hashlib.sha256(data).hexdigest() != item['sha256']:
-            changed += 1
-            problems.append('differs: %s' % item['path'])
-        else:
-            same += 1
-    return {'checked': len(manifest['files']), 'identical': same, 'changed': changed,
-            'missing': missing, 'problems': problems[:20]}
+        same = current.read_bytes() == original.read_bytes()
+        rows.append({'file': name, 'identical_to_origin': same, 'bytes': current.stat().st_size})
+        if not same:
+            problems.append('changed: %s' % name)
+    legacy_tests = Path(repo) / 'legacy_tests'
+    tests = sorted(p.name for p in legacy_tests.glob('test_*.py')) if legacy_tests.exists() else []
+    return {'checked': len(rows),
+            'identical': sum(1 for row in rows if row['identical_to_origin']),
+            'rows': rows, 'legacy_tests_present': tests, 'problems': problems}
 
 
 def check_batch(batch):
     batch = Path(batch)
     complete = batch / 'complete.json'
     if not complete.exists():
-        return {'error': 'no complete.json in %s' % batch}
-    data = json.loads(complete.read_text(encoding='utf-8'))
-    entries = data.get('files') or data.get('hashes') or []
+        return {'error': 'no complete.json in %s' % batch, 'problems': ['missing complete.json']}
+    entries = json.loads(complete.read_text(encoding='utf-8')).get('files') or []
     ok = bad = missing = 0
     problems = []
     for entry in entries:
-        if isinstance(entry, dict):
-            rel = entry.get('path') or entry.get('name')
-            recorded = entry.get('sha256') or entry.get('hash')
-        else:
-            rel, recorded = entry, None
+        rel, recorded = ((entry.get('path'), entry.get('sha256'))
+                         if isinstance(entry, dict) else (entry, None))
         if not rel:
             continue
         path = Path(rel)
@@ -89,14 +80,13 @@ def check_batch(batch):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--repo', required=True)
-    parser.add_argument('--m0', required=True)
-    parser.add_argument('--tools', default=None)
+    parser.add_argument('--origin', required=True, help='受保护旧核心的原树目录')
     parser.add_argument('--batch', action='append', default=[])
     parser.add_argument('--json')
     args = parser.parse_args()
-    report = {'migration': check_migration(args.repo, args.m0, args.tools),
+    report = {'legacy_core': check_legacy(args.repo, args.origin),
               'batches': [check_batch(b) for b in args.batch]}
-    report['verdict'] = 'PASS' if (report['migration']['problems'] == []
+    report['verdict'] = 'PASS' if (not report['legacy_core']['problems']
                                    and all(b.get('problems') == [] for b in report['batches'])) else 'FAIL'
     text = json.dumps(report, ensure_ascii=False, indent=1)
     if args.json:
