@@ -68,6 +68,11 @@ class AssetRef:
     unit_num: int = 1
     unit_den: int = 48000
     kind: str = ''
+    #: The voice a speech asset already has, as the voice layer names it (a Jianying
+    #: speaker id, a legacy BV id, ...).  Recorded, never validated and never
+    #: substituted: re-deciding a voice is the voice layer's job, and "导入已有音频"
+    #: is not "获得新文字合成能力".
+    voice: str = ''
     sha256: str = ''
 
     def __post_init__(self):
@@ -85,6 +90,7 @@ class AssetRef:
         if self.kind not in KINDS:
             raise SchemaError('unknown asset kind %r' % (self.kind,), path=path,
                               hint='可用种类：%s' % '、'.join(k or '(未标注)' for k in KINDS))
+        _text(self.voice, 'asset voice', path=path)
         _text(self.sha256, 'asset sha256', path=path)
 
     @property
@@ -100,13 +106,19 @@ class AssetRef:
                          unit_num=self.unit_num, unit_den=self.unit_den)
 
     def to_dict(self):
-        return {'asset_id': self.asset_id, 'path': self.path, 'units': self.units,
-                'unit_num': self.unit_num, 'unit_den': self.unit_den,
-                'kind': self.kind, 'sha256': self.sha256}
+        document = {'asset_id': self.asset_id, 'path': self.path, 'units': self.units,
+                    'unit_num': self.unit_num, 'unit_den': self.unit_den,
+                    'kind': self.kind, 'sha256': self.sha256}
+        if self.voice:
+            # Written only when the asset has one, so a registry that never knew the
+            # field round-trips byte for byte and an older reader sees nothing new.
+            document['voice'] = self.voice
+        return document
 
     @classmethod
     def from_dict(cls, value, path='assets'):
-        keys = ('asset_id', 'path', 'units', 'unit_num', 'unit_den', 'kind', 'sha256')
+        keys = ('asset_id', 'path', 'units', 'unit_num', 'unit_den', 'kind', 'sha256',
+                'voice')
         if not isinstance(value, dict):
             raise SchemaError('asset must be an object', path=path)
         unknown = sorted(set(value) - set(keys))
@@ -120,7 +132,7 @@ class AssetRef:
         return cls(asset_id=value['asset_id'], path=value['path'],
                    units=value.get('units'), unit_num=value.get('unit_num', 1),
                    unit_den=value.get('unit_den', 48000), kind=value.get('kind', ''),
-                   sha256=value.get('sha256', ''))
+                   voice=value.get('voice', ''), sha256=value.get('sha256', ''))
 
 
 @dataclass(frozen=True)
