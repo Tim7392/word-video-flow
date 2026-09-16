@@ -792,11 +792,12 @@ class Preflight:
 
 
 def _blockers_from(document):
-    """Read the blockers of a stored preflight, tolerating the earlier shape.
+    """Read the blockers of a stored preflight.
 
-    A document written before ``wv-batch@1`` carried blockers stored the problems
-    alone (``problems``); those are read back with their own hint as the fix, so an
-    old batch still reports what stopped it instead of silently reporting "ready".
+    A document written before this field existed has no ``blockers``; it is not a
+    problem, because the batch's own problems were always stored on its *packages*
+    (``packages[].problems``) and :meth:`BatchDocument.__post_init__` rebuilds the
+    blockers from them — a stored blocked batch still reads back as blocked.
     """
     found = []
     for item in document.get('blockers') or ():
@@ -804,10 +805,6 @@ def _blockers_from(document):
             raise SchemaError('every blocker needs a problem',
                               path='batch.checks.blockers')
         found.append((_conflict(item['problem']), tuple(item.get('fixes') or ())))
-    if not found:
-        for item in document.get('problems') or ():
-            problem = _conflict(item)
-            found.append((problem, (problem.hint or problem.message,)))
     return tuple(found)
 
 

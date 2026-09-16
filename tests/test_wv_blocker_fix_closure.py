@@ -261,6 +261,37 @@ def test_the_reference_layout_keeps_the_intro_and_never_drops_it(source, monkeyp
     assert instance.intro_clip() is not None
 
 
+def test_a_stored_batch_document_written_before_the_verdict_still_reads_blocked():
+    """Reading an older ``wv-batch@1`` document must not turn blocked into ready.
+
+    The batch's own problems were always stored on its packages, so the one verdict
+    rebuilds from them: a document saved by the previous build (no ``blockers`` key at
+    all) reports the same blocker, and therefore the same refusal, as the day it was
+    planned.
+    """
+    from word_video.application.packages import BatchDocument
+
+    loaded = BatchDocument.from_dict({
+        'schema': 'wv-batch@1', 'batch_id': 'b151-153-x1-deadbeef',
+        'profile': {'background': '', 'video_codec': 'h264', 'slices': None},
+        'selection': {'first': 151, 'last': 153}, 'rule': {'per_package': 0, 'count': 0},
+        'packages': [{'package_id': 'p151-153', 'project_id': 'b1-p151-153',
+                      'record_ids': ['w151'], 'words': [], 'problems': [
+                          {'code': 'TEMPLATE_INTRO_MISMATCH', 'message': '模板没有片头图层',
+                           'object_path': 'template', 'hint': '用 template save '
+                                                             '--from-project 记录含片头的模板'}],
+                      'delivery': {'ready': True, 'background': 'b.mp4', 'problems': [],
+                                   'fixes': []}}],
+        # The previous shape: an aggregate computed over the areas alone, which is
+        # exactly what used to disagree with a submit.
+        'checks': {'ready': True, 'blocking': [], 'checks': [], 'fixes': []}})
+    assert loaded.readiness().names() == ('TEMPLATE_INTRO_MISMATCH',)
+    assert loaded.ready is False
+    assert loaded.checks.ready is False and loaded.checks.blocking == \
+        ('TEMPLATE_INTRO_MISMATCH',)
+    assert any('template save --from-project' in fix for fix in loaded.fixes())
+
+
 def test_a_pinned_template_that_would_drop_the_intro_is_refused_and_its_fix_clears_it(
         source, monkeypatch):
     """Pinning is a choice: a template that disagrees with the source is still refused.
