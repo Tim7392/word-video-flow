@@ -581,6 +581,10 @@ def main(argv=None):
     parser.add_argument('--skip-gui', action='store_true',
                         help='skip the editor smoke (launcher opens it + import/export '
                              'through the window + independent checker)')
+    parser.add_argument('--gui-platform', choices=('offscreen', 'windows'), default='offscreen',
+                        help='QT_QPA_PLATFORM for the editor smoke; offscreen (default) keeps '
+                             'the run off the machine\'s display, windows proves the real '
+                             'platform plugin loads too')
     args = parser.parse_args(argv)
     if hasattr(sys.stdout, 'reconfigure'):
         sys.stdout.reconfigure(encoding='utf-8')
@@ -717,10 +721,21 @@ def main(argv=None):
     if not args.skip_gui:
         # The GUI checks are counted one by one rather than as one aggregate: an
         # aggregate would let "the window opened" hide "the delivery was refused".
-        evidence['gui'] = gui_smoke(package, environment, scratch, root, args.timeout)
+        # QT_QPA_PLATFORM is added to the *GUI* environment only, and the editor's own
+        # report says which plugin it actually loaded - so "it ran offscreen" is a
+        # statement about the run, not about the variable this script set.
+        gui_environment = dict(environment)
+        gui_environment['QT_QPA_PLATFORM'] = args.gui_platform
+        evidence['gui_environment'] = {'QT_QPA_PLATFORM': args.gui_platform,
+                                       'PATH': environment['PATH'],
+                                       'TEMP': environment['TEMP']}
+        evidence['gui'] = gui_smoke(package, gui_environment, scratch, root, args.timeout)
         checks.update({'gui_%s' % name: bool(value)
                        for name, value in (evidence['gui'].get('checks') or {}).items()})
         checks['gui_smoke_ran'] = bool(evidence['gui'].get('checks'))
+        checks['gui_used_the_requested_platform'] = bool(
+            ((evidence['gui'].get('editor_report') or {}).get('qt') or {}).get('platform')
+            == args.gui_platform)
     evidence['checks'] = checks
     evidence['ok'] = all(checks.values())
     evidence['finished'] = datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %z')
