@@ -22,12 +22,13 @@ cd D:\1\1-AI_workflow\word_video_flow\worktrees\QA
 | 归档复现 | `tests/test_gate_reproduction.py`（1 项） | 用归档自己的 timeline 造请求（`provider.kind=local` 指未加工音频）重跑 50 词，与归档逐字段 / 五轨 SRT 逐字节 / 172 文件 sha256 对照 | 首次约 100 s；源码未变则复用 |
 | 策略判定 | `tests/test_gate_policy.py`（1 项） | 同一输入出 v2 与 legacy 两批，分别用 `--cleaning v2 --spoken-file 我的表` 与 `--cleaning legacy` 判 PASS，并逐字段说明两批只差朗读文本 | 首次约 6 分钟；源码未变则复用 |
 | 采样数独立复算 | `tests/test_acceptance_audio_samples.py`（1 项） | 解码 AAC 后数样本，验证引擎的 `audio_sample_count` 与"包数×帧长"不是同一个数 | < 1 s |
-| 多段背景 | `tests/test_acceptance_background_segments.py`（6 项） | 计划两段 / 像素证明两段都进片 / 草稿可编辑对象且源区间不越界 / 段间留洞拒绝 / 段间重叠拒绝 / 片头拆分拒绝 | 约 10 s |
+| 多段背景 | `tests/test_acceptance_background_segments.py`（6 项） | 计划两段 / 像素证明两段都进片 / 草稿可编辑对象且源区间不越界 / 段间留洞拒绝 / 段间重叠拒绝 / 片头拆分拒绝 | 约 6 s |
 | 归档扫描（B 提供） | `tests/test_wv_import_cache.py`（2 项） | 全归档每条记录与它指向的文件一致 | 约 140 s |
 | 协调器端到端（A 提供） | `tests/test_wv_coordinator_e2e.py`（1 项） | 真实批次走协调器并发布 | 约 4 s |
 | **发布目录** | `tests/test_gate_published.py`（1 项） | **两个工程**：① 带 `delivery.json` → 不传 `--background` 也 `ready=true`，且计划继承的那条与文件一致；② 无交付设置 → `ready=false` + `BACKGROUND_MISSING`、submit `NEEDS_INPUT` 且不留收据；再有背景 submit→run，在 `runs\<job>` 上判三份文档路径、无 staging、`timing.complete=true` | 约 38 s |
+| **导入闭环** | `tests/test_gate_import_voices.py`（1 项） | 没有音色的工程 → `import audio --roots <cache> --voices … --apply` 真把 voice 写进 `assets.json`、再导一次字节不变、`plan` 里那条 fix 消失且 `ready=true`、随后能 submit | 约 6 s |
 
-**门禁共 31 项。** 实测一次完整门禁（**不含**发布目录那一步）：**30 passed / 墙钟 2056 s（约 34 分钟）**，
+**门禁共 32 项**（另有一项 	est_wv_media_streams.py 由 B 新加，同属该标记）。 实测一次完整门禁（**不含**发布目录/导入闭环两步）：**30 passed / 墙钟 2056 s（约 34 分钟）**，
 但那次是**与 A、B、C 三个 Agent 并行**跑的（16 逻辑核，负载 71%），媒体矩阵被拖到 25 分钟；
 同一台机器空闲时媒体矩阵 13 分钟。所以**独占槽位预期 20–21 分钟，拥挤时 34 分钟是上界**——
 报这个数字时请连负载一起报。默认套件不受影响（`pytest.ini` 是 `-m "not acceptance_media"`）。
@@ -45,9 +46,9 @@ cd D:\1\1-AI_workflow\word_video_flow\worktrees\QA
 ### 跑门禁前必须知道的四件事（否则容易误判成门禁坏了）
 
 1. **`assets.json` 里每个语音资产必须有 `voice`。** 缺音色记录时 `batch submit` 会（正确地）
-   返回 `NEEDS_INPUT`——这是产品当前行为（A-8），不是门禁失败。发布目录那一步**直接写
-   `assets.json` 的 `voice` 字段**（文档允许的方式）；在 A-8 修好 `import audio --apply` 的写入
-   路径之前**不要**用那条命令准备可提交工程。A-8 修好后该步骤改为走导入路径再复跑一次闭环。
+   返回 `NEEDS_INPUT`。**推荐用文档路径准备它**：`import audio --roots <旧缓存根> --voices female=…,male=…,chinese=… --apply`（A-8 起真的落盘且幂等），
+   `tests/test_gate_import_voices.py` 就是这条闭环的看门测试；发布目录那一步为了不依赖导入命令，
+   仍然**直接写 `assets.json` 的 `voice` 字段**（也算文档允许的方式），报告里会注明用的是哪条路径。
 2. **`timeline.json` 允许引用运行目录之外的文件**（本次交付的背景 + 已安装字体）；
    `complete.json` 与草稿必须全部落在运行目录内。口径不同是刻意的。
 3. **判断拒绝面要看收据增量，不要看 `receipts` 是否为空**：全局收据本来就含此前成功那次的记录，
@@ -70,6 +71,7 @@ D:\1\1-AI_workflow\word_video_flow\out\reports\
     gate-aac-samples.json                 采样数三种口径的复算
     gate-published-<日期>.json            发布目录判定（继承 / 拒绝面 / 三份文档 / 运行状态）
     gate-published-accept-<日期>.json     在该发布目录上的八面判定
+    gate-import-<日期>.json               导入闭环（voice 落盘 / 幂等 / blocker 消失）
     stamp-*.json                          指纹：哪次运行的源码/输入与这份证据对应
 ```
 

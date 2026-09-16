@@ -52,6 +52,8 @@ def main(argv=None):
     parser.add_argument('--background', default=None)
     parser.add_argument('--no-delivery', dest='no_delivery', action='store_true',
                         help='不写 delivery.json：用于判"没有交付设置"时的拒绝面')
+    parser.add_argument('--link-media', dest='link_media', action='store_true',
+                        help='用硬链接并保留原文件名：给 import audio 用的形态')
     parser.add_argument('--fps', type=int, default=30)
     parser.add_argument('--width', type=int, default=320)
     parser.add_argument('--height', type=int, default=180)
@@ -106,16 +108,32 @@ def main(argv=None):
     # ``<cache>/original.volcengine_legacy.ogg``, so copying by file name would
     # collapse three different stages into one file and quietly change what the
     # timing face measures.
+    #
+    # ``--link-media`` hard-links the originals and keeps their original names
+    # instead, which is the shape ``import audio`` matches against: it compares the
+    # recordings it finds with the project's, so a link reads as "this recording,
+    # already here" and the import has something to pin a voice to.
+    link_media = getattr(args, 'link_media', False)
     for item in assets:
-        target = folder / 'media' / ('%s.ogg' % item['asset_id'].replace(':', '_'))
+        source = Path(item['path'])
+        # Name each media file after its asset: the archive stores every
+        # recording under the same base name (``original.volcengine_legacy.ogg``),
+        # so keeping the original name would hard-link three different stages onto
+        # one file and quietly change what timing measures.
+        target = folder / 'media' / ('%s%s' % (item['asset_id'].replace(':', '_'),
+                                               source.suffix))
         if not target.exists():
-            target.write_bytes(Path(item['path']).read_bytes())
+            if link_media:
+                import os
+                os.link(source, target)
+            else:
+                target.write_bytes(source.read_bytes())
         item['path'] = str(target)
         for clip in document['clips']:
-            source = clip.get('source') or {}
-            if source.get('asset_id') == item['asset_id']:
-                source['unit_num'] = item['unit_num']
-                source['unit_den'] = item['unit_den']
+            clip_source = clip.get('source') or {}
+            if clip_source.get('asset_id') == item['asset_id']:
+                clip_source['unit_num'] = item['unit_num']
+                clip_source['unit_den'] = item['unit_den']
     save_project(Project.from_dict(document), folder)
     (folder / 'assets.json').write_text(
         json.dumps({'schema': 'wv-assets@1', 'project_id': args.project,

@@ -135,13 +135,23 @@ def run(command, cwd, env=None):
 
 
 def last_json(result):
-    """The last complete JSON object a CLI call printed, or None.
+    """The JSON object a CLI call printed, or None.
 
-    ``json.loads`` on the whole tail is wrong as soon as the tail starts in the
-    middle of an object; parsing each line from the end is robust and still fails
-    loudly (returns None) when the call printed no JSON at all.
+    The CLI answers a command with exactly one JSON object, but it may print it on
+    one line or pretty-print it over many; a captured tail can also start in the
+    middle of a log line.  So: the whole text first, then the last line that starts
+    an object, then the longest ``{...}`` span.  Returning None when there is no
+    JSON at all keeps callers failing loudly instead of reading an empty payload as
+    an answer - which is how a multi-line answer used to look like no answer.
     """
-    for line in reversed(result.get('stdout_tail', '').splitlines()):
+    text = (result.get('stdout_tail') or '').strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    for line in reversed(text.splitlines()):
         line = line.strip()
         if not line.startswith('{'):
             continue
@@ -149,6 +159,12 @@ def last_json(result):
             return json.loads(line)
         except ValueError:
             continue
+    start, end = text.find('{'), text.rfind('}')
+    if start >= 0 and end > start:
+        try:
+            return json.loads(text[start:end + 1])
+        except ValueError:
+            return None
     return None
 
 
