@@ -38,9 +38,12 @@ from . import ass as ass_export
 from . import srt as srt_export
 from .background import BackgroundError, background_segments, build_background_track
 from .catalog import CatalogError, load_catalog, measure_all
-from .plan import ProjectionError, SourceMedia, build_manifest
+from .plan import ProjectionError, SourceMedia, build_manifest, frame_at
 
 RENDER_SCHEMA = 'wv-export@1'
+#: The per-asset speech record published with every run (see `write_speech_record`).
+SPEECH_SCHEMA = 'wv-speech@1'
+SPEECH_FILENAME = 'speech.json'
 
 
 class ExportError(Exception):
@@ -84,25 +87,36 @@ def _styles(project_styles=None):
 def _prepared(asset_id, asset_path, source, target_dir, rate=48000):
     """One asset's speech over its source window, at tempo exactly once.
 
-    Returns the published path.  ``source`` is the clip's
-    :class:`~word_video.domain.model.MediaSlice` and ``asset_path`` is where the
-    catalogue says that asset lives.  A slice at speed 1.0 is trimmed only; the
-    file is read back once before publication so a truncated write cannot reach
-    the renderer.
+    Returns ``(path, raw_seconds, rendered_seconds, digest)``.  The two durations
+    are the numbers an independent reader needs to re-derive the timeline: the
+    original's own length (what a stage must reserve room for) and the prepared
+    file's (what the mixer consumes) - they differ by the tempo pass, and a
+    published run has to say both rather than leave them to be re-probed.
+
+    A slice at speed 1.0 is only trimmed, and the file is read back before
+    publication so a truncated write cannot reach the renderer.
     """
+    from ..media import duration as whole_duration
     from ..media import executable, run, wav_duration
+    from ..media.core import sha256
 
     source_path = Path(asset_path)
     if not source_path.is_file():
         raise ExportError('asset %s is missing: %s' % (asset_id, source_path))
     window_seconds = float(Fraction(source.source_units * source.unit_num,
                                     source.unit_den))
+    raw_seconds = float(Fraction(source.source_end * source.unit_num, source.unit_den)) \
+        if source.source_start == 0 else None
+    if raw_seconds is None:
+        # A trimmed window: the "original" length is still the whole source's, which
+        # only the caller's asset knows - read it once, here, where the file is.
+        raw_seconds = float(whole_duration(source_path))
     target_dir = Path(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
     suffix = '_%.4fs_%.4fx.wav' % (window_seconds, float(source.speed))
     target = target_dir / (asset_id.replace(':', '_') + suffix)
     if target.exists():
-        return target
+        return target, raw_seconds, wav_duration(target), sha256(target)
     partial = target.with_suffix('.partial.wav')
     args = [executable('ffmpeg'), '-v', 'error', '-nostdin', '-n']
     if source.source_start:
@@ -118,8 +132,8 @@ def _prepared(asset_id, asset_path, source, target_dir, rate=48000):
         if wav_duration(partial) <= 0:
             raise ExportError('prepared audio for %s is empty' % asset_id)
         partial.replace(target)
-        wav_duration(target)  # read it back once: a truncated write fails here
-        return target
+        rendered = wav_duration(target)   # read it back: a truncated write fails here
+        return target, raw_seconds, rendered, sha256(target)
     finally:
         partial.unlink(missing_ok=True)
 
@@ -200,6 +214,7 @@ def export_run(project_path, *, output=None, run_name='', background=None,
     run_dir.mkdir(parents=True, exist_ok=True)
     speech_dir = run_dir / '.speech'
     sources = {}
+    prepared_facts = {}
     for clip in project.clips:
         if clip.source is None:
             continue
@@ -208,10 +223,17 @@ def export_run(project_path, *, output=None, run_name='', background=None,
             if asset is None:
                 raise CatalogError('clip %s needs asset %r, which the catalogue lacks'
                                    % (clip.id, clip.source.asset_id))
-            prepared = _prepared(clip.source.asset_id, asset.path, clip.source,
-                                 speech_dir)
-            sources[clip.source.asset_id] = SourceMedia(path=str(prepared),
+            path, raw_seconds, rendered_seconds, digest = _prepared(
+                clip.source.asset_id, asset.path, clip.source, speech_dir)
+            sources[clip.source.asset_id] = SourceMedia(path=str(path),
                                                         voice=asset.voice)
+            prepared_facts[clip.source.asset_id] = {
+                'asset_id': clip.source.asset_id, 'role': clip.role,
+                'record_id': clip.record_id, 'text': clip.text,
+                'voice': asset.voice, 'path': str(path),
+                'raw_seconds': round(raw_seconds, 6),
+                'rendered_seconds': round(rendered_seconds, 6),
+                'source_seconds': round(raw_seconds, 6), 'sha256': digest}
             continue
         if clip.is_intro:
             # The intro layer's measurement already resolved its media to a real
@@ -237,6 +259,11 @@ def export_run(project_path, *, output=None, run_name='', background=None,
             for index, piece in enumerate(pieces, start=1)]
     timeline = run_dir / 'timeline.json'
     _atomic_json(timeline, view.to_dict())
+    # The per-asset speech record: what an independent reader needs to re-derive the
+    # timeline instead of taking it on trust.  Written here, before the run record,
+    # so a failure later leaves no record claiming a complete run.
+    speech_record = write_speech_record(run_dir, view, prepared_facts,
+                                        solution.render)
 
     # One layout for every product: computed here, read by the captions below and
     # (W04) by the preview.
@@ -268,6 +295,10 @@ def export_run(project_path, *, output=None, run_name='', background=None,
                           report={'project_revision': project.revision,
                                   'plan_identity': solution.render.identity(),
                                   'cue_identity': solution.cues.identity(),
+                                  'speech_record': str(run_dir / SPEECH_FILENAME),
+                                  'speech_assets': len(speech_record['records']),
+                                  'asset_source': 'registry' if from_registry
+                                  else 'catalogue',
                                   'total_ticks': solution.render.total_ticks,
                                   'total_frames': view.total_frames,
                                   'fps': view.fps, 'width': view.width,
@@ -317,6 +348,50 @@ def _background_piece(piece, index, run_dir, view):
     build_background_track([piece], target, fps=view.fps,
                            size=(view.width, view.height))
     return dict(piece.to_dict(), path=str(target))
+
+
+def write_speech_record(run_dir, view, prepared_facts, plan):
+    """One record per speech asset, next to the audio it describes.
+
+    An independent checker has to be able to ask "is this stage as long as the
+    rhythm plus the recording it actually plays?" - and answering that needs the
+    recording's **own** length, the prepared file's length, the text, the role and
+    the voice.  The verified chain kept exactly that in
+    ``audio-cache/<token>/complete.json``; the new entry point prepares its speech
+    under ``.speech/`` instead, so without this document the ``timing`` face of the
+    acceptance checker has nothing to recompute against and reports PASS while
+    having checked nothing (the false-green H0 found: ``data_missing=9``).
+
+    The record also carries the **planned stage** for each asset (ticks and frames),
+    so a reader can compare item by item instead of re-deriving the plan.
+
+    It is written as part of publication, before ``complete.json``, so a run that
+    fails leaves no record claiming a complete one - the same rule as the run
+    record itself.
+    """
+    records = []
+    for item in getattr(plan, 'audio', ()):
+        facts = prepared_facts.get(item.source.asset_id if item.source else None)
+        if facts is None:
+            # A plan item with no prepared audio would have failed earlier; being
+            # explicit here beats writing a record that silently omits a stage.
+            raise ExportError('no prepared speech for %s (asset %r)'
+                              % (item.clip_id, item.source.asset_id
+                                 if item.source else None))
+        records.append(dict(
+            facts, clip_id=item.clip_id,
+            text=item.text,
+            start_ticks=item.start_ticks, end_ticks=item.end_ticks,
+            duration_ticks=item.duration_ticks,
+            start_frame=frame_at(item.start_ticks, view.fps),
+            end_frame=frame_at(item.end_ticks, view.fps),
+            stage_seconds=round(float(Fraction(item.duration_ticks, 720000)), 6)))
+    document = {'schema': SPEECH_SCHEMA, 'mode': 'prepared',
+                'fps': view.fps, 'sample_rate': 48000, 'speed': view.speed,
+                'total_frames': view.total_frames, 'records': records}
+    target = Path(run_dir) / SPEECH_FILENAME
+    _atomic_json(target, document)
+    return document
 
 
 def _atomic_json(path, value):

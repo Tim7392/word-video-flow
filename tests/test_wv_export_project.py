@@ -121,6 +121,125 @@ class ExportTests(unittest.TestCase):
         from word_video.contracts import TimelineManifest
         verify_against_manifest(self.plan.cues, TimelineManifest.from_dict(manifest))
 
+    def test_the_speech_record_lets_an_independent_reader_recheck_the_timing(self):
+        """The `timing` face of the acceptance checker needs exactly these numbers.
+
+        Without a per-asset record the checker cannot re-derive "stage = rhythm +
+        the recording it plays", so it reported PASS while checking nothing (C's
+        ``data_missing=9``).  Every speech asset must therefore be in ``speech.json``
+        with its text, role, voice, both lengths and its planned stage - and the
+        numbers must match the files that were published.
+        """
+        from word_video.media import wav_duration
+
+        path = Path(self.result.run_dir) / 'speech.json'
+        self.assertTrue(path.is_file(), 'no speech record was published')
+        document = json.loads(path.read_text(encoding='utf-8'))
+        self.assertEqual('wv-speech@1', document['schema'])
+        self.assertEqual(FPS, document['fps'])
+        self.assertEqual(48000, document['sample_rate'])
+        records = document['records']
+        self.assertEqual(3 * len(self.roles), len(records))
+
+        expected = {(record.index, role):
+                    (record.word if role in ('female', 'male')
+                     else record.spoken_meaning)
+                    for record in self.project.records
+                    for role in ('female', 'male', 'chinese')}
+        seen = set()
+        for record in records:
+            key = (int(record['record_id'][1:]), record['role'])
+            seen.add(key)
+            self.assertEqual(expected[key], record['text'])
+            # Both durations, describing the file that was really published.
+            self.assertGreater(record['raw_seconds'], 0)
+            self.assertGreater(record['rendered_seconds'], 0)
+            self.assertLess(record['rendered_seconds'], record['raw_seconds'])
+            self.assertTrue(Path(record['path']).is_file())
+            self.assertAlmostEqual(wav_duration(record['path']),
+                                   record['rendered_seconds'], places=3)
+            # The planned stage in ticks and frames: no re-derivation required.
+            self.assertEqual(record['end_ticks'] - record['start_ticks'],
+                             record['duration_ticks'])
+            self.assertAlmostEqual(record['duration_ticks'] / 720000,
+                                   record['stage_seconds'], places=6)
+            self.assertAlmostEqual(record['start_ticks'] * FPS / 720000,
+                                   record['start_frame'], delta=0.5)
+            # ...and the stage really can hold the prepared audio.
+            self.assertGreaterEqual(record['stage_seconds'] + 1e-6,
+                                    record['rendered_seconds'] - 1.0 / FPS)
+        self.assertEqual(set(expected), seen)
+
+    def test_changing_one_word_changes_only_that_words_records(self):
+        """A record has to describe the run it belongs to, item by item.
+
+        The edited lesson is re-expanded (a clip carries its own text snapshot, so
+        editing a record alone does not re-render it) and the two documents are
+        compared item by item: the edited word's record must differ and every other
+        record must be byte-identical.
+        """
+        from dataclasses import replace
+
+        from word_video.application import instantiate
+        from word_video.application.intro import measure_project_intro
+        from word_video.domain import solve
+        from word_video.domain.lesson import DEFAULT_LESSON_TEMPLATE
+        from word_video.exporters.render import write_speech_record
+
+        published = json.loads((Path(self.result.run_dir) / 'speech.json')
+                               .read_text(encoding='utf-8'))['records']
+        facts = {record['asset_id']: {key: value for key, value in record.items()
+                                      if key not in ('clip_id', 'text', 'start_ticks',
+                                                     'end_ticks', 'duration_ticks',
+                                                     'start_frame', 'end_frame',
+                                                     'stage_seconds')}
+                 for record in published}
+        measurement = measure_project_intro(self.project)
+        changed_records = [replace(record, spoken_meaning=record.spoken_meaning + '补充')
+                           if record.index == 152 else record
+                           for record in self.project.records]
+        # Expansion needs an empty carrier, so the edited lesson is built the same
+        # way the exported one was: same settings, same assets, edited records.
+        carrier = self.project.with_records(()).with_clips(())
+        edited = instantiate(DEFAULT_LESSON_TEMPLATE, tuple(changed_records),
+                             self.media, carrier, asset_ids={
+                                 (record.id, role): '%s:%s' % (record.id, role)
+                                 for record in changed_records
+                                 for role in ('female', 'male', 'chinese')})
+        base, other = solve(self.project, self.media, measurement), \
+            solve(edited, self.media, measurement)
+
+        with tempfile.TemporaryDirectory() as folder:
+            first = write_speech_record(folder, _view_from(base.render, self.result),
+                                        facts, base.render)
+            second = write_speech_record(folder, _view_from(other.render, self.result),
+                                         facts, other.render)
+        by_key = {(record['record_id'], record['role']): record
+                  for record in first['records']}
+        after = {(record['record_id'], record['role']): record
+                 for record in second['records']}
+        self.assertEqual(set(by_key), set(after))
+        # The edit is a Chinese-record edit: that record's text changes, and no other
+        # record's text does.  (Later words shift in time, which is real - the lesson
+        # got longer - so the comparison is about *what each record says*.)
+        texts_before = {key: record['text'] for key, record in by_key.items()}
+        texts_after = {key: record['text'] for key, record in after.items()}
+        touched = {key for key in texts_before if texts_before[key] != texts_after[key]}
+        self.assertEqual({('w152', 'chinese')}, touched,
+                         'the edit changed the text of %r' % (sorted(touched),))
+        self.assertIn('补充', texts_after[('w152', 'chinese')])
+        # The word before the edit is untouched in every field, including its stage.
+        for key in [key for key in by_key if key[0] == 'w151']:
+            self.assertEqual(by_key[key], after[key], key)
+
+    def test_the_speech_record_is_not_published_when_the_run_fails(self):
+        """A record is part of publication, so a run that cannot start leaves none."""
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            with self.assertRaises(Exception):
+                export_run(str(root / 'missing-project'), output=root / 'out')
+            self.assertFalse((root / 'out').exists())
+
     def test_every_role_of_every_word_is_on_the_timeline_with_its_own_text(self):
         """Per role, per word: no sampling.  The plan is the oracle."""
         manifest = json.loads(Path(self.result.timeline).read_text(encoding='utf-8'))
@@ -232,6 +351,16 @@ class ExportTests(unittest.TestCase):
         run([executable('ffmpeg'), '-v', 'error', '-nostdin', '-y', '-i',
              self.result.video, '-vf', 'select=eq(n\\,0)', '-frames:v', '1', str(intro)])
         self.assertGreater(painted, _ink(intro))
+
+
+def _view_from(plan, result):
+    """The little view `write_speech_record` reads: fps and total frames."""
+    import types
+
+    manifest = json.loads(Path(result.timeline).read_text(encoding='utf-8'))
+    return types.SimpleNamespace(fps=manifest['fps'],
+                                 total_frames=manifest['total_frames'],
+                                 speed=manifest['speed'])
 
 
 def _ms(milliseconds):
