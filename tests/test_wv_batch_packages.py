@@ -354,9 +354,16 @@ def intro_project(folder, records, media, *, seconds=1.0):
     return project, measure
 
 
-def test_a_batch_never_changes_the_intro_the_source_has_without_saying_so(source,
-                                                                         monkeypatch):
-    """A member's layer is neither dropped nor invented: the plan names the mismatch."""
+def test_the_reference_layout_keeps_the_intro_and_a_captured_one_pins_it(source,
+                                                                        monkeypatch):
+    """A member's layer is neither dropped nor invented — and the default keeps it.
+
+    Nothing pinned means the **reference** layout is in use, and the reference is the
+    layout the verified engine draws: that engine draws the countdown the project has,
+    so the plan keeps it too (``intro_from: source``).  Pinning a template is the
+    explicit choice, and *that* is where a template disagreeing with the source is
+    refused — see ``test_wv_blocker_fix_closure`` for the refusal and its fix.
+    """
     import importlib
     import word_video.cli.main as cli_function
     cli_module = importlib.import_module('word_video.cli.main')
@@ -373,24 +380,21 @@ def test_a_batch_never_changes_the_intro_the_source_has_without_saying_so(source
                                      seconds=1.0)
     monkeypatch.setattr(cli_module, 'measure_project_intro', lambda *a, **k: measure)
 
-    # The built-in template declares no intro layer, so this batch would publish a
-    # delivery without the countdown the member placed: the plan says so by name.
+    # The built-in template declares no intro layer of its own, and the reference
+    # follows the project rather than dropping the layer the member placed.
     code, document, err = run_cli(root, *plan_arguments(folder, '--per-package', '2'))
     assert code == 0, (document, err)
     result = document['result']
-    assert result['ready'] is False
-    problem = result['plan']['problems'][0]
-    assert problem['code'] == 'TEMPLATE_INTRO_MISMATCH'
-    assert '片头' in problem['message']
-    assert any('template save --from-project' in fix for fix in result['fixes'])
+    assert result['ready'] is True and result['plan']['problems'] == []
     arrangement = [item for item in result['checks']['checks']
                    if item['name'] == 'template'][0]
     assert arrangement['intro_in_source'] is True
     assert arrangement['intro_in_template'] is False
-    assert arrangement['intro_used'] is False
+    assert arrangement['intro_from'] == 'source'
+    assert arrangement['intro_used'] is True
 
-    # Recording the arrangement the member actually has is the fix, and then the layer
-    # really is in the instance, measured from its own media.
+    # Recording the arrangement the member actually has pins it, and then the layer is
+    # in the instance, measured from its own media.
     TemplateStore(root).save(TemplateDocument(
         template_id='p1-lesson', version=1, lesson=replace(DEFAULT_LESSON_TEMPLATE,
                                                            intro=True)))
