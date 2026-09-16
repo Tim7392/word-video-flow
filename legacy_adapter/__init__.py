@@ -44,6 +44,17 @@ Quick start::
     python -m legacy_adapter calibers --wordlist <词表> --start 301 --end 350 \
         --batch-size 50 --timeline <归档运行目录或 timeline.json>
     python -m legacy_adapter generate --wordlist <词表> --start 1 --end 50 --batch-size 50
+
+The two acceptance steps of W10 are modules of their own, because both are things a
+person runs and reads rather than functions a program calls::
+
+    python -m legacy_adapter.gate          # 两个真实区间的五轨逐字节/逐毫秒门禁 + 保护核对
+    python -m legacy_adapter.failure_isolation   # 两个方向的最小反例（各自独立子进程）
+
+Both write their evidence to fixed names under ``<work root>/out/reports``
+(``gate-legacy-*.json``); :mod:`legacy_adapter.protection` is the shared half that
+answers "did anything protected change", and :mod:`legacy_adapter.new_entry_probe` is
+the small project the isolation evidence runs the *new* entry against.
 """
 from .caliber import (CALIBER_CHOICES, CALIBER_LEGACY, CALIBER_MEDIA, LEGACY_FORMULA,
                       LEGACY_LABEL, MEDIA_FORMULA, MEDIA_LABEL, UI_NOTICE, caliber,

@@ -82,7 +82,9 @@ def test_old_entry_and_new_entry_are_identical_on_a_real_archive_selection():
         assert report['new_entry']['counts']['file_count'] == 5
 
         # The two clocks, on the same 50 words: the old rule is longer than the audio.
-        legacy = report['calibers']['legacy']['measured']
+        # ``measure_equivalence`` publishes the old caliber as the measured block itself
+        # (the old core's own plan) and the new one as the engine's caliber document.
+        legacy = report['calibers']['legacy']
         media = report['calibers']['media']['measured']
         assert legacy['total_duration_ms'] == 199400
         assert media['total_duration_ms'] == 173733

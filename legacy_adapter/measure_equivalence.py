@@ -56,6 +56,8 @@ def build_parser():
                         help='本次对照的工作根（默认 D 盘 out/legacy/equivalence）')
     parser.add_argument('--timeline', default='', help='新口径数值来源：归档运行目录或 timeline.json')
     parser.add_argument('--legacy-script', default='')
+    parser.add_argument('--legacy-python', default='',
+                        help='运行旧 CLI 的解释器；两侧（旧入口直调与新入口适配器）都用它')
     parser.add_argument('--report', default='', help='把对照报告写到这个文件')
     parser.add_argument('--label', default='equivalence', help='本次运行的标签，进目录名')
     return parser
@@ -148,7 +150,7 @@ def main(argv=None):
     old_work, new_work = root / 'old-work', root / 'new-work'
     common = dict(wordlist=args.wordlist, start=args.start, end=args.end,
                   batch_size=args.batch_size, first_six=args.first_six, extra=args.extra,
-                  legacy_script=str(entry))
+                  legacy_script=str(entry), legacy_python=str(args.legacy_python or ''))
     old_request = LegacyRequest(**common, output=str(old_output),
                                 work_dir=str(old_work)).resolve()
     for path, role in ((old_output, '输出目录'), (new_output, '输出目录'),
