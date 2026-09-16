@@ -102,6 +102,9 @@
 
 | **事故与处置：同一 worktree 两个写者（H0 调度失误）** | H0 把同一份 C-5（成员包带编辑器）**同时派给两个子 Agent**，且都在 `worktrees\C` → 同一目录出现两个竞争实现（`desktop\__main__.py` + 双 onedir vs `packaging\frozen_entry.py` 单 exe console 分派）与文件互相覆盖的风险。**处置**：① 裁决唯一 owner 并保留**双 onedir** 方案（理由：CLI 必须 console 子系统让 Agent 取 stdout，编辑器必须 windowed 避免成员看到控制台窗口；多约 180MB 体积换成员体验与 Agent 可用性）；② 另一方**立即停写** `packaging/**`，只保留并提交我真正派给它的 3 项桌面测试更新；③ 双方**只按显式路径 `git add`**；④ H0 复核后清除无人引用的竞争文件 `packaging\frozen_entry.py`（全仓 grep 无任何代码引用；**由 H0 删除，不是另一方删的**——被停手的 Agent 事后看到文件消失并误记为并发写者所为，此处更正）。**损失**：约 5 分钟机时 + 一次人工核对；**无代码丢失**（owner 的两个提交完整：`4008763` 编辑器入口、`8b9ffb2` 打包与验收）。**规则已写入 `docs/DIVISION.md`**：一个 worktree 同时只允许一个活跃子 Agent、派工前先确认目标 worktree 无活跃写者、重复派工前确认旧 Agent 已结束、提交禁止 `git add -A/-u` |
 
+| **H0 独立跑协调器整链，抓到两个真实缺陷（已派 A）** | 复现：`batch submit → job run → artifacts → reconcile` 在 **3 词夹具**上跑通（55s、43 产物、`reconcile healthy`），**音画也对**（验收器 `audio_e2e` 12.48s 与 `pixels` 两面全 0）。但：① **产物里的路径是 staging 路径**——`complete.json` 的 `files[].path`、`timeline.json`、草稿资源引用全部指向 `…\staging\<job>\…`，发布后该目录已不在 → 验收器判 **FAIL failures=[integrity, draft, timing]**（integrity 43 条 missing、草稿三轨引用缺失、timing 9 条缺失）。**建议修法**：直接导出到最终 `runs\<job>`（用状态与"`complete.json` 最后写"表达"未校验不算成功"，失败整个目录移 `recovery\`），或发布时改写三份 JSON 里的绝对路径；**回归红线**：修完后断言三份 JSON 里每个路径都存在且独立验收器 PASS。② **缺 `--background` 时** `job run` 返回 `{"type":"PermissionError","code":"INTERNAL","message":"Permission denied: '<cwd>'"}`（空路径被当 cwd 打开），违反 P2 A6"缺信息必须 `NEEDS_INPUT` + 修复项"，要求改成结构化 `NEEDS_INPUT` 并留反例 |
+| 附带证实（QA 的严格化生效） | 上述批次里验收器 `timing` 面因缺少 per-asset 记录**直接判 FAIL**（不再是"`data_missing` 却 PASS"）——QA 的 `bf13dbf`「a face that could not run its checks must not report PASS」按要求生效；B 的 per-asset 记录落地后该面才能真过 |
+
 ### 待决/风险（不阻塞当前开发）
 - GitHub owner/repo 仍未提供 → 只本地提交。
 - 预览档位（720p30/540p30）未批准冻结，实测后再请 Tim 确认。
