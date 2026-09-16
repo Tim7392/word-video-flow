@@ -36,6 +36,11 @@ H0 每次派工写清"**为团队成员/Agent 解除什么生产阻塞，做到�
 
 ## 4. 隔离与资源纪律
 
+- **磁盘预算：重跑前先看可用空间（`Get-PSDrive D`），预估不够就先报 H0，不许跑到一半满盘。**
+  2026-09-16 实测过一次：`runtime\tmp` 被各 Agent 的跑批堆到 **37.7GB**、D 盘只剩 **8.85GB**；
+  H0 清掉可重建临时物（A 的 tmp 6.97GB、H0 检查根 1.56GB、out/tim 1.35GB、out/perf* 0.83GB）后回到 **17.3GB**。
+  清理只动"可重建的跑批/临时物"，**正式产物（out/production、out/packages、out/candidates）、
+  证据 JSON（out/reports）、仓库与 worktree 一律不动**。
 - **一个 worktree 同时只允许一个活跃子 Agent（H0 派工前必须确认目标 worktree 没有活跃写者）。**
   2026-09-16 发生过一次真实事故：H0 把同一份 C-5 同时派给两个子 Agent 且都在 `worktrees\C`，
   导致同一 worktree 出现两个竞争实现与互相覆盖的文件。处置：裁决唯一 owner、另一方立刻停写、
