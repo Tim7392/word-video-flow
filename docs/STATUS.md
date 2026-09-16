@@ -144,6 +144,9 @@
 | 新派 C：编辑器导入丢音色（一行 bug，属 C 范围） | `desktop/editor_import.py::registry_for` 构造 `AssetRef(...)` 时**丢掉 `voice=voice`**（而 `assets_for` 已从 provider 取到音色）→ **编辑器导入的工程天生没有音色记录**，正是 H0 踩到的"预检死循环"的另一半根源。已派 C 补字段 + 断言；修好后 A 可把 `voices` 从 warning 升为 blocker（切换点在 `check_voices(blocking=…)` 与 `VOICE_FIXES`，口径已文档化）。**A 未验**：`--run` 真实渲染下"保留工程片头"的实际画面（只验到计划与实例层），待后续用 3 词与归档对照 |
 | H0 自省：我的契约工具有解码缺陷 | 我一直用 `subprocess.run(text=True)` 读 CLI stdout（未指定 `encoding`），在这台 cp936 机器上会把 UTF-8 中文解码失败并把动作误判为"不是单个 JSON"——**此前那批"exit 2 / 不是 JSON"的判定里有一部分是我工具的错，不是产品的错**。已要求自己：子进程读文本一律显式 `encoding='utf-8'`；产品侧（A）也顺手把 CLI stdout 改成 ASCII 安全 JSON，两边都不再依赖控制台代码页 |
 
+| **H0 复验：批量路径保留工程片头（补上 A-8 只到"计划/实例层"的缺口）** | 在批量路径上用**真实渲染**验证：`batch submit`（**不传 `--background`**——继承工程自带 `delivery.json`；**不传 `--template`**）+ `job run` → **18.9s succeeded、44 产物**。产出 `timeline.json`：`intro_frames=112`（与归档一致）、`intro_video` = 工程自带的透明片头 `.mov`、**词边界 112/171/229/308 与归档逐帧相同**、9 条音频路径**无 staging**。独立验收器 `--cleaning legacy --pixels all` → **verdict=PASS / failures=[]**（integrity 43 文件 0 问题、draft 0、`timing complete=True` 9/9 阶段、音画 e2e 0 问题且片头有声 1.867s、像素 10/10 探针 0 问题）。报告 `out\reports\h0-batch-intro-run.accept.json` |
+| 新派：W10 收尾 + QA 全量门禁 | ① **W10 收尾**（独立 worktree `worktrees\C6`，分支 `task/C6` @ `207d593`）：补完归档等价性长跑（进门禁 + 稳定证据）、失败隔离两个最小反例、旧核心/归档保护核对；② **QA 跑完整 31 项门禁**并给"与上次差异"（要求先确认基点含相关合并、报数连负载一起报），并把发布目录步骤改成走 `import audio --voices` 导入路径复跑闭环 |
+
 ### 待决/风险（不阻塞当前开发）
 - **两个子 Agent 崩溃留下的未提交工作（已保全，未丢）**：① `worktrees\A`（分支 `task/A7`）留了 W08 进行中的改动（`application/packages.py`、`storage/batches.py`、`storage/delivery.py`、`tests/test_wv_batch_packages.py` 及 4 个文件的修改）——**已原样保留**，并派新 Agent 在同一 worktree **复核后继续**（明确要求"不要默认上个 Agent 的代码是对的"）。② `worktrees\Ctests`（分支 `task/Ctests`）留了测试隔离/降本的改动（`tests/conftest.py` 与 3 个编辑器测试文件）——**暂缓**，因为当前已有 3 个开发位（A/B/C）在用，按"最多 3 开发 + 1 QA"不再新开；该分支保留待后续接手。
 - **顺序相关失败当前未复现**：A-7 合并后全套 **710 passed / 0 failed / 2 分 55 秒**，那条编辑器用例的偶发失败没有再出现（属负载/顺序相关）；`Ctests` 的根因工作保留，不视为已解决。
