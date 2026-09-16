@@ -116,6 +116,32 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(self.plan.cues.identity(), report['cue_identity'])
         self.assertEqual([], report['conflicts'])
 
+    def test_the_run_says_where_its_seconds_went(self):
+        """Stage timing is part of the run record, in the verified chain's names.
+
+        "The export took four minutes" has to be answerable without a profiler: the
+        old chain wrote ``stage_seconds`` (speech / timeline / draft / srt / render)
+        and the new entry point wrote nothing, so a slow run could not be located at
+        all.  A stage that did not run is absent rather than zero, and the wall clock
+        is the total.
+        """
+        report = self.result.report
+        stages = report['stage_seconds']
+        for name in ('speech', 'timeline', 'layout', 'srt', 'draft', 'render', 'total'):
+            self.assertIn(name, stages, name)
+            self.assertGreaterEqual(stages[name], 0.0, name)
+        # The mix and the picture pass run inside the renderer and report themselves.
+        self.assertIn('mix', stages)
+        self.assertIn('encode', stages)
+        self.assertGreaterEqual(report['slices'], 1)
+        self.assertEqual(stages['total'], report['seconds_wall'])
+        # The record on disk carries the same numbers, so a reader needs no API.
+        document = json.loads((Path(self.result.run_dir) / 'export.json')
+                              .read_text(encoding='utf-8'))
+        self.assertEqual(stages, document['report']['stage_seconds'])
+        # total is the largest stage: it is the wall clock around all of them.
+        self.assertEqual('total', max(stages, key=lambda name: stages[name]))
+
     def test_the_five_tracks_are_the_plan_not_a_second_projection(self):
         """Byte-level equality with the verified exporter is the only acceptable gap."""
         manifest = json.loads(Path(self.result.timeline).read_text(encoding='utf-8'))

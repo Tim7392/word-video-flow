@@ -40,14 +40,19 @@ def _audio_streams(path):
     return [item for item in _streams(path) if item.get('codec_type') == 'audio']
 
 
-def audio_stream(path):
-    """The single audio stream of ``path``; refuses to guess between several."""
-    found = _audio_streams(path)
+def _single_audio(streams, path):
+    """The one audio stream among ``streams``, naming ``path`` when refusing."""
+    found = [item for item in streams if item.get('codec_type') == 'audio']
     if not found:
         raise ValueError('No audio stream: %s' % path)
     if len(found) > 1:
         raise ValueError('Several audio streams, name one by index: %s' % path)
     return found[0]
+
+
+def audio_stream(path):
+    """The single audio stream of ``path``; refuses to guess between several."""
+    return _single_audio(_streams(path), path)
 
 
 def video_stream(path):
@@ -165,7 +170,7 @@ def _priming_samples(path, stream):
     return opus_pre_skip(path)
 
 
-def audio_sample_count(path):
+def audio_sample_count(path, streams=None):
     """How many samples of audio a file really holds.
 
     Three sources, in order of authority:
@@ -183,6 +188,11 @@ def audio_sample_count(path):
     guarantee can tell a real count from a derived one instead of being handed a
     packet count labelled as exact.  A corrected count also carries
     ``priming_samples``, so the correction is visible rather than silent.
+
+    ``streams`` is a probe the caller has already taken (``probe(path)['streams']``),
+    so a caller that needs several properties of one file does not pay for a second
+    ffprobe.  The catalogue's per-asset measurement did exactly that, and the second
+    probe was half its cost: 0.32 s an asset over a 50-word import's 150 assets.
     """
     try:
         with wave.open(str(path), 'rb') as stream:
@@ -194,7 +204,7 @@ def audio_sample_count(path):
                         'exact': True}
     except (wave.Error, EOFError, ValueError):
         pass
-    stream = audio_stream(path)
+    stream = _single_audio(streams if streams is not None else _streams(path), path)
     facts = samples_from_stream(stream)
     priming = _priming_samples(path, stream)
     if priming and not facts['exact']:

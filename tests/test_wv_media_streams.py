@@ -229,6 +229,37 @@ class SampleFactsTests(unittest.TestCase):
         self.assertLessEqual(facts['samples'], decoded)
         self.assertLess(decoded - facts['samples'], 1024)
 
+    def test_measuring_one_asset_probes_it_once(self):
+        """Two ffprobes per asset was half the import's measurement cost.
+
+        The catalogue asked ``has_audio`` (one probe) and then measured the audio
+        (another probe) - 0.32 s an asset over the 150 assets of a real 50-word
+        import.  The stream list is taken once and handed to the measurement.
+        """
+        from unittest.mock import patch
+
+        from word_video.exporters.catalog import Asset, measure
+        from word_video.media import core as media_core
+        from word_video.media import probe as real_probe
+        import word_video.media as media_package
+
+        path = self.root / 'measured.m4a'
+        run([executable('ffmpeg'), '-v', 'error', '-nostdin', '-n', '-f', 'lavfi',
+             '-i', 'sine=frequency=440:duration=0.5:sample_rate=48000',
+             '-c:a', 'aac', '-b:a', '128k', str(path)])
+        calls = []
+
+        def counting(value):
+            calls.append(str(value))
+            return real_probe(value)
+
+        with patch.object(media_package, 'probe', counting), \
+                patch.object(media_core, 'probe', counting):
+            info = measure(Asset(asset_id='audit', path=str(path)))
+        self.assertEqual(1, len(calls), calls)
+        self.assertEqual(24000, info.units)
+        self.assertEqual(48000, info.unit_den)
+
     def test_pts_is_reported_and_a_wav_starts_at_zero(self):
         path = _wav(self.root / 'plain.wav', 0.3)
         facts = audio_pts(path)

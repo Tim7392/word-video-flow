@@ -206,7 +206,16 @@ def _render_slices(manifest, stage, slices, background, codec, fonts_ready, prog
     return listing
 
 
-def render_video(manifest, output_dir, progress=None, cancel=None, slices=None):
+def render_video(manifest, output_dir, progress=None, cancel=None, slices=None,
+                 timings=None):
+    """Render the picture and mux the mix into ``<output_dir>/video.mp4``.
+
+    ``timings``, when given, is filled with what this call spent: ``mix`` (building
+    mix.wav), ``encode`` (every ffmpeg pass that draws the picture, including the
+    concat and the mux) and ``slices`` (how many processes the picture was split
+    into, which is the number that decides whether libass is the bottleneck).  The
+    caller owns the dict; nothing here changes what is rendered.
+    """
     from .mix import build_mix
     from ..media import resolve_intro_audio
     target=Path(output_dir).resolve()
@@ -231,7 +240,9 @@ def render_video(manifest, output_dir, progress=None, cancel=None, slices=None):
         # Resolved once, before any caption work, so the intro's sound is the
         # same decision the draft exporter made from the same manifest.
         intro_sound=resolve_intro_audio(manifest.intro_video,None,manifest.intro_audio)
+        mix_started=time.monotonic()
         mix=stage/'mix.wav';build_mix(manifest,mix,cancel,intro_audio=intro_sound.path)
+        if timings is not None: timings['mix']=round(time.monotonic()-mix_started,3)
         check()
         codec='h264_nvenc'
         try:
@@ -253,6 +264,8 @@ def render_video(manifest, output_dir, progress=None, cancel=None, slices=None):
         width,height=manifest.width,manifest.height
         scale=f'scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1'
         count = slice_count(manifest) if slices is None else max(1,int(slices))
+        if timings is not None: timings['slices']=count
+        encode_started=time.monotonic()
         if count > 1:
             if progress:
                 progress({'stage':'render','frame':0,'fraction':0,
@@ -310,6 +323,9 @@ def render_video(manifest, output_dir, progress=None, cancel=None, slices=None):
                     piece=stage/('render-%d.log'%index)
                     if piece.exists(): errors.write(piece.read_text(encoding='utf-8',errors='replace'))
         check();validate_video(partial,manifest)
+        # Everything that drew the picture, the concat and the mux - the cost the old
+        # chain reported only as part of one "render" number.
+        if timings is not None: timings['encode']=round(time.monotonic()-encode_started,3)
         # Final publication cannot overwrite a concurrently created user output.
         os.link(partial,final)
         shutil.copy2(ass,target/'captions.ass');shutil.copy2(mix,target/'mix.wav')
