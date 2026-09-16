@@ -112,12 +112,28 @@ class RenderPlan:
     video: tuple = ()
     audio: tuple = ()
     conflicts: tuple = ()
+    #: The project's per-role style overrides, carried into the plan so a renderer
+    #: and an on-screen canvas read *one* style source instead of each merging the
+    #: defaults again (fields not named here still fall back to the defaults).
+    styles: tuple = ()
     schema: str = 'wv-render@1'
 
     def __post_init__(self):
         object.__setattr__(self, 'video', tuple(self.video))
         object.__setattr__(self, 'audio', tuple(self.audio))
         object.__setattr__(self, 'conflicts', tuple(self.conflicts))
+        object.__setattr__(self, 'styles', tuple(self.styles))
+
+    def style_table(self):
+        """This plan's style **overrides** — what the project changed, not a full table.
+
+        A consumer wants the merged table (defaults + these overrides), which needs
+        the font-resolving template and therefore lives above the domain:
+        ``word_video.application.styles.merged_styles(plan.style_table())``.  Handing
+        a layout the bare overrides would silently drop every default the project
+        did not override.
+        """
+        return {override.role: override.values for override in self.styles}
 
     def item(self, clip_id):
         for item in self.video + self.audio:
@@ -150,7 +166,8 @@ class RenderPlan:
                 'total_ticks': self.total_ticks,
                 'video': [item.to_dict() for item in self.video],
                 'audio': [item.to_dict() for item in self.audio],
-                'conflicts': [conflict.to_dict() for conflict in self.conflicts]}
+                'conflicts': [conflict.to_dict() for conflict in self.conflicts],
+                'styles': [override.to_dict() for override in self.styles]}
 
 
 @dataclass(frozen=True)

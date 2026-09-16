@@ -13,10 +13,13 @@ two clients editing one project cannot silently overwrite each other.
 from dataclasses import dataclass, replace
 
 from ..domain.errors import (ClipBoundError, CycleError, DanglingRefError,
-                             InvalidTimeError, SchemaError, StaleRevisionError,
+                             DuplicateIdError, InvalidTimeError, SchemaError,
+                             SplitNotAllowedError, StaleRevisionError,
                              UnknownCommandError)
-from ..domain.model import MediaSlice, Project
-from ..domain.timebase import TimeExpr
+from ..domain.model import (PROJECT_LAYERS, STYLE_FONT_KEYS, STYLE_KEYS,
+                            STYLE_ROLES, MediaSlice, Project, StyleOverride,
+                            style_overrides)
+from ..domain.timebase import TICKS_PER_SECOND, TimeExpr, half_up, rational
 
 
 @dataclass(frozen=True)
@@ -81,7 +84,92 @@ class UnbindStart:
     ticks: int | None = None
 
 
-COMMANDS = (MoveClip, MoveClips, TrimClip, SetMediaSlice, BindStart, UnbindStart)
+#: Roles a split may produce: the media project layers.  Everything else is
+#: singular by design — a per-record reading stage or text layer exists once per
+#: word, and two of them make the lesson undeliverable — so the command refuses
+#: them *before* the UI can offer a button that only ever errors.
+SPLITTABLE_ROLES = ('background', 'intro')
+
+
+@dataclass(frozen=True)
+class SplitCheck:
+    """Whether one clip may be split, and why not when it may not."""
+
+    ok: bool
+    code: str = ''
+    reason: str = ''
+
+
+def can_split(clip):
+    """Decide before the fact: the UI greys out what this refuses.
+
+    ``ok=False`` carries the same ``code`` the command itself would raise, so a
+    button and its error message cannot disagree.
+    """
+    if clip.role not in SPLITTABLE_ROLES:
+        return SplitCheck(False, SplitNotAllowedError.code, _split_reason(clip.role))
+    if clip.source is None:
+        return SplitCheck(False, SplitNotAllowedError.code,
+                          'the %s layer has no media to cut' % clip.role)
+    if clip.start.is_linked:
+        return SplitCheck(False, ClipBoundError.code,
+                          'clip %s follows %s; unbind it before splitting'
+                          % (clip.id, clip.start.ref))
+    return SplitCheck(True)
+
+
+def _split_reason(role):
+    if role in PROJECT_LAYERS:
+        return ('the %s layer is drawn as one window over the whole project; '
+                'splitting it is not expressible yet' % role)
+    return ('%s is a per-record role: each word has exactly one, and two would be '
+            'refused as ambiguous' % role)
+
+
+@dataclass(frozen=True)
+class SplitClip:
+    """Cut one clip in two at ``at_ticks``; the left half keeps the original id.
+
+    Only the media project layers can be split (:data:`SPLITTABLE_ROLES`):
+    splitting a reading stage or a text layer would produce two clips claiming one
+    per-record role, which :mod:`word_video.domain.compile` refuses as
+    ``ROLE_AMBIGUOUS``, so the command refuses it up front with the same code
+    ``can_split`` reports.  A linked clip is refused too: the halves would need two
+    different bindings and the right half has no id to bind.
+
+    A clip with media is cut on its **source grid**: the cut lands on the unit
+    closest to ``at_ticks`` (half up), the two source windows stay contiguous and
+    both keep the clip's speed, so the frame the member sees is the frame the
+    mixer plays.
+    """
+
+    clip_id: str
+    at_ticks: int
+    new_clip_id: str = ''
+
+
+@dataclass(frozen=True)
+class SetStyle:
+    """Set per-role style overrides (merged into that role's current override).
+
+    Fields are the editable keys of ``template.default_styles()``; a field left out
+    keeps following the default.  Only the named fields change, so "字号变大" does
+    not reset a colour the member already chose.
+    """
+
+    role: str
+    fields: dict
+
+
+@dataclass(frozen=True)
+class ClearStyle:
+    """Drop one role's overrides so it follows the template defaults again."""
+
+    role: str
+
+
+COMMANDS = (MoveClip, MoveClips, TrimClip, SplitClip, SetMediaSlice, BindStart,
+            UnbindStart, SetStyle, ClearStyle)
 
 
 @dataclass(frozen=True)
@@ -248,6 +336,139 @@ def _unbind(project, command):
     return clips, True, (clip.id,), (note,)
 
 
+def _split(project, command):
+    """Cut one media layer in two; left keeps the id, right takes a new one."""
+    clip = _clip_or_fail(project, command.clip_id)
+    check = can_split(clip)
+    if not check.ok:
+        # The same code ``can_split`` hands the UI, so a disabled button and this
+        # refusal can never tell the member two different stories.
+        error = (ClipBoundError if check.code == ClipBoundError.code
+                 else SplitNotAllowedError)
+        raise error(check.reason, path='clip:%s' % clip.id,
+                    hint=_split_hint(clip.role))
+    start = clip.start.ticks
+    duration = clip.duration_ticks
+    if isinstance(command.at_ticks, bool) or not isinstance(command.at_ticks, int):
+        raise InvalidTimeError('the cut must be an integer tick count',
+                               path='clip:%s' % clip.id)
+    if duration is None:
+        raise InvalidTimeError(
+            'clip %s has no length yet, so there is nothing to cut'
+            % clip.id, path='clip:%s' % clip.id,
+            hint='先求解一次取得时长，或显式给它一个时长')
+    if not start < command.at_ticks < start + duration:
+        raise InvalidTimeError(
+            'the cut must fall strictly inside %s (%d..%d), not at %d'
+            % (clip.id, start, start + duration, command.at_ticks),
+            path='clip:%s' % clip.id,
+            hint='切口不能落在片段边界上；那等于移动或修剪，不是拆分')
+    new_id = command.new_clip_id or _free_split_id(project, clip.id)
+    if new_id == clip.id or project.clip(new_id) is not None:
+        raise DuplicateIdError('clip id %r is already used' % (new_id,),
+                               path='clip:%s' % new_id,
+                               hint='换一个 id，或留空让命令自己取一个')
+    left_ticks = command.at_ticks - start
+    right_ticks = start + duration - command.at_ticks
+    left = replace(clip, duration_ticks=left_ticks)
+    right = replace(clip, id=new_id, start=TimeExpr.at(command.at_ticks),
+                    duration_ticks=right_ticks)
+    if clip.source is not None:
+        # Cut on the source's own grid: the unit nearest the cut, half up, so the
+        # two windows stay contiguous and neither invents media.
+        cut_units = _source_units_at(clip.source, left_ticks)
+        if not 0 < cut_units < clip.source.source_units:
+            raise InvalidTimeError(
+                'the cut does not land inside the source window of %s' % clip.id,
+                path='clip:%s' % clip.id,
+                hint='源区间太短，按源网格切不出两段')
+        left = replace(left, source=replace(clip.source,
+                                            source_end=clip.source.source_start + cut_units))
+        right = replace(right, source=replace(
+            clip.source, source_start=clip.source.source_start + cut_units))
+    clips = []
+    for item in project.clips:
+        clips.append(left if item.id == clip.id else item)
+        if item.id == clip.id:
+            # The right half sits immediately after the clip it came from.
+            clips.append(right)
+    clip_ids = (clip.id, new_id)
+    notes = ('%s 拆成 %s 与 %s（各 %d / %d tick）'
+             % (clip.id, clip.id, new_id, left_ticks, right_ticks),)
+    return tuple(clips), True, clip_ids, notes
+
+
+def _split_hint(role):
+    if role in SPLITTABLE_ROLES:
+        return '先 UnbindStart 解绑，或给这个图层一个媒体源'
+    return '可拆分的角色：%s' % '、'.join(SPLITTABLE_ROLES)
+
+
+def _free_split_id(project, clip_id):
+    """A deterministic free id for the right half: ``<id>.2``, ``.3``, ..."""
+    number = 2
+    while project.clip('%s.%d' % (clip_id, number)) is not None:
+        number += 1
+    return '%s.%d' % (clip_id, number)
+
+
+def _source_units_at(source, delta_ticks):
+    """Source units ``delta_ticks`` of project time covers, half up.
+
+    ``unit_num / unit_den`` seconds per unit at playback speed ``speed``, so the
+    conversion is one exact rational rounded once — the same rule the rest of the
+    model uses for a boundary.
+    """
+    exact = (rational(delta_ticks) / TICKS_PER_SECOND) * rational(source.speed) \
+        * rational(source.unit_den) / rational(source.unit_num)
+    return half_up(exact)
+
+
+def _set_style(project, command):
+    if command.role not in STYLE_ROLES:
+        raise SchemaError('unknown style role %r' % (command.role,),
+                          path='style:%s' % command.role,
+                          hint='可用样式角色：%s' % '、'.join(STYLE_ROLES))
+    if not hasattr(command.fields, 'items'):
+        raise SchemaError('style fields must be a mapping',
+                          path='style:%s' % command.role)
+    swapped = sorted(set(command.fields) & set(STYLE_FONT_KEYS))
+    if swapped:
+        # Same refusal the document makes, but said here first so the message names
+        # the reason instead of "unknown field".
+        raise SchemaError('style %s cannot be set per project' % swapped[0],
+                          path='style:%s' % command.role,
+                          hint='字体仍走既有解析链（template.resolve_fonts），不在这里替换')
+    unknown = sorted(set(command.fields) - set(STYLE_KEYS))
+    if unknown:
+        raise SchemaError('unknown style field(s): %s' % ', '.join(unknown),
+                          path='style:%s' % command.role,
+                          hint='可用字段：%s' % '、'.join(STYLE_KEYS))
+    current = project.style(command.role)
+    merged = dict(current.fields) if current else {}
+    merged.update(command.fields)
+    updated = StyleOverride(role=command.role, fields=tuple(merged.items()))
+    if current == updated:
+        return project.styles, False, (), ()
+    styles = tuple(override for override in project.styles
+                   if override.role != command.role) + (updated,)
+    note = '%s 样式改为 %s（其余字段仍走默认）' % (
+        command.role, ', '.join('%s=%s' % pair for pair in updated.fields))
+    return styles, True, (), (note,)
+
+
+def _clear_style(project, command):
+    if command.role not in STYLE_ROLES:
+        raise SchemaError('unknown style role %r' % (command.role,),
+                          path='style:%s' % command.role,
+                          hint='可用样式角色：%s' % '、'.join(STYLE_ROLES))
+    if project.style(command.role) is None:
+        return project.styles, False, (), ()
+    styles = tuple(override for override in project.styles
+                   if override.role != command.role)
+    return styles, True, (), ('%s 恢复模板默认样式' % command.role,)
+
+
 def apply(project, command, expected_revision=None):
     """Apply one command and return the new revision (the old one is untouched)."""
     if not isinstance(project, Project):
@@ -262,6 +483,7 @@ def apply(project, command, expected_revision=None):
                 % (project.project_id, project.revision, expected_revision),
                 path='project',
                 hint='重新读取工程后再提交；过期修订不能覆盖新内容')
+    replaces_styles = isinstance(command, (SetStyle, ClearStyle))
     if isinstance(command, (MoveClip, MoveClips)):
         ids = ((command.clip_id,) if isinstance(command, MoveClip) else command.clip_ids)
         clips, moved, notes = _shift(project, ids, command.delta_ticks)
@@ -274,6 +496,12 @@ def apply(project, command, expected_revision=None):
         clips, changed, moved, notes = _bind(project, command)
     elif isinstance(command, UnbindStart):
         clips, changed, moved, notes = _unbind(project, command)
+    elif isinstance(command, SplitClip):
+        clips, changed, moved, notes = _split(project, command)
+    elif isinstance(command, SetStyle):
+        project_styles, changed, moved, notes = _set_style(project, command)
+    elif isinstance(command, ClearStyle):
+        project_styles, changed, moved, notes = _clear_style(project, command)
     else:
         raise UnknownCommandError('unsupported command %r' % type(command).__name__,
                                   path='command',
@@ -281,6 +509,12 @@ def apply(project, command, expected_revision=None):
                                        % '、'.join(item.__name__ for item in COMMANDS))
     if not changed:
         return CommandResult(project=project, command=command, changed=False)
+    if replaces_styles:
+        # A style override is document content, so it states the revision it needs
+        # (@3) exactly like adding an intro layer does.
+        return CommandResult(project=project.with_styles(project_styles,
+                                                         revision=project.revision + 1),
+                             command=command, changed=True, moved=moved, notes=notes)
     return CommandResult(project=project.with_clips(clips,
                                                     revision=project.revision + 1),
                          command=command, changed=True, moved=moved, notes=notes)

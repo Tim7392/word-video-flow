@@ -60,7 +60,7 @@ def test_the_document_kind_fields_and_numbers_are_strict(tmp_path, project):
         return path
 
     document = project.to_dict()
-    document['schema'] = 'wv-project@3'
+    document['schema'] = 'wv-project@4'
     with pytest.raises(SchemaError) as error:
         load_project(write(document))
     assert error.value.code == 'SCHEMA'

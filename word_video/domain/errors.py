@@ -121,6 +121,17 @@ class ClipBoundError(ProjectError):
     code = 'CLIP_BOUND'
 
 
+class SplitNotAllowedError(ProjectError):
+    """A clip whose role cannot be cut into two clips.
+
+    Raised before anything changes, so a UI that asks
+    :func:`word_video.application.commands.can_split` first never offers a button
+    that can only fail.
+    """
+
+    code = 'SPLIT_NOT_APPLICABLE'
+
+
 class StaleRevisionError(ProjectError):
     code = 'STALE_REVISION'
 
