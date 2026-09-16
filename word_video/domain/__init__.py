@@ -8,9 +8,10 @@ editable truth, ``RenderPlan``/``CuePlan`` the read-only derivations, and
 """
 from .compile import (IntroMeasurement, Solution, cue_plan, render_plan, resolve,
                       solve, sounding_items, speech_overlaps)
-from .errors import (AmbiguousRoleError, ClipBoundError, CycleError,
-                     DanglingRefError, DuplicateIdError, IntroMediaError,
-                     InvalidTimeError, MissingRoleError, ProjectError, SchemaError,
+from .errors import (AmbiguousRoleError, AssetFileError, ClipBoundError, CycleError,
+                     DanglingRefError, DuplicateAssetError, DuplicateIdError,
+                     IntroMediaError, InvalidTimeError, MissingAssetError,
+                     MissingRoleError, ProjectError, SchemaError,
                      SourceRangeError, StaleRevisionError, TeachingOrderError,
                      TeachingOverlapError, UnknownCommandError,
                      UnknownDurationError, UnsupportedRateError)
@@ -25,14 +26,14 @@ from .timebase import (TICKS_PER_SECOND, TimeExpr, ticks_to_microseconds,
                        ticks_to_milliseconds)
 
 __all__ = [
-    'AUDIO_ROLES', 'AmbiguousRoleError', 'CLIP_ROLES', 'CUE_ROLES', 'CUE_TRACKS',
-    'Clip', 'ClipBoundError', 'Conflict', 'Cue', 'CuePlan', 'CycleError',
+    'AUDIO_ROLES', 'AmbiguousRoleError', 'AssetFileError', 'CLIP_ROLES', 'CUE_ROLES',
+    'CUE_TRACKS', 'Clip', 'ClipBoundError', 'Conflict', 'Cue', 'CuePlan', 'CycleError',
     'DEFAULT_LESSON_TEMPLATE', 'DISPLAY_LAYERS', 'DanglingRefError', 'DisplayNode',
-    'DuplicateIdError', 'INTRO_ROLE', 'IntroMeasurement', 'IntroMediaError',
-    'InvalidTimeError', 'LessonTemplate', 'MediaInfo',
-    'MediaSlice', 'MissingRoleError', 'PROJECT_LAYERS', 'PlanItem', 'PlanSound',
-    'Project', 'ProjectError', 'Record', 'RenderPlan', 'SCHEMA', 'SCHEMA_V1',
-    'SCHEMAS', 'SchemaError', 'Solution',
+    'DuplicateAssetError', 'DuplicateIdError', 'INTRO_ROLE', 'IntroMeasurement',
+    'IntroMediaError', 'InvalidTimeError', 'LessonTemplate', 'MediaInfo',
+    'MediaSlice', 'MissingAssetError', 'MissingRoleError', 'PROJECT_LAYERS',
+    'PlanItem', 'PlanSound', 'Project', 'ProjectError', 'Record', 'RenderPlan',
+    'SCHEMA', 'SCHEMA_V1', 'SCHEMAS', 'SchemaError', 'Solution',
     'SourceRangeError', 'StageNode', 'StaleRevisionError', 'TICKS_PER_SECOND',
     'TEACHING_STAGES', 'TeachingOrderError', 'TeachingOverlapError', 'TimeExpr',
     'UnknownCommandError', 'UnknownDurationError', 'UnsupportedRateError',

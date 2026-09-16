@@ -77,6 +77,24 @@ class IntroMediaError(ProjectError):
     code = 'INTRO_MEDIA'
 
 
+class MissingAssetError(ProjectError):
+    """No registered asset carries the id a clip names."""
+
+    code = 'MISSING_ASSET'
+
+
+class DuplicateAssetError(ProjectError):
+    """Two registered assets carry the same id."""
+
+    code = 'DUPLICATE_ASSET'
+
+
+class AssetFileError(ProjectError):
+    """A registered asset's file is not where the registry says it is."""
+
+    code = 'ASSET_FILE_MISSING'
+
+
 class MissingRoleError(ProjectError):
     code = 'MISSING_ROLE'
 
