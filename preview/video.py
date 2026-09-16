@@ -272,11 +272,26 @@ class FfmpegFrameDecoder:
                 if self._request is request:
                     self._request = None
 
-    def _superseded(self, generation):
+    def _superseded(self, generation, spec=None):
+        """Is this run no longer what the caller wants?
+
+        The **spec** is compared, not just the generation.  A segmented picture
+        replaces its source file without a new generation (nothing is flushed and the
+        clock is untouched - that is what makes crossing a segment boundary a decoder
+        restart rather than a seek), and a run that kept going until its own file ended
+        would deliver frames from the old segment *after* the new segment had started -
+        frames the presentation step then shows out of order, which is a visible jump
+        backwards.  Comparing the spec makes "a request replaces the current one" true
+        for those replacements too.
+        """
         with self._condition:
             if not self._running:
                 return True
-            return self._request is None or self._request[0] != generation
+            if self._request is None:
+                return True
+            if self._request[0] != generation:
+                return True
+            return spec is not None and self._request[1] is not spec
 
     def _run(self, generation, spec):
         """Decode one item at one generation, looping the source when asked.
@@ -290,7 +305,7 @@ class FfmpegFrameDecoder:
         item = spec.offset_frames
         attempts = 0
         self.stats.runs += 1
-        while not self._superseded(generation):
+        while not self._superseded(generation, spec):
             if item >= spec.frames_needed:
                 return
             if spec.source_frames and not spec.loop and item >= spec.source_frames:
@@ -332,7 +347,7 @@ class FfmpegFrameDecoder:
                                       name='preview-read', daemon=True)
             reader.start()
             while True:
-                if self._superseded(generation):
+                if self._superseded(generation, spec):
                     return item, False
                 block = frames.get(timeout=self.stall_timeout)
                 if block is None:
