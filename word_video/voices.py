@@ -140,7 +140,7 @@ def discover(roots=None, progress=None):
                     'and nothing is ever substituted silently'}
 
 
-def as_role_map(chosen, roles=('female', 'male', 'chinese')):
+def as_role_map(chosen, roles=('female', 'male', 'chinese'), listing=None):
     """Turn a role -> id-or-name map into the role -> speaker map a request needs.
 
     Names are accepted because that is what the user recognises from the app; a
@@ -149,8 +149,13 @@ def as_role_map(chosen, roles=('female', 'male', 'chinese')):
     *service* decides entitlement - refusing it here would block a voice the user
     legitimately knows about but has not used on this machine yet.  An unknown
     name, on the other hand, is a typo and is reported with the available names.
+
+    ``listing`` lets a caller resolve against a catalogue it already holds (the
+    import flow's own scan of a chosen directory) instead of re-reading every
+    draft; the rules are identical, so there stays one definition of "which id
+    does this name mean" rather than two that drift apart.
     """
-    listing = discover()['voices']
+    listing = discover()['voices'] if listing is None else list(listing)
     by_speaker = {item['speaker']: item for item in listing}
     by_name = {}
     for item in listing:
