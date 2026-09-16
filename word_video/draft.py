@@ -44,6 +44,32 @@ def _load_library():
         keyframe=load('keyframe'), mix_mode=load('metadata.mix_mode_meta'))
 
 
+def _overlong_speech(item, source, actual, planned_us, manifest):
+    """Why one stage does not fit, in the terms the member can act on.
+
+    "Speech exceeds allocated timeline stage" named neither the word, the role, the
+    file nor the size of the problem, and the most common cause is not a broken
+    file at all: a *raw* recording handed to ``prepared_speech`` has not been
+    through the tempo pass, so it is longer than the stage reserved for it by
+    exactly the speed factor.  The message therefore leads with the measurements
+    and ends with the route that does apply the tempo (``provider.kind=local``).
+    """
+    planned_s = planned_us / 1e6
+    frames = item['duration_frames']
+    shortfall = actual - planned_s
+    # The speed that would make it fit; a ready-made number beats a diagnosis.
+    speed = actual / planned_s if planned_s > 0 else 0.0
+    return ('word %s %s: speech is %.3fs but the timeline reserved %.3fs '
+            '(%d frames at %s fps) - %.3fs too long, about %.2fx; '
+            'file %s; this usually means the audio was not tempo-adjusted to the '
+            'project speed (%.2fx). Reuse existing audio through '
+            'provider.kind=local, which measures and re-times the original for '
+            'you, instead of passing it as prepared_speech'
+            % (item.get('word_index'), item['role'], actual, planned_s, frames,
+               manifest.fps, shortfall, speed, source,
+               getattr(manifest, 'speed', 0.0) or 0.0))
+
+
 def export_draft(manifest, output_dir):
     """output_dir is a NEW draft folder, never an existing project."""
     target = Path(output_dir).resolve()
@@ -62,6 +88,10 @@ def export_draft(manifest, output_dir):
     for name in default_styles():
         refs[name] = script.append_track(lib.track.TrackSpec(lib.track.TrackType.text, name))
     us = lambda frame: (frame * 1000000 + manifest.fps // 2) // manifest.fps
+    # Plan items are counted in ticks (720000/s); the draft is built in frames, so a
+    # tick value is converted through frames before it becomes microseconds.  Doing
+    # it in one step is what keeps a background piece's segment inside its material.
+    frames_of = lambda ticks: (ticks * manifest.fps + 360000) // 720000
     copied = {}
     resources = stage / 'Resources'
     resources.mkdir()
@@ -95,18 +125,31 @@ def export_draft(manifest, output_dir):
         capacity = math.floor(bg.duration * manifest.fps / 1000000)
         if capacity < 1:
             raise ValueError('Background has no usable frame')
-        start = 0
-        while start < manifest.total_frames:
-            end = min(start + capacity, manifest.total_frames)
-            script.add_segment(lib.video.VideoSegment(bg, lib.timer.Timerange(us(start), us(end)-us(start)),
-                                                       volume=0), refs['背景'])
-            start = end
+        pieces = list(getattr(manifest, 'background_segments', ()) or ())
+        if pieces:
+            # A background the member cut in two: one editable segment per planned
+            # piece, on its own file and its own place on the one background track.
+            # Each piece loops inside itself exactly as the whole background did.
+            for piece in pieces:
+                material = lib.materials.VideoMaterial(material_file(piece['path']))
+                start = us(frames_of(piece['start_ticks']))
+                length = us(frames_of(piece['end_ticks'])) - start
+                script.add_segment(lib.video.VideoSegment(
+                    material, lib.timer.Timerange(start, length), volume=0), refs['背景'])
+        else:
+            start = 0
+            while start < manifest.total_frames:
+                end = min(start + capacity, manifest.total_frames)
+                script.add_segment(lib.video.VideoSegment(bg, lib.timer.Timerange(us(start), us(end)-us(start)),
+                                                           volume=0), refs['背景'])
+                start = end
         for item in manifest.audio:
             start = us(item['start_frame'])
             planned = us(item['start_frame'] + item['duration_frames']) - start
             source = Path(item['path']).resolve(strict=True)
-            if duration(source) > planned/1e6 + 1/manifest.fps:
-                raise ValueError('Speech exceeds allocated timeline stage')
+            actual = duration(source)
+            if actual > planned/1e6 + 1/manifest.fps:
+                raise ValueError(_overlong_speech(item, source, actual, planned, manifest))
             padded = resources / (uuid.uuid4().hex + '.wav')
             run([executable('ffmpeg'), '-v', 'error', '-nostdin', '-n', '-i', source,
                  '-af', f'apad,atrim=duration={planned/1e6:.9f}', '-ar', '48000',
@@ -115,7 +158,12 @@ def export_draft(manifest, output_dir):
             mat = lib.materials.AudioMaterial(str(padded))
             # MediaInfo rounds WAV duration to milliseconds; keep target time exact.
             if abs(mat.duration - planned) > 2000:
-                raise ValueError('Prepared audio duration disagrees with timeline')
+                raise ValueError(
+                    'prepared audio for word %s/%s disagrees with the timeline: the '
+                    'draft reports %.3fs where %d us (%.3fs) were allocated (%s); '
+                    'the file is %s'
+                    % (item.get('word_index'), item['role'], mat.duration / 1e6,
+                       planned, planned / 1e6, source, padded))
             mat.duration = max(mat.duration, planned)
             script.add_segment(lib.audio.AudioSegment(mat, lib.timer.Timerange(start, planned)), refs[item['role']])
         # One 片头音效 segment, from the single resolver the renderer uses too.

@@ -36,6 +36,7 @@ from ..storage.project_store import load_project
 from ..template import default_styles, font_name, resolve_fonts
 from . import ass as ass_export
 from . import srt as srt_export
+from .background import BackgroundError, background_segments, build_background_track
 from .catalog import CatalogError, load_catalog, measure_all
 from .plan import ProjectionError, SourceMedia, build_manifest
 
@@ -123,6 +124,44 @@ def _prepared(asset_id, asset_path, source, target_dir, rate=48000):
         partial.unlink(missing_ok=True)
 
 
+def _asset_source(base):
+    """Where this project's assets come from: the registry, else the catalogue.
+
+    One document is the goal, and it is A's ``assets.json`` (``wv-assets@1``): the
+    editor registers an asset once and both the solver and this exporter read it.
+    ``media.json`` (W02's catalogue) stays supported so a project built before the
+    registry existed keeps exporting; when both are present the registry wins, and
+    which one was read is reported rather than left to guesswork.
+    """
+    from ..storage.assets import ASSETS_FILENAME, AssetIndex
+
+    registry = Path(base) / ASSETS_FILENAME
+    if registry.is_file():
+        index = AssetIndex.load(base)
+        entries = {}
+        media = {}
+        for ref in index.refs:
+            entries[ref.asset_id] = _CatalogEntry(
+                asset_id=ref.asset_id, path=index.path(ref.asset_id),
+                voice=str(getattr(ref, 'voice', '') or ''))
+            if ref.media_info is not None:
+                media[ref.asset_id] = ref.media_info
+        return entries, media, True
+    assets = load_catalog(base)
+    return assets, measure_all(assets), False
+
+
+class _CatalogEntry:
+    """The two fields the exporter needs from an asset: where it is, whose voice."""
+
+    __slots__ = ('asset_id', 'path', 'voice')
+
+    def __init__(self, asset_id, path, voice=''):
+        self.asset_id = asset_id
+        self.path = path
+        self.voice = voice
+
+
 def export_run(project_path, *, output=None, run_name='', background=None,
                intro_video='', intro_audio='', video_codec='h264',
                slices=None, render=True, draft=True, progress=None):
@@ -142,8 +181,7 @@ def export_run(project_path, *, output=None, run_name='', background=None,
     base = base if base.is_dir() else base.parent
     if output is None:
         output = base / 'out'
-    assets = load_catalog(base)
-    media = measure_all(assets)
+    assets, media, from_registry = _asset_source(base)
     from ..application.intro import measure_project_intro
     from ..domain import solve
     # A project with an intro layer is measured from its own media; a project
@@ -163,17 +201,40 @@ def export_run(project_path, *, output=None, run_name='', background=None,
     speech_dir = run_dir / '.speech'
     sources = {}
     for clip in project.clips:
-        if clip.source is None or clip.role not in ('female', 'male', 'chinese'):
+        if clip.source is None:
             continue
-        asset = assets.get(clip.source.asset_id)
-        if asset is None:
-            raise CatalogError('clip %s needs asset %r, which the catalogue lacks'
-                               % (clip.id, clip.source.asset_id))
-        prepared = _prepared(clip.source.asset_id, asset.path, clip.source, speech_dir)
-        sources[clip.source.asset_id] = SourceMedia(path=str(prepared), voice=asset.voice)
+        if clip.role in ('female', 'male', 'chinese'):
+            asset = assets.get(clip.source.asset_id)
+            if asset is None:
+                raise CatalogError('clip %s needs asset %r, which the catalogue lacks'
+                                   % (clip.id, clip.source.asset_id))
+            prepared = _prepared(clip.source.asset_id, asset.path, clip.source,
+                                 speech_dir)
+            sources[clip.source.asset_id] = SourceMedia(path=str(prepared),
+                                                        voice=asset.voice)
+            continue
+        if clip.is_intro:
+            # The intro layer's measurement already resolved its media to a real
+            # file, and the intro is not looped by this exporter (the renderer does
+            # that), so the path is carried through as-is.
+            sources.setdefault(clip.source.asset_id,
+                               SourceMedia(path=clip.source.asset_id))
+            continue
+        # A picture layer (the background): carried through unchanged, because the
+        # background is looped by whoever renders it and needs no tempo pass.
+        sources.setdefault(clip.source.asset_id, SourceMedia(path=clip.source.asset_id))
     view = build_manifest(solution.render, project, sources, background=background or '',
                           intro_video=intro_video, intro_audio=intro_audio,
                           video_codec=video_codec, styles=styles)
+    # A background the member cut in two: every planned piece gets a file of its own,
+    # looped inside itself exactly like a whole background, and the manifest carries
+    # the pieces so the draft keeps one editable segment per planned item.  With one
+    # piece nothing changes at all (the red line for this feature).
+    pieces = background_segments(solution.render, sources)
+    if len(pieces) > 1:
+        view.background_segments = [
+            _background_piece(piece, index, run_dir, view)
+            for index, piece in enumerate(pieces, start=1)]
     timeline = run_dir / 'timeline.json'
     _atomic_json(timeline, view.to_dict())
 
@@ -242,6 +303,20 @@ def _publish_record(run_dir):
         raise ExportError('nothing was published in %s' % run_dir)
     return atomic_json(recorded, {'files': [{'path': str(path), 'sha256': sha256(path)}
                                             for path in published]})
+
+
+def _background_piece(piece, index, run_dir, view):
+    """One planned background item as its own looped file, plus its stage.
+
+    The file is built here rather than by the renderer because the *loop* belongs
+    to the item: each piece fills its own stage, so the assembled picture has no
+    hole and no repeat across the cut.  The returned dict is what the draft turns
+    into one editable segment per item.
+    """
+    target = Path(run_dir) / ('background-%d.mp4' % index)
+    build_background_track([piece], target, fps=view.fps,
+                           size=(view.width, view.height))
+    return dict(piece.to_dict(), path=str(target))
 
 
 def _atomic_json(path, value):
