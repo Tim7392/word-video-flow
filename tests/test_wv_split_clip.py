@@ -146,7 +146,7 @@ def test_un_deliverable_roles_are_refused_before_anything_changes():
     assert reasons['title'] == 'SPLIT_NOT_APPLICABLE'
     assert 'per-record' in can_split(project.clip('w1.female')).reason
     assert 'one window' in can_split(project.clip('layer.title')).reason
-    assert SPLITTABLE_ROLES == ('background', 'intro')
+    assert SPLITTABLE_ROLES == ('background',)
     # Nothing changed: the refusal is a refusal, not a partial edit.
     assert _ticks(project) == _ticks(background_project())
 
@@ -199,32 +199,31 @@ def test_undo_restores_the_single_clip_exactly():
     assert session.can_undo is True
 
 
-def test_splitting_an_intro_layer_stays_deliverable():
+def test_splitting_an_intro_layer_is_refused_like_the_exporter_refuses_it():
+    """A split intro could never be exported, so the button must be dead too.
+
+    The projection draws exactly one countdown stage and raises on a second
+    (``exporters/plan.py``); offering the split here would be a button whose only
+    outcome is an error at export time.
+    """
     project, measurement = intro_project()
+    check = can_split(project.clip('layer.intro'))
+    assert check.ok is False and check.code == 'SPLIT_NOT_APPLICABLE'
+    assert 'countdown' in check.reason
     total = project.clip('layer.intro').duration_ticks
-    cut = apply(project, SplitClip('layer.intro', total // 2)).project
-    assert {clip.id for clip in cut.clips if clip.role == 'intro'} == \
-        {'layer.intro', 'layer.intro.2'}
-    solution = solve(cut, golden_media(), measurement)
-    # Both halves carry the same sound verdict, and the plan lists both stages.
-    intro_items = [item for item in solution.render.video if item.role == 'intro']
-    assert [item.sound.source for item in intro_items] == ['FROM_CLIP', 'FROM_CLIP']
-    assert solution.render.intro_item.clip_id == 'layer.intro'
-    assert cue_plan(cut, golden_media(), measurement).total_ticks == \
-        solution.render.total_ticks
-    # The lesson body is untouched by cutting the countdown in two.
-    assert [item.start_ticks for item in solution.render.audio] == \
-        [item.start_ticks for item in solve(project, golden_media(),
-                                            measurement).render.audio]
+    with pytest.raises(SplitNotAllowedError) as error:
+        apply(project, SplitClip('layer.intro', total // 2))
+    assert error.value.path == 'clip:layer.intro'
+    assert 'set(SPLITTABLE_ROLES)' not in error.value.hint
+    assert 'background' in error.value.hint
+    # The intro still solves and projects exactly as before: nothing changed for it.
+    solution = solve(project, golden_media(), measurement)
+    assert [item.clip_id for item in solution.render.video if item.role == 'intro'] == \
+        ['layer.intro']
 
 
 def test_a_split_background_still_has_one_plan_item_per_half():
-    """The plan expresses both halves; a projection that reads only one must refuse.
-
-    B's manifest view has a single ``background`` field today, so this test states
-    the contract the plan offers (two items, contiguous) rather than pretending the
-    exporter already draws both.
-    """
+    """The plan expresses both halves, and the exporter draws both (B's W03 flip)."""
     project = background_project()
     total = project.clip('layer.background').duration_ticks
     split = apply(project, SplitClip('layer.background', total // 2)).project
