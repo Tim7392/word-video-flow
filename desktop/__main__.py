@@ -154,28 +154,30 @@ def window_facts(window, *, seconds_to_window):
 
     ``seconds_to_window`` is measured immediately after ``show()`` returns and Qt has
     processed its events, so it is *the member's* startup cost and nothing else.  The
-    import, the first preview and the delivery are timed separately: averaging them
-    into "startup" is how a slow first render gets reported as a slow editor.
+    import and the delivery are timed separately: averaging them into "startup" is how
+    a slow first render gets reported as a slow editor.
+
+    The preview facts are the **text** preview's (Tim 2026-09-17): there is no session,
+    no decoder and no timeline any more, and a report that still asked a session for
+    its open seconds would be describing a path the product no longer has.
     """
     diagnostics = window.diagnostics()
-    session = window.showing.session
+    preview = window.canvas.diagnostics() if window.canvas is not None else None
+    presentation = window.canvas.presentation() if window.canvas is not None else None
     return {'entry_to_window_seconds': round(seconds_to_window, 3),
             'window_shown': window.isVisible(),
             'window_title': window.windowTitle(),
             'window_size': [window.width(), window.height()],
             'canvas_present': window.canvas is not None,
-            'timeline': {'rows': diagnostics['timeline'].get('rows'),
-                         'bars': len(window.timeline.items()),
-                         'width': diagnostics['timeline'].get('width')},
-            'preview': {'has_session': diagnostics['has_session'],
-                        'open_seconds': None if session is None else session.open_seconds,
-                        'first_frame_seconds': None if session is None
-                                               else session.first_frame_seconds,
-                        'preparing': None if session is None else session.preparing,
-                        'segments': None if session is None
-                                    else (session.report().get('segments')),
-                        'canvas': None if session is None else '%dx%d' % (session.canvas_width,
-                                                                          session.canvas_height),
+            'timeline': None,
+            'preview': {'has_session': False,
+                        'text': None if preview is None else {
+                            'placements': preview.get('placements'),
+                            'paints': preview.get('paints'),
+                            'still': preview.get('still'),
+                            'still_error': preview.get('still_error')},
+                        'position_ticks': None if presentation is None
+                                          else presentation.position_ticks,
                         'error': diagnostics['preview_error']},
             'diagnostics': diagnostics}
 
