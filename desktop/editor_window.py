@@ -35,6 +35,7 @@ from . import editor_notices as notices
 from .editor_export import blocking_notices, export_folder
 from .editor_model import MODE_ADVANCED, MODE_TEMPLATE, EditorState
 from .editor_project import ProjectFolder
+from .legacy_dialog import LegacyDialog
 from .preview_canvas import PreviewCanvas
 from .timeline_widget import TimelineWidget
 
@@ -96,6 +97,10 @@ class EditorWindow(QtWidgets.QMainWindow):
         #: "which command did this gesture become" is the question a member's
         #: support call - and the acceptance measurement - actually asks.
         self.last_outcome = None
+        #: The last old-factory run (W10) and the word list it used, so the entry can
+        #: offer the same list again without asking the member to find it twice.
+        self.last_legacy = None
+        self._last_wordlist = ''
         self._build_ui()
         self._build_menus()
         if folder is not None:
@@ -280,6 +285,10 @@ class EditorWindow(QtWidgets.QMainWindow):
         file_menu.addSeparator()
         self.action_save = file_menu.addAction('保存', self.save, 'Ctrl+S')
         self.action_export = file_menu.addAction('导出三产物', self.export, 'Ctrl+E')
+        file_menu.addSeparator()
+        # The old factory is a different clock, so it is a differently named entry and
+        # never a mode of "导出三产物": the dialog it opens says which clock it is on.
+        self.action_legacy = file_menu.addAction('旧字幕工厂（文字规则计时）…', self.choose_legacy)
         file_menu.addSeparator()
         file_menu.addAction('退出', self.close)
         edit_menu = self.menuBar().addMenu('编辑')
@@ -761,11 +770,12 @@ class EditorWindow(QtWidgets.QMainWindow):
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
-        if self.state is None:
+        if self.state is None and not extra:
             return ()
         found = list(extra)
-        found += list(self.folder.diagnostics(self.state.project))
-        found += list(self.state.document_notices())
+        if self.state is not None:
+            found += list(self.folder.diagnostics(self.state.project))
+            found += list(self.state.document_notices())
         seen, unique = set(), []
         for notice in found:
             key = (notice.code, notice.clip_id, notice.message)
@@ -924,7 +934,7 @@ class EditorWindow(QtWidgets.QMainWindow):
                 code='EXPORT_OK',
                 message='三产物已发布：%s（%.1fs）' % (outcome.run_dir, outcome.seconds),
                 severity=notices.SEVERITY_INFO,
-                hint='MP4 + 五轨 SRT + 可编辑剪映草稿',
+                hint='MP4 + 五轨 SRT + 可编辑剪映草稿（新口径：按音频实际时长）',
                 actions=(notices.Action(notices.ACTION_OPEN_FOLDER, '打开输出目录',
                                         path=outcome.run_dir),),
                 detail=outcome.to_dict()))
@@ -938,6 +948,96 @@ class EditorWindow(QtWidgets.QMainWindow):
 
     def last_notice_texts(self):
         return tuple(notice.headline() for notice in getattr(self, '_last_notices', ()))
+
+    # ------------------------------------------- 旧字幕工厂入口（W10，不改旧核心）
+    def media_caliber_block(self):
+        """The **new** clock's real numbers for what is open, from the engine's plan.
+
+        Read off ``RenderPlan.total_ticks`` and converted with the time core's own
+        function: the dialog must be able to show both clocks' numbers without a
+        second way of computing either of them.
+        """
+        from legacy_adapter import caliber, missing_plan_block
+
+        if self.state is None or self.folder is None:
+            return missing_plan_block('还没有打开工程')
+        plan = self.state.plan()
+        if plan is None:
+            return missing_plan_block('当前工程的时间线无法求解：%s'
+                                      % (self.showing.preview_error
+                                         or self.state.plan_error or ''))
+        from word_video.domain.timebase import ticks_to_milliseconds
+
+        block = dict(caliber('media-actual'))
+        block.update({'available': True, 'reason': '',
+                      'timeline': str(self.folder.project_path),
+                      'measured': {'total_duration_ms': ticks_to_milliseconds(plan.total_ticks),
+                                   'total_ticks': plan.total_ticks, 'items': len(plan.video),
+                                   'word_count': len(self.state.project.records),
+                                   'source': '本工程当前计划（RenderPlan.total_ticks）'}})
+        return block
+
+    def legacy_dialog(self, **values):
+        """The old-factory dialog, wired to this window's own numbers and notices."""
+        known = {key: values[key] for key in
+                 ('wordlist', 'output', 'start', 'end', 'batch_size', 'first_six', 'extra')
+                 if key in values}
+        known.setdefault('wordlist', self._last_wordlist)
+        return LegacyDialog(self, media_caliber=self.media_caliber_block(),
+                            report=(self.last_legacy or {}).get('report'),
+                            on_outcome=self._on_legacy_finished, **known)
+
+    def choose_legacy(self):
+        """Menu action: open the entry; the dialog runs the old core on its button."""
+        dialog = self.legacy_dialog()
+        dialog.show()
+        dialog.exec()
+        return dialog.last_outcome
+
+    def run_legacy(self, mapping=None, *, wait=True):
+        """The same dialog driven without a member (support call, scripted evidence).
+
+        It is the dialog's own ``run`` that is called, so a scripted run is evidence
+        about the member's route rather than about a second implementation of it.
+        """
+        mapping = dict(mapping or {})
+        dialog = self.legacy_dialog(**mapping)
+        dialog.show()
+        try:
+            return dialog.run(wait=wait)
+        finally:
+            dialog.close()
+
+    def _on_legacy_finished(self, outcome):
+        """One notice card: what the old clock produced, or why it refused."""
+        if outcome.get('ok'):
+            report = outcome['report']
+            counts = report['counts']
+            if report['request']['wordlist']:
+                self._last_wordlist = report['request']['wordlist']
+            notice = notices.Notice(
+                code='LEGACY_TRACKS_OK',
+                message='旧口径（文字规则）已生成 %s 包 / %s 个文件：%s'
+                        % (counts['package_count'], counts['file_count'], report['directory']),
+                severity=notices.SEVERITY_INFO,
+                hint='这五轨按文字规则计时；与“导出三产物”（按音频实际时长）不是同一口径',
+                actions=(notices.Action(notices.ACTION_OPEN_FOLDER, '打开输出目录',
+                                        path=report['directory']),),
+                detail={'caliber': report['caliber'], 'counts': counts,
+                        'media_caliber': report['media_caliber']})
+            self.status.showMessage('旧入口完成：%s' % report['directory'])
+        else:
+            error = outcome.get('error') or {}
+            notice = notices.Notice(
+                code=error.get('code') or 'LEGACY_FAILED',
+                message='旧入口失败：%s' % (error.get('message') or ''),
+                severity=notices.SEVERITY_BLOCK,
+                hint=error.get('hint') or '旧核心本身没有被改动：修好输入再点一次即可',
+                detail=error.get('details') or {})
+            self.status.showMessage('旧入口失败：%s' % (error.get('code') or ''))
+        self.last_legacy = outcome
+        self.refresh_notices(extra=(notice,))
+        return notice
 
     # ------------------------------------------------------------- dialogs
     def choose_open(self):
@@ -1006,4 +1106,23 @@ class EditorWindow(QtWidgets.QMainWindow):
                 'timeline': self.timeline.diagnostics(),
                 'notices': [notice.code for notice in getattr(self, '_last_notices', ())],
                 'exporting': self._exporting,
+                'legacy': self.legacy_diagnostics(),
                 'scale': self.devicePixelRatioF()}
+
+    def legacy_diagnostics(self):
+        """Which clock the old entry is on, and what the last run did (W10)."""
+        from legacy_adapter import CALIBER_LEGACY, CALIBER_MEDIA
+
+        outcome = self.last_legacy or {}
+        report = outcome.get('report') or {}
+        return {'caliber': CALIBER_LEGACY, 'export_caliber': CALIBER_MEDIA,
+                'last_ok': (None if not self.last_legacy else bool(outcome.get('ok'))),
+                'last_code': (None if not self.last_legacy
+                              else 'LEGACY_TRACKS_OK' if outcome.get('ok')
+                              else (outcome.get('error') or {}).get('code')),
+                'last_output': (None if not self.last_legacy else outcome.get('output')),
+                'packages': (report.get('counts') or {}).get('package_count'),
+                'files': (report.get('counts') or {}).get('file_count'),
+                'wordlist': self._last_wordlist,
+                'media_caliber_available': bool(
+                    (self.media_caliber_block() or {}).get('available'))}

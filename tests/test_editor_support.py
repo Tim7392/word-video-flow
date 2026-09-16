@@ -6,7 +6,7 @@ instead of three drifting fixtures.
 
 Two deliberate choices:
 
-* **the folder is a real folder.**  ``project.json``, ``media.json`` and
+* **the folder is a real folder.**  ``project.json``, ``assets.json`` and
   ``delivery.json`` are written by the same code the member's editor writes, and
   the audio is real 48 kHz WAV on disk, because "the edit survived a save and a
   reopen" and "the missing file is reported" cannot be tested against an
@@ -105,8 +105,8 @@ def tiny_folder(folder, *, count=1, seconds=1.0, speed=1.25, delivery=None,
 
     The returned object is the same :class:`~desktop.editor_project.ProjectFolder`
     the window opens, so a test and the member are looking at the same files: a
-    ``project.json``, A's ``assets.json`` registry, B's ``media.json`` catalogue and
-    the delivery sidecar, all written by the same code the editor uses.
+    ``project.json``, A's ``assets.json`` registry (the one document that names an
+    asset) and the delivery sidecar, all written by the same code the editor uses.
     """
     from word_video.application import instantiate
     from word_video.domain.model import Project, Record
