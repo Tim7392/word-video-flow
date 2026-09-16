@@ -18,6 +18,49 @@ from pathlib import Path
 
 FONT_ROLES = ('heading', 'footer', 'bold', 'heavy', 'arial')
 
+#: How many pixels of the 2160-high reference canvas one Jianying draft text unit is
+#: worth.  **Calibrated against a physical sample, not guessed** (B-9):
+#:
+#: * sample: the delivered 251-300 draft, opened in Jianying 11.4, which rendered its
+#:   own ``draft_cover.jpg`` at 1920x1080 (kept at
+#:   ``runtime/tmp/A/drafts/production-251-300/draft_cover.jpg``; our side is frame 0
+#:   of the delivered ``0251-0300/video/video.mp4``);
+#: * measured ink heights of the three furniture layers - title 94 / subtitle 72 /
+#:   footer 51 px in Jianying against 126 / 93 / 69 px in our own frame for the same
+#:   strings and fonts (ratio 1.34 / 1.29 / 1.35);
+#: * the drafts were writing ``size / 35``; the ratio says the unit is ``size / 26``
+#:   (13 px at 1080).  The three layers span two faces, and a font's own ink-per-em
+#:   ratio cancels out of that comparison (ours = size * H/2160 * r, theirs =
+#:   draft_size * k * r), so the constant belongs to the *unit*, not to a face;
+#: * the measurement pins k to 25.6..26.4 px per unit; any value in (25.3, 28.0]
+#:   rounds those three layers to the same integers, so 26 is both the middle of the
+#:   measured range and stable against measurement noise.
+#:
+#: One unit is an integer in Jianying's own field, so a style size quantises to
+#: +/-1 unit = at most ~2% of ink height; the three calibrated layers land within
+#: 1.5% of our video after this mapping.
+DRAFT_REFERENCE_PX_PER_UNIT = 26.0
+
+
+def draft_text_size(size):
+    """The text size to write into a Jianying draft for a style ``size``.
+
+    The single implementation of ``size -> draft_size``: the draft exporter calls it
+    for every text layer (so a project's own size reaches the draft) and the preset
+    below uses it instead of carrying a second, hand-kept number.
+    """
+    return max(1, int(round(float(size) / DRAFT_REFERENCE_PX_PER_UNIT)))
+
+
+def style_size(draft_size):
+    """The inverse of :func:`draft_text_size`, for reading a draft back in.
+
+    An importer that finds ``size`` in a Jianying draft needs our own style size to
+    store it: the two directions live here together so they cannot drift apart.
+    """
+    return max(1, int(round(float(draft_size) * DRAFT_REFERENCE_PX_PER_UNIT)))
+
+
 # (font file name, Jianying effect id) in preference order per role.
 _FONT_CANDIDATES = {
     'heading': (('喜鹊古字典体(字节试用版).ttf', '7035911487646339598'),
