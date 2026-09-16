@@ -65,12 +65,15 @@ def build_parser():
     parser.add_argument('--out', default=None, help='output directory')
     parser.add_argument('--run', default='', help='run folder name inside --out')
     parser.add_argument('--background', default=None,
-                        help='background media for this delivery')
+                        help='background media for this delivery; omitted follows the '
+                             'project delivery settings (delivery.json)')
     parser.add_argument('--intro-video', default='',
                         help='reference countdown clip (its own sound wins)')
     parser.add_argument('--intro-audio', default='',
                         help='intro sound when the clip has none')
-    parser.add_argument('--codec', default='h264', choices=('h264', 'h265'))
+    parser.add_argument('--codec', default=None, choices=('h264', 'h265'),
+                        help='render codec; omitted follows the project delivery '
+                             'settings (delivery.json), then h264')
     parser.add_argument('--slices', type=int, default=None,
                         help='render slices; 1 forces one ffmpeg process')
     parser.add_argument('--no-video', action='store_true',

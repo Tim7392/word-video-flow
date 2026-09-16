@@ -1,4 +1,4 @@
-"""Create genuinely editable drafts without importing the Windows UI controller."""
+﻿"""Create genuinely editable drafts without importing the Windows UI controller."""
 import importlib
 import importlib.metadata
 import importlib.util
@@ -14,6 +14,7 @@ import types
 import uuid
 import wave
 
+from .domain.errors import ProjectError
 from .media import (atomic_json, duration, executable, resolve_intro_audio, run,
                     wav_duration)
 from .template import default_styles, text_events
@@ -22,6 +23,12 @@ from .template import default_styles, text_events
 #: only writes a small PCM file, so the cost is the process, not the work: 151 of
 #: them in a row measured 9-11 s of a 44 s draft stage on the 50-word lesson.
 AUDIO_WORKERS = min(8, os.cpu_count() or 4)
+
+
+class DraftMediaError(ProjectError):
+    """A delivery input the draft has to copy is empty or is not a file."""
+
+    code = 'DRAFT_MEDIA_MISSING'
 
 
 def _has_audio(path):
@@ -127,22 +134,44 @@ def export_draft(manifest, output_dir):
     copied = {}
     resources = stage / 'Resources'
     resources.mkdir()
-    def material_file(source):
-        source = Path(source).resolve(strict=True)
+    def material_file(source, field='media'):
+        """Copy one delivery input into the draft, refusing an unusable one by name.
+
+        ``Path('')`` is the *current working directory*: an empty field used to reach
+        ``shutil.copy2`` and come back as ``PermissionError: [Errno 13]`` on a folder
+        - a message about the cwd instead of about the missing setting (H0
+        reproduced it through a project whose delivery background was empty).  The
+        field is named here, so the refusal says which input is missing, and the
+        primary check in ``export_run`` refuses even earlier with A's own wording.
+        """
+        text = str(source or '').strip()
+        if not text:
+            raise DraftMediaError(
+                'the draft has no %s to copy: the field is empty, and an empty path '
+                'is the current working directory (copying it fails on a folder)'
+                % field, path='draft:%s' % field,
+                hint='在编辑器里设置交付背景，或给 --background 一个存在的视频文件')
+        path = Path(text)
+        if not path.is_file():
+            raise DraftMediaError(
+                'the draft cannot copy %s: %s is not a file' % (field, path),
+                path='draft:%s' % field,
+                hint='给出一个存在的文件（当前：%s）' % text)
+        source = path.resolve(strict=True)
         if source not in copied:
             dest = resources / (uuid.uuid4().hex + source.suffix)
             shutil.copy2(source, dest)
             copied[source] = str(dest)
         return copied[source]
     try:
-        bg = lib.materials.VideoMaterial(material_file(manifest.background))
+        bg = lib.materials.VideoMaterial(material_file(manifest.background, 'background'))
         # The intro lives on its own track above the background.  Keeping it off
         # the background track is what lets the background start at frame 0,
         # exactly as the rendered MP4 draws it: a transparent countdown is
         # composited *over* a background that is already running.
         if manifest.intro_video and manifest.intro_frames > 0:
             intro_material = lib.materials.VideoMaterial(
-                material_file(manifest.intro_video))
+                material_file(manifest.intro_video, 'intro_video'))
             length = min(us(manifest.intro_frames), intro_material.duration)
             segment = lib.video.VideoSegment(
                 intro_material, lib.timer.Timerange(0, length))
@@ -163,7 +192,7 @@ def export_draft(manifest, output_dir):
             # piece, on its own file and its own place on the one background track.
             # Each piece loops inside itself exactly as the whole background did.
             for piece in pieces:
-                material = lib.materials.VideoMaterial(material_file(piece['path']))
+                material = lib.materials.VideoMaterial(material_file(piece['path'], 'background'))
                 start = us(frames_of(piece['start_ticks']))
                 wanted = us(frames_of(piece['end_ticks'])) - start
                 # The piece file is built to the frame the plan asks for, so these
@@ -260,7 +289,7 @@ def export_draft(manifest, output_dir):
                     segment.add_keyframe(prop,0,a)
                     segment.add_keyframe(prop,min(150000,us(end)-us(start)),b)
             script.add_segment(segment, refs[name])
-            text_fonts[segment.material_id] = material_file(style['font'])
+            text_fonts[segment.material_id] = material_file(style['font'], 'font')
         content = json.loads(script.dumps())
         for text in content['materials']['texts']:
             font = text_fonts[text['id']]
