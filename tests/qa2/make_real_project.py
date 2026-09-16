@@ -50,6 +50,8 @@ def main(argv=None):
     parser.add_argument('--range', default='151-153')
     parser.add_argument('--project', default='p1')
     parser.add_argument('--background', default=None)
+    parser.add_argument('--no-delivery', dest='no_delivery', action='store_true',
+                        help='不写 delivery.json：用于判"没有交付设置"时的拒绝面')
     parser.add_argument('--fps', type=int, default=30)
     parser.add_argument('--width', type=int, default=320)
     parser.add_argument('--height', type=int, default=180)
@@ -122,16 +124,27 @@ def main(argv=None):
     delivery = {'schema': 'wv-delivery@1', 'video_codec': 'h265',
                 'background': str(Path(args.background).resolve()) if args.background
                 else '', 'fps': args.fps, 'width': args.width, 'height': args.height}
-    (folder / 'delivery.json').write_text(json.dumps(delivery, ensure_ascii=False,
-                                                     indent=1), encoding='utf-8')
+    if getattr(args, 'no_delivery', False):
+        # A project with no delivery settings at all.  This is the shape the
+        # refusal path has to be judged on: `batch plan` inherits a project's
+        # delivery.json when one exists, so a project that carries a background is
+        # *supposed* to be ready without --background.
+        target = folder / 'delivery.json'
+        if target.exists():
+            target.unlink()
+        delivery = None
+    else:
+        (folder / 'delivery.json').write_text(json.dumps(delivery, ensure_ascii=False,
+                                                         indent=1), encoding='utf-8')
 
     report = {'project': str(folder), 'records': len(records),
               'assets': len(assets), 'media_files': len(list((folder / 'media').iterdir())),
               'clips': len(document['clips']), 'range': args.range,
               'words': [entry['word'] for entry in entries],
-              'background': delivery['background'],
+              'delivery_json': bool(delivery),
+              'background': delivery['background'] if delivery else None,
               'background_exists': Path(delivery['background']).exists()
-              if delivery['background'] else None}
+              if delivery and delivery['background'] else None}
     print(json.dumps(report, ensure_ascii=False, indent=1))
     return 0
 
