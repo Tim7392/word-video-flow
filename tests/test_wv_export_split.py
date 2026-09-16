@@ -233,12 +233,19 @@ class SplitBackgroundTests(unittest.TestCase):
 
 
 class SplitIntroTests(unittest.TestCase):
-    """A split intro is refused, not half-drawn."""
+    """A split intro is refused, not half-drawn.
+
+    The state is built by hand rather than with ``SplitClip``: A tightened
+    ``SPLITTABLE_ROLES`` to the background only, so the command refuses to create
+    two intro items at all - which is better, because a member never reaches an
+    unexportable project.  The projection still has to answer for a document that
+    carries them (an older build, or a hand edit), and it answers by name.
+    """
 
     def test_two_intro_items_are_refused_by_name(self):
         from dataclasses import replace
 
-        from word_video.domain import IntroMeasurement
+        from word_video.domain import IntroMeasurement, TimeExpr
 
         clip = 'D:/fixtures/intro.mp4'
         measurement = IntroMeasurement(asset_id=clip, seconds=1.0, sound_asset=clip,
@@ -249,7 +256,15 @@ class SplitIntroTests(unittest.TestCase):
             replace(DEFAULT_LESSON_TEMPLATE, intro=True), (record,), _media([record]),
             Project(project_id='split-intro', intro_s=2.0, fps_num=30),
             intro=MediaSlice(clip, 0, 48000), intro_measure=measurement)
-        project = apply(project, SplitClip('layer.intro', 360000)).project
+        layer = project.clip('layer.intro')
+        half = layer.duration_ticks // 2
+        second = replace(layer, id='layer.intro.2',
+                         start=TimeExpr.at(layer.start.ticks + half),
+                         duration_ticks=layer.duration_ticks - half)
+        project = project.with_clips(tuple(
+            replace(item, duration_ticks=half) if item.id == 'layer.intro' else item
+            for item in project.clips) + (second,))
+        self.assertEqual(2, len([item for item in project.clips if item.role == 'intro']))
         solution = solve(project, _media([record]), measurement)
         with self.assertRaises(ProjectionError) as caught:
             build_manifest(solution.render, project, _sources([record]),
