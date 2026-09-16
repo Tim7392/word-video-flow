@@ -28,7 +28,7 @@ import wave
 from .core import probe
 
 __all__ = ['audio_stream', 'video_stream', 'audio_sample_count', 'audio_pts',
-           'stream_facts']
+           'stream_facts', 'video_stream_seconds']
 
 
 def _streams(path):
@@ -119,6 +119,34 @@ def audio_pts(path):
     return {'start_s': seconds, 'time_base_denominator': base,
             'start_sample': (int(round(seconds * _rate(stream)))
                              if seconds and stream.get('sample_rate') else 0)}
+
+
+def video_stream_seconds(path):
+    """Duration of the *video stream*, which may be shorter than the container.
+
+    A clip whose audio outruns its picture still reports the longer container
+    length, so reading the container alone would miss a truncated countdown.  The
+    fallback order matters: the stream's own duration first, then its frame count
+    over its rate, then the container.
+
+    It lives beside the other stream facts rather than in the timing module because
+    two callers need it - the verified engine's intro length and the project's
+    ``measure_intro`` - and a second implementation of "how long is this picture"
+    is exactly the drift this package exists to prevent.
+    """
+    from .core import duration
+
+    for stream in _streams(path):
+        if stream.get('codec_type') != 'video':
+            continue
+        if stream.get('duration'):
+            return float(stream['duration'])
+        if stream.get('nb_frames'):
+            rate = stream.get('avg_frame_rate') or stream.get('r_frame_rate') or '0/1'
+            number, _, denominator = str(rate).partition('/')
+            if float(denominator or 1) and float(number):
+                return float(stream['nb_frames']) / (float(number) / float(denominator))
+    return duration(path)
 
 
 def stream_facts(path):
