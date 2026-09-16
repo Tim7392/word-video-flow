@@ -25,6 +25,30 @@ def _canonical(value):
 
 
 @dataclass(frozen=True)
+class PlanSound:
+    """The one file that sounds with a layer, and the verdict behind that choice.
+
+    ``source`` is echoed verbatim from the single resolver
+    (``word_video.media.resolve_intro_audio``); the planner never decides which
+    file wins, it records what the resolver answered.  ``asset_id`` is empty when
+    nothing sounds, and ``fallback_asset`` is the standalone audio the project
+    declared for this layer (empty when it declared none).
+    """
+
+    asset_id: str = ''
+    fallback_asset: str = ''
+    source: str = ''
+
+    @property
+    def silent(self):
+        return not self.asset_id
+
+    def to_dict(self):
+        return {'asset_id': self.asset_id, 'fallback_asset': self.fallback_asset,
+                'source': self.source}
+
+
+@dataclass(frozen=True)
 class PlanItem:
     """One solved clip: absolute range plus everything a consumer needs."""
 
@@ -35,6 +59,7 @@ class PlanItem:
     end_ticks: int
     text: str = ''
     source: MediaSlice | None = None
+    sound: PlanSound | None = None
 
     @property
     def duration_ticks(self):
@@ -44,11 +69,16 @@ class PlanItem:
     def is_speech(self):
         return self.source is not None and self.role in ('female', 'male', 'chinese')
 
+    @property
+    def is_intro(self):
+        return self.role == 'intro'
+
     def to_dict(self):
         return {'clip_id': self.clip_id, 'role': self.role, 'record_id': self.record_id,
                 'start_ticks': self.start_ticks, 'end_ticks': self.end_ticks,
                 'text': self.text,
-                'source': self.source.to_dict() if self.source else None}
+                'source': self.source.to_dict() if self.source else None,
+                'sound': self.sound.to_dict() if self.sound else None}
 
 
 @dataclass(frozen=True)
@@ -92,6 +122,19 @@ class RenderPlan:
     def item(self, clip_id):
         for item in self.video + self.audio:
             if item.clip_id == clip_id:
+                return item
+        return None
+
+    @property
+    def intro_item(self):
+        """The solved intro stage, or ``None`` when the lesson has no intro layer.
+
+        Everything a consumer needs is on it: the video asset in ``source``, the
+        stage length in ``start_ticks``/``end_ticks``, and which file sounds plus
+        the resolver's verdict in ``sound``.
+        """
+        for item in self.video:
+            if item.is_intro:
                 return item
         return None
 

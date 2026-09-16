@@ -138,7 +138,7 @@ def test_document_refuses_bad_numbers_bad_versions_and_unknown_fields(project):
     with pytest.raises(InvalidTimeError):
         Project(project_id='p', width=0)
     with pytest.raises(SchemaError) as error:
-        Project(project_id='p', schema='wv-project@2')
+        Project(project_id='p', schema='wv-project@3')
     assert error.value.code == 'SCHEMA'
 
     document = project.to_dict()

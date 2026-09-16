@@ -11,10 +11,11 @@ Clip ids are stable (``<record_id>.<role>``), which is what lets a later
 template upgrade match the clips a user already edited.
 """
 from ..domain.compile import media_table
-from ..domain.errors import SchemaError, UnknownDurationError
+from ..domain.errors import IntroMediaError, SchemaError, UnknownDurationError
 from ..domain.lesson import LessonTemplate
-from ..domain.model import Clip, MediaSlice, Project, check_duplicate_ids
-from ..domain.rhythm import stage_duration_ticks
+from ..domain.model import (INTRO_ROLE, SCHEMA, Clip, MediaSlice, Project,
+                            check_duplicate_ids)
+from ..domain.rhythm import intro_ticks, stage_duration_ticks
 from ..domain.timebase import TimeExpr
 
 
@@ -27,11 +28,18 @@ def asset_id_for(record_id, role, asset_ids=None):
     return '%s:%s' % (record_id, role)
 
 
-def expand(template, records, media, base, *, background=None, asset_ids=None):
+def expand(template, records, media, base, *, background=None, intro=None,
+           intro_audio='', intro_measure=None, asset_ids=None):
     """Expand ``template`` for ``records`` into clips placed on ``base``'s grid.
 
     Split out from :func:`instantiate` so a later explicit template upgrade can
     reuse the same rhythm and the same ids instead of writing a second expander.
+
+    ``intro`` (a :class:`~word_video.domain.model.MediaSlice`) is the reference
+    countdown clip and ``intro_measure`` is its measurement from
+    :func:`word_video.application.intro.measure_intro`.  Both are needed together:
+    the stage the lesson reserves in front of the body is the *media's* length, so
+    a template's ``intro_s`` can never contradict the clip that will play.
     """
     if not isinstance(template, LessonTemplate):
         raise SchemaError('instantiate needs a LessonTemplate', path='template')
@@ -44,8 +52,13 @@ def expand(template, records, media, base, *, background=None, asset_ids=None):
     check_duplicate_ids(records, ())
     table = media_table(media)
     base.frame_ticks  # refuse a frame rate the tick base cannot express
-    cursor = base.intro_ticks
+    if intro is not None and base.schema != SCHEMA:
+        # An intro layer is what wv-project@2 exists for, and a @1 document may not
+        # hold one, so the revision is stated before the clips are built rather
+        # than patched in afterwards.
+        base = base.with_schema(SCHEMA)
     clips = []
+    cursor = _intro_slot(template, base, intro, intro_audio, intro_measure, clips)
     for record in records:
         phone = 'record:%s' % record.id
         stages = {}
@@ -93,7 +106,44 @@ def expand(template, records, media, base, *, background=None, asset_ids=None):
         clips.append(Clip(id='layer.background', role='background',
                           start=TimeExpr.at(0), duration_ticks=total,
                           source=background))
-    return base.with_records(records).with_clips(clips)
+    project = base.with_records(records).with_clips(clips)
+    return project
+
+
+def _intro_slot(template, base, intro, intro_audio, intro_measure, clips):
+    """Create the intro layer when the template has one; return the body's start.
+
+    A template that declares an intro layer and a caller that supplies no media are
+    a mismatch, and so are media without a measurement: both are refused rather
+    than resolved by guessing.  Without an intro layer the body starts at
+    ``base.intro_ticks`` (the legacy ``intro_s`` slot), exactly as before.
+    """
+    if intro is None:
+        if template.intro:
+            raise SchemaError('the template has an intro layer but no intro media',
+                              path='request',
+                              hint='实例化时给出片头素材（intro=），或改用不含片头的模板')
+        return base.intro_ticks
+    if not template.intro:
+        raise SchemaError('the template has no intro layer', path='request',
+                          hint='先用含片头的模板实例化，或去掉片头素材')
+    if not isinstance(intro, MediaSlice):
+        raise SchemaError('intro must be a MediaSlice', path='request')
+    if intro_measure is None:
+        raise IntroMediaError(
+            'the intro layer has no measurement', path='clip:layer.intro',
+            hint='先测量片头素材（word_video.application.intro.measure_intro）：'
+                 '片头时长只能来自媒体')
+    if intro_measure.asset_id != intro.asset_id:
+        raise IntroMediaError(
+            'the measurement is for %r but the intro media is %r'
+            % (intro_measure.asset_id, intro.asset_id), path='clip:layer.intro',
+            hint='换了素材就要重新测量')
+    duration = intro_ticks(intro_measure.seconds, base.fps_num, base.fps_den)
+    clips.append(Clip(id='layer.intro', role=INTRO_ROLE, start=TimeExpr.at(0),
+                      duration_ticks=duration, source=intro,
+                      audio_asset=str(intro_audio or '')))
+    return duration
 
 
 def _numbering(records):
@@ -103,7 +153,8 @@ def _numbering(records):
     return 1, len(records)
 
 
-def instantiate(template, records, media, base, *, background=None, asset_ids=None):
+def instantiate(template, records, media, base, *, background=None, intro=None,
+                intro_audio='', intro_measure=None, asset_ids=None):
     """Create a new project from a template; only valid on an empty document."""
     if not isinstance(base, Project):
         raise SchemaError('instantiate needs a Project as its settings carrier',
@@ -112,5 +163,6 @@ def instantiate(template, records, media, base, *, background=None, asset_ids=No
         raise SchemaError('instantiate only expands into an empty project',
                           path='project',
                           hint='模板展开只发生在创建或显式升级时，不会覆盖已有片段')
-    return expand(template, records, media, base, background=background,
+    return expand(template, records, media, base, background=background, intro=intro,
+                  intro_audio=intro_audio, intro_measure=intro_measure,
                   asset_ids=asset_ids)
