@@ -37,23 +37,45 @@
    同键同请求返回原任务，不同内容冲突。先完成 CLI，不另造云 API/MCP 平台。
 8. **旧线保护**：旧字幕核心、旧入口、旧归档只读；新入口通过独立子进程适配（W10）。
 
-## 本仓库当前代码形态（迁移起点，不是重写目标）
+## 当前代码形态与公共接口（截至 2026-09-16，主干 `9c3dc11` 一带）
 
 ```
 repo/
-  word_video/            # 现引擎：contracts timing tts original_tts jianying_tts jobs draft
-                         #           template media srt_export voices validate reference
-                         #           render/{__init__,ass,mix}
-  legacy_subtitle 6 文件 + legacy_tests/  # 平铺在仓库根目录（逐字复制未改，见 docs/LEGACY_SUBTITLE.md）
-  word_video_cli.py      # 现 headless JSON CLI（14 个 action，stdout 单 JSON）
-  word_video_package.py  # 打包入口
-  tests/                 # 19 个测试文件；默认离线（conftest 阻断非回环连接）
-  docs/ control/         # 本文档与任务清单/角色提示词
+  word_video/
+    domain/          # 唯一可编辑真相与只读派生：model(timebase/Project/Clip/MediaSlice)
+                     #   plan(RenderPlan/CuePlan) compile solve rhythm lesson errors
+    application/     # 命令层（UI/CLI 共用）：commands(Move/Trim/SetMediaSlice/Bind…)
+                     #   instantiate(模板展开) session(撤销/模式) intro(片头测量与音源裁决接线)
+    storage/         # project_store(原子写/严格读) assets(wv-assets@1 资产登记与解析)
+    cli/             # 新命令入口（W05 落成中）
+    media/           # 媒体链：core/intro/streams/proxy/audio（片头音源唯一裁决、真实 PTS/样本、代理、重叠混音）
+    voices/ layout/ exporters/   # 音色定义；LayoutSurface（预览与成片唯一排版）；三产物导出
+    importers/       # 旧缓存导入（cache）、旧剪映配音/音色导入（jianying/store）
+    text_policy.py   # 朗读文本清洗（默认 v2，legacy 供复现历史）
+    tts.py timing.py jobs.py draft.py render/ template.py srt_export.py …（旧链，保持可用）
+  preview/ desktop/  # W04 连续预览引擎（Qt-free）+ 独立画布/音频输出
+  packaging/         # 成员目录式包（PyInstaller onedir + 包内 ffmpeg + 启动器 + 清洗环境验收）
+  legacy_subtitle 6 文件 + legacy_tests/   # 平铺在根目录（逐字复制未改，见 docs/LEGACY_SUBTITLE.md）
+  word_video_cli.py  # 旧 headless JSON CLI（submit/start/…；新命令由 W05 增加）
+  tests/ tests/acceptance/ tests/qa2/ tests/qa3/   # 回归 + 独立验收（重验收用 -m acceptance_media）
+  tools/             # H0 核对工具（保护核对、批次比较、口径核对等）
 ```
 
-演进方式：在 `word_video/` 内按 A/B 的模块边界生长 domain/application/storage/media/voices/
-layout/exporters 子包，**不做推倒重写**；现有 `timeline.json` 生产链是可复用资产，
-新工程模型先与它共存（W01 先交最小接口与手算夹具，W02 消费它）。
+### 已冻结的公共契约（消费者必须用同一版本）
+
+| 契约 | 版本/入口 | 说明 |
+|---|---|---|
+| 工程文档 | **`wv-project@2`** | `@1` 原样加载、行为不变；片头是工程里的一层（`intro`），时长**来自媒体**；每角色样式覆盖见 A-6 |
+| 资产登记 | **`wv-assets@1`** | `<工程目录>/assets.json`；`resolve()` 出 `asset_id → 路径 + MediaInfo`；错误码 `MISSING_ASSET`/`DUPLICATE_ASSET`/`ASSET_FILE_MISSING`/`UNKNOWN_DURATION`；无登记表时「id 即路径」兜底 |
+| 音色登记 | **`wv-voices@1`** | 导入的旧配音/音色，带 `status`（仅可复用/可合成/待验证/需剪映操作） |
+| 排版 | `word_video.layout.LayoutSurface` | 预览与 MP4**唯一**排版；坐标 0..1、字号按 `height/2160` 缩放、溢出是数据不是异常 |
+| 三产物入口 | `python -m word_video.exporters` | `project.json` + 目录 → MP4 / 五轨 SRT / 可编辑剪映草稿；**只读计划**，不依赖剪映 GUI |
+| 朗读文本策略 | `word_video.text_policy` | 默认 `v2`（去词性标记与其连接符、去内嵌音标）；`legacy` 仅用于复现历史批次 |
+| 旧线 | `word_video_cli.py`、旧字幕工厂 | 保持可用；旧核心 6 文件逐字节未改，W10 只做子进程适配 |
+
+演进方式：**不做推倒重写**——旧 `timeline.json` 生产链与新工程模型共存，
+新入口的产物与旧链产物**过同一个独立验收器**（已验证：同一请求下五轨 SRT 逐字节相同、
+归档可逐帧复现）。
 
 ## 公共接口变更流程
 
