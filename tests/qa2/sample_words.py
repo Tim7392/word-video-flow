@@ -55,11 +55,33 @@ FFMPEG = tool('ffmpeg')
 
 
 def gray_frame(source, seconds):
+    """One grey frame, padded to a full frame.
+
+    A seek can land past the last frame of a shorter source (a subset run is much
+    shorter than the full archive), and then FFmpeg returns an empty or short
+    buffer.  Padding keeps the comparison defined; the caller checks that the
+    instant exists in both videos, so padding never fakes a difference.
+    """
     out = subprocess.run(
         [FFMPEG, '-v', 'error', '-nostdin', '-ss', '%.6f' % seconds, '-i', str(source),
          '-frames:v', '1', '-vf', 'scale=%d:%d,format=gray' % (WIDTH, HEIGHT),
          '-f', 'rawvideo', '-'], capture_output=True, check=True).stdout
-    return out[:WIDTH * HEIGHT]
+    size = WIDTH * HEIGHT
+    if len(out) < size:
+        return None
+    return out[:size]
+
+
+def media_seconds(source):
+    out = subprocess.run(
+        [FFMPEG, '-v', 'error', '-nostdin', '-i', str(source), '-f', 'null', '-'],
+        capture_output=True)
+    for line in out.stderr.decode('utf-8', 'replace').splitlines():
+        if 'Duration:' in line:
+            stamp = line.split('Duration:')[1].split(',')[0].strip()
+            hours, minutes, seconds = stamp.split(':')
+            return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    return None
 
 
 def band_bounds(band):
@@ -138,11 +160,24 @@ def main(argv=None):
 
     mine, archive = Path(args.mine), Path(args.archive)
     timeline = json.loads((archive / 'timeline.json').read_text(encoding='utf-8'))
+    # A run may cover a subset of the archive (three words against the fifty-word
+    # batch).  When it does, the instants come from the run's *own* timeline -
+    # legitimate here because those words' time fields were already compared
+    # field by field - while the archive's SRT still says what the delivery
+    # promises at that instant.
+    mine_timeline = json.loads((mine / 'timeline.json').read_text(encoding='utf-8'))
+    subset = len(mine_timeline['words']) != len(timeline['words'])
     fps = timeline['fps']
-    words = timeline['words']
+    words = mine_timeline['words'] if subset else timeline['words']
+    published = {w['index']: w for w in timeline['words']}
+    problems = []
+    if subset:
+        missing = [w['index'] for w in words if w['index'] not in published]
+        if missing:
+            problems.append('run 覆盖了归档里没有的词：%s' % missing)
     entries = {w['index']: w for w in load_expectations(
         args.wordlist, words[0]['index'], words[-1]['index'], 'legacy')['words']}
-    base = '%04d-%04d' % (words[0]['index'], words[-1]['index'])
+    base = '%04d-%04d' % (timeline['words'][0]['index'], timeline['words'][-1]['index'])
     scripts = {suffix: parse_srt(archive / 'srt' / (base + suffix))
                for suffix in ('_01_英文重复.srt', '_02_英文单次.srt', '_03_音标.srt',
                               '_04_中文带词性.srt', '_05_中文无词性.srt')}
@@ -155,7 +190,7 @@ def main(argv=None):
     mine_video = mine / 'video' / 'video.mp4'
     archive_video = archive / 'video' / 'video.mp4'
     background = Path(timeline['background'])
-    rows, problems = [], []
+    rows = []
     for position in positions:
         word = words[position]
         index = word['index']
@@ -170,8 +205,16 @@ def main(argv=None):
             milliseconds = round(seconds * 1000)
             mine_frame = gray_frame(mine_video, seconds)
             archive_frame = gray_frame(archive_video, seconds)
+            if mine_frame is None or archive_frame is None:
+                problems.append('word %d %s: %.3fs 在%s里没有画面'
+                                % (index, phase, seconds,
+                                   '复现批次' if mine_frame is None else '归档'))
+                continue
             if background_frame is None:
                 background_frame = _reference_frame(background, seconds)
+            if background_frame is None:
+                problems.append('word %d %s: 背景在 %.3fs 没有画面' % (index, phase, seconds))
+                continue
             ink = {band: round(band_ink(mine_frame, background_frame, band), 4)
                    for band in BANDS}
             means = {band: (round(band_mean(mine_frame, band), 3),
@@ -220,7 +263,7 @@ def main(argv=None):
                                    want['phonetic']))
             rows.append(row)
 
-    report = {'mine': str(mine), 'archive': str(archive),
+    report = {'mine': str(mine), 'archive': str(archive), 'subset': subset,
               'sampled_words': [words[p]['index'] for p in positions],
               'phases_per_word': 3, 'frames_compared': len(rows) * 2,
               'mean_tolerance': MEAN_TOLERANCE,
