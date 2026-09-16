@@ -62,6 +62,9 @@
 | 集成纪律修复（H0） | QA 的重验收默认被执行，把"快速回归"拖到 **831s**（违反"开发随手可跑"）。`pytest.ini` 改为 `addopts = -q -m "not acceptance_media"`：默认套件回到 **284 passed / 18 deselected / 49 subtests / 64.7s**；重验收显式 `-m acceptance_media` 跑（18 项，约 13 分钟，独占槽位） |
 | QA-2 新发现（已转 C） | 子进程若缺 `SystemRoot`/`windir`，**包内 exe exit 1 且 stderr 全空**，与"包坏了"无法区分；成员机正常有这些变量，但 C 的 `verify_member_package.py` 应显式补齐并记录。另：包 `VERSION.txt` 记 `source_commit=da04a820 / source_dirty=true`，**无法与某个 commit 一一对应**，C 重建时需修正 |
 
+| **P3 里程碑：首批 v2 真实生产批次 201-250（H0 亲跑）** | 真实 TTS 端到端出齐三产物：job `wv-3adc97b2f61af8b7aae4ab94`，**74.8s**（speech 12.7s 真实合成 150 条 / render 32.6s / draft 16.2s），**172 文件**，`timeline.json` 盖章 `spoken_policy: "v2"`。独立验收器 `--cleaning v2 --pixels all` → **verdict PASS / failures=[]**：完整性 172 文件 0 问题、计时 **150 阶段 `data_missing=0` 0 问题**、音画 e2e 0 问题（MP4 172.843s ↔ mix 172.833s、包络 r=1.0、片头有声 1.867s）、**逐词像素 151 探针 0 问题**（空白侧 0.0037 / 着墨侧 0.0228）、草稿 0 问题、五轨 SRT 齐（4289/2141/2482/2826/2599 字节）。**消耗 150 次请求（累计 162/20000）** |
+| v2 策略"真的作用到产物"（H0 工具核对） | `tools/check_batch_policy.py` 对 201-250 实测：50 词中 **3 个词的 v2 朗读文本与历史 `d_c` 不同**（#223 dynamic、#234 characteristic、#243 input，均为去掉派生连接符的差异）；产物 SRT 05 里 **3 条 v2 文本全部命中、历史文本 0 命中**，清单 `spoken_policy=v2`。→ 清洗策略不只是单测通过，**确实落到了成片字幕与合成文本上**（这也补上了 A 报告的"v2 文本从未真实合成过"缺口） |
+
 ### 待决/风险（不阻塞当前开发）
 - GitHub owner/repo 仍未提供 → 只本地提交。
 - 预览档位（720p30/540p30）未批准冻结，实测后再请 Tim 确认。
