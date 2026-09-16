@@ -10,6 +10,14 @@ rem                       (--import/--into/--export/--report); with more than
 rem                       the switch it runs in the foreground so the caller
 rem                       gets the exit code and the JSON report
 rem   anything else    -> the unchanged headless JSON CLI (doctor/submit/...)
+rem
+rem No GOTO labels and no bracketed blocks, deliberately.  Measured: this file is
+rem stored with LF line endings, and cmd.exe finds a GOTO label by scanning for a
+rem CR-terminated line, so every label was reported as missing ("cannot find the
+rem batch label specified") and the double-click did nothing.  A mode variable and
+rem single-line IFs do the same job with neither that trap nor the delayed
+rem expansion one (an %ERRORLEVEL% inside brackets is read before the line runs,
+rem which is how a launcher reports the wrong exit code).
 setlocal enableextensions
 set "PKG=%~dp0"
 if "%PKG:~-1%"=="\" set "PKG=%PKG:~0,-1%"
@@ -46,20 +54,24 @@ set "PATH=%PKG%\ffmpeg;%PATH%"
 
 cd /d "%PKG%"
 
-if "%~1"=="" goto editor_window
-if /i "%~1"=="--editor" goto editor
+rem Which door: the window, the window driven by arguments, or the CLI.
+set "WV_MODE=cli"
+if "%~1"=="" set "WV_MODE=window"
+if /i "%~1"=="--editor" set "WV_MODE=driven"
+if /i "%~1"=="--editor" if "%~2"=="" set "WV_MODE=window"
+
+rem The window alone: `start` lets the console this .cmd brought with it close,
+rem instead of sitting behind the editor for the whole session.  The redirection
+rem is not decoration: the started process inherits this command's handles, and a
+rem caller that captured the launcher's output would otherwise hold its pipe open
+rem until the member closed the editor.
+if "%WV_MODE%"=="window" start "" "%PKG%\WordVideoEditor\WordVideoEditor.exe" --editor >nul 2>nul
+if "%WV_MODE%"=="window" exit /b 0
+
+rem Driven: in the foreground, because a caller that drives the editor wants its
+rem exit code and the JSON report it writes.
+if "%WV_MODE%"=="driven" "%PKG%\WordVideoEditor\WordVideoEditor.exe" %*
+if "%WV_MODE%"=="driven" exit /b %ERRORLEVEL%
+
 "%PKG%\WordVideo\WordVideo.exe" %*
 exit /b %ERRORLEVEL%
-
-:editor
-rem The switch alone opens a window: `start` lets the console this .cmd brought
-rem with it close, instead of sitting behind the editor for the whole session.
-rem More arguments mean the editor is being driven, and a caller that drives it
-rem wants its exit code - so that case stays in the foreground.
-if "%~2"=="" goto editor_window
-"%PKG%\WordVideoEditor\WordVideoEditor.exe" %*
-exit /b %ERRORLEVEL%
-
-:editor_window
-start "" "%PKG%\WordVideoEditor\WordVideoEditor.exe" --editor
-exit /b 0
