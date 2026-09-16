@@ -10,7 +10,7 @@ Two things the project model needs and the resolver does not answer:
 
 * **how long the stage is when the clip is silent** — the verified engine measures
   the *video stream*, not the container, so
-  ``word_video.timing._video_stream_seconds`` is reused rather than re-derived
+  ``word_video.media.video_stream_seconds`` is reused rather than re-derived
   (a second implementation of "how long is this clip" is what W02 removed for the
   sound and must not come back for the picture);
 * **that the picture covers its own sound** — the same rule the verified engine
@@ -21,14 +21,18 @@ All IO lives here: the domain stays pure and the plan is solved from a measureme
 from ..domain.compile import IntroMeasurement
 from ..domain.errors import IntroMediaError
 from ..domain.model import INTRO_ROLE
-from ..media import resolve_intro_audio
+from ..media import resolve_intro_audio, video_stream_seconds
 from ..media.intro import FRAME_EPSILON_S
-from ..timing import _video_stream_seconds
 
 
 def _picture_seconds(video):
-    """Length of the clip's picture, measured the way the verified engine measures it."""
-    return float(_video_stream_seconds(video))
+    """Length of the clip's picture, measured the way the verified engine measures it.
+
+    ``word_video.media.video_stream_seconds`` is that one implementation now; this
+    module used to reach into ``timing`` for it, which is the private cross-module
+    call the rename removes.
+    """
+    return float(video_stream_seconds(video))
 
 
 def measure_intro(video_asset, *, fallback_audio='', clip_id=None):

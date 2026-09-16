@@ -196,24 +196,14 @@ def intro_has_alpha(path):
 
 
 def _video_stream_seconds(path):
-    """Duration of the *video stream*, which may be shorter than the container.
+    """Duration of the *video stream*; see :func:`word_video.media.video_stream_seconds`.
 
-    A clip whose audio outruns its picture still reports the longer container
-    length, so reading the container alone would miss a truncated countdown.
+    Kept as a name here because the verified engine's own tests and callers use it;
+    the implementation moved to :mod:`word_video.media.streams` so the project's
+    ``measure_intro`` and this module cannot drift apart.
     """
-    from .media import probe
-    data = probe(path)
-    for stream in data.get('streams', []):
-        if stream.get('codec_type') == 'video':
-            for key in ('duration', 'tags', 'nb_frames'):
-                if key == 'duration' and stream.get('duration'):
-                    return float(stream['duration'])
-            if stream.get('nb_frames'):
-                rate = stream.get('avg_frame_rate') or stream.get('r_frame_rate') or '0/1'
-                number, _, denominator = str(rate).partition('/')
-                if float(denominator or 1) and float(number):
-                    return float(stream['nb_frames']) / (float(number) / float(denominator))
-    return duration(path)
+    from .media import video_stream_seconds
+    return video_stream_seconds(path)
 
 
 def intro_frames_for(lesson):

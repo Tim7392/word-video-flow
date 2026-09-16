@@ -128,10 +128,14 @@ def export_run(project_path, *, output=None, run_name='', background=None,
                slices=None, render=True, draft=True, progress=None):
     """Produce all three deliverables for one project revision.
 
-    ``background``, ``intro_video`` and ``intro_audio`` are delivery settings, not
-    project content: the document owns the editable lesson (words, stages, text
-    layers, rhythm) and the caller owns which background and which countdown clip
-    this delivery uses.
+    ``background`` is a delivery setting, not project content: the document owns the
+    editable lesson and the caller owns which background this delivery uses.
+
+    ``intro_video``/``intro_audio`` are the **legacy fallback** for a project that
+    has no intro layer of its own (the "seconds without media" case, and the old
+    fixture shape).  A project that *does* carry an intro layer is measured from
+    that layer and the parameters are ignored - the plan is the source of truth
+    for its own intro, exactly as it is for the words.
     """
     project = load_project(project_path)
     base = Path(project_path)
@@ -140,8 +144,12 @@ def export_run(project_path, *, output=None, run_name='', background=None,
         output = base / 'out'
     assets = load_catalog(base)
     media = measure_all(assets)
+    from ..application.intro import measure_project_intro
     from ..domain import solve
-    solution = solve(project, media)
+    # A project with an intro layer is measured from its own media; a project
+    # without one keeps the verified engine's reserved-seconds fallback.
+    intro_measure = measure_project_intro(project) if project.intro_clip() else None
+    solution = solve(project, media, intro_measure)
     styles, font_paths, font_names = _styles()
     run_dir = Path(output) / (run_name or ('rev%d' % project.revision))
     # A published batch may be checked by an independent reader that treats every
