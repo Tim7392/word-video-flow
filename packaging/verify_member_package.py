@@ -162,6 +162,34 @@ def run_launcher(package, arguments, environment, timeout=300):
     return record
 
 
+def start_detached(package, environment, timeout=120):
+    """Run the launcher with no arguments - the member's double-click - without pipes.
+
+    Deliberately ``DEVNULL`` rather than ``capture_output``: the launcher starts the
+    window and returns immediately, and the process it starts inherits this caller's
+    handles.  Measured: with pipes, a run of the launcher held the pipe open until
+    the editor was closed, so the caller sat there for its whole timeout and then
+    reported "the editor never started" about an editor that was running.
+    """
+    package = Path(package)
+    command = [environment['ComSpec'], '/c', LAUNCHER_NAME]
+    started = time.monotonic()
+    record = {'command': ' '.join(['cd /d %s &&' % package, LAUNCHER_NAME]),
+              'capture': 'devnull (the window would inherit a pipe and hold it open)',
+              'stdout': '', 'stderr': '', 'stdout_lines': 0}
+    try:
+        result = subprocess.run(command, cwd=str(package), env=environment,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                timeout=timeout)
+    except subprocess.TimeoutExpired:
+        record.update({'timeout': True, 'returncode': None,
+                       'seconds': round(time.monotonic() - started, 2)})
+        return record
+    record.update({'timeout': False, 'returncode': result.returncode,
+                   'seconds': round(time.monotonic() - started, 2)})
+    return record
+
+
 def process_ids(image, environment):
     """PIDs of a running image, by asking Windows instead of trusting our own spawn.
 
@@ -263,7 +291,7 @@ def gui_smoke(package, environment, scratch, root, timeout, words=GUI_WORDS):
         time.sleep(1.0)
 
     print('[verify] launcher with no arguments (the member double-click)', file=sys.stderr)
-    launched = run_command(package, [], environment, timeout=120)
+    launched = start_detached(package, environment, timeout=120)
     deadline = time.monotonic() + 60
     observed = {'pids': []}
     while time.monotonic() < deadline:
@@ -271,19 +299,17 @@ def gui_smoke(package, environment, scratch, root, timeout, words=GUI_WORDS):
         if observed['pids']:
             break
         time.sleep(1.0)
-    still = process_ids(EDITOR_EXE, environment) if observed['pids'] else observed
     time.sleep(3.0)
     survived = process_ids(EDITOR_EXE, environment)
     evidence['default_launch'] = {
         'launcher': {key: launched[key] for key in ('command', 'returncode', 'seconds',
-                                                    'stdout_lines', 'stdout', 'stderr')},
+                                                    'timeout', 'capture', 'stdout', 'stderr')},
         'editor_started': bool(observed['pids']),
         'editor_pids': observed['pids'],
         'editor_still_running_after_3s': bool(survived['pids']),
-        'tasklist': survived,
-        'cli_stdout_is_empty': launched['stdout_lines'] == 0}
+        'tasklist': survived}
     evidence['default_launch']['ok'] = bool(
-        launched['returncode'] == 0 and observed['pids'] and survived['pids'])
+        launched.get('returncode') == 0 and observed['pids'] and survived['pids'])
     print('[verify] default launch: started=%s survived=%s (%.2fs)'
           % (evidence['default_launch']['editor_started'],
              evidence['default_launch']['editor_still_running_after_3s'],

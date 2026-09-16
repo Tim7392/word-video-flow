@@ -97,6 +97,41 @@ def write_report(path, payload):
     return target
 
 
+def release_inherited_console():
+    """Give back the console handles this process inherited from whoever started it.
+
+    Measured problem, not a precaution.  The launcher starts the window with
+    ``start``, and Windows hands a new process *every* inheritable handle of its
+    parent - including the write end of the pipe a script used to capture the
+    launcher's output.  ``cmd.exe`` exits immediately afterwards, but that stray
+    handle keeps the pipe open, so the caller never sees EOF: its ``communicate()``
+    waits, and even a timeout cannot save it (``subprocess.run`` drains the pipes
+    again after killing the child).  A windowed editor has nothing to say on stdout
+    anyway, so dropping the handles here is what makes "just run the launcher" safe
+    to script.
+
+    Only called on the interactive path: a driven run *does* write its report to
+    stderr when a caller gave it one, and that is worth keeping.
+    """
+    if os.name != 'nt':
+        return []
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        closed = []
+        for constant in (-10, -11, -12):                    # stdin, stdout, stderr
+            handle = kernel32.GetStdHandle(constant)
+            if handle and kernel32.CloseHandle(handle):
+                closed.append(constant)
+        # Python's wrappers would now be writing to a closed handle; ``None`` is what
+        # a windowed build has from the start, and ``print`` treats it as a no-op.
+        sys.stdout = None
+        sys.stderr = None
+        return closed
+    except Exception:                                       # noqa: BLE001 - never fatal
+        return []
+
+
 def environment_facts():
     """What the process was handed; the PATH/TEMP rules are acceptance items."""
     return {'frozen': bool(getattr(sys, 'frozen', False)),
@@ -115,7 +150,13 @@ def environment_facts():
 
 
 def window_facts(window, *, seconds_to_window):
-    """The window's own state, read from the window - not a re-derived opinion of it."""
+    """The window's own state, read from the window - not a re-derived opinion of it.
+
+    ``seconds_to_window`` is measured immediately after ``show()`` returns and Qt has
+    processed its events, so it is *the member's* startup cost and nothing else.  The
+    import, the first preview and the delivery are timed separately: averaging them
+    into "startup" is how a slow first render gets reported as a slow editor.
+    """
     diagnostics = window.diagnostics()
     session = window.showing.session
     return {'entry_to_window_seconds': round(seconds_to_window, 3),
@@ -215,13 +256,15 @@ def _run(args, payload, report_path):
     window.resize(*WINDOW_SIZE)
     window.show()
     application.processEvents()
+    # Taken here, before anything is imported or rendered: this is the number that
+    # answers "how long until the member sees a window".
+    window_shown_seconds = time.perf_counter() - ENTRY_START
     payload['qt'] = {'platform': application.platformName(),
                      'qt': QtCore.qVersion(), 'pyside': QtCore.__version__,
                      'device_pixel_ratio': window.devicePixelRatioF()}
 
     payload['import'] = run_import(window, args)
-    payload.update(window_facts(window,
-                                seconds_to_window=time.perf_counter() - ENTRY_START))
+    payload.update(window_facts(window, seconds_to_window=window_shown_seconds))
     if args.request or args.open_dir:
         payload['ok'] = bool(payload['import'].get('ok'))
         if not payload['ok']:
@@ -246,6 +289,7 @@ def _run(args, payload, report_path):
     # window is up" apart from "the window is up and Qt is dispatching events".
     payload['ok'] = True
     write_report(report_path, payload)
+    payload['console_released'] = release_inherited_console()
     ticks = {'count': 0}
     beat = QtCore.QTimer()
     beat.setInterval(100)

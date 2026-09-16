@@ -13,8 +13,10 @@ by double-click equivalent and then drives import -> export through the window. 
 is pinned here is everything that can be decided without building a 400 MB package.
 """
 import importlib.util
+import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -35,29 +37,59 @@ builder = load('packaging_build_editor', PACKAGING / 'build_member_package.py')
 verify = load('packaging_verify_editor', PACKAGING / 'verify_member_package.py')
 entry = load('desktop_main_entry', ROOT / 'desktop' / '__main__.py')
 entry_source = (ROOT / 'desktop' / '__main__.py').read_text(encoding='utf-8')
-launcher = (PACKAGING / 'launcher' / builder.LAUNCHER_NAME).read_text(encoding='utf-8')
+launcher_bytes = (PACKAGING / 'launcher' / builder.LAUNCHER_NAME).read_bytes()
+launcher = launcher_bytes.decode('utf-8')
 readme = (PACKAGING / builder.README_NAME).read_text(encoding='utf-8')
 
 
 # --------------------------------------------------------------- the launcher
 def test_the_launcher_opens_the_editor_when_it_is_given_nothing():
-    assert 'if "%~1"=="" goto editor_window' in launcher
+    assert 'if "%~1"=="" set "WV_MODE=window"' in launcher
     assert 'start "" "%PKG%\\WordVideoEditor\\WordVideoEditor.exe" --editor' in launcher
+    assert 'if "%WV_MODE%"=="window" exit /b 0' in launcher
 
 
 def test_the_cli_is_reached_only_by_an_argument_the_editor_does_not_claim():
-    """The order matters: the editor's two branches must be decided first, or
+    """The order matters: both editor doors must close before the CLI line, or
     ``单词视频.cmd doctor`` would open a window and never return."""
     cli = launcher.index('"%PKG%\\WordVideo\\WordVideo.exe" %*')
-    assert launcher.index('if "%~1"=="" goto editor_window') < cli
-    assert launcher.index('if /i "%~1"=="--editor" goto editor') < cli
+    assert launcher.index('if "%WV_MODE%"=="window" exit /b 0') < cli
+    assert launcher.index('if "%WV_MODE%"=="driven" exit /b %ERRORLEVEL%') < cli
 
 
 def test_a_driven_editor_run_stays_in_the_foreground_so_the_caller_gets_the_code():
-    assert ':editor' in launcher
-    driven = launcher.index('if "%~2"=="" goto editor_window')
-    assert launcher.index('"%PKG%\\WordVideoEditor\\WordVideoEditor.exe" %*') > driven
-    assert ':editor_window' in launcher
+    assert ('if "%WV_MODE%"=="driven" "%PKG%\\WordVideoEditor\\WordVideoEditor.exe" %*'
+            in launcher)
+    # ``--editor`` on its own is still just "open the window"; it is the arguments
+    # after it that make the run something a caller waits for.
+    assert 'if /i "%~1"=="--editor" set "WV_MODE=driven"' in launcher
+    assert 'if /i "%~1"=="--editor" if "%~2"=="" set "WV_MODE=window"' in launcher
+
+
+def test_the_launcher_has_no_goto_labels():
+    r"""Measured, not stylistic: this file is stored with LF endings, cmd.exe looks a
+    label up on a CR-terminated line, and so *every* GOTO was answered with "The
+    system cannot find the batch label specified - editor_window" and the member's
+    double-click did nothing at all.  A mode variable with single-line IFs does the
+    same dispatching without that trap - and without the other one either, because an
+    ``%ERRORLEVEL%`` inside brackets is expanded before the line that sets it runs.
+    """
+    commands = [line.strip().lower() for line in launcher.splitlines()]
+    assert [line for line in commands if line.startswith('goto ')] == []
+    assert [line for line in commands if line.startswith(':')] == []
+
+
+def test_the_launcher_is_crlf_which_is_what_cmd_expects():
+    assert launcher_bytes.count(b'\r\n') == launcher_bytes.count(b'\n') > 0
+    assert b'\r\n' not in launcher_bytes.replace(b'\r\n', b'')
+
+
+def test_the_detached_window_does_not_hand_its_console_to_the_caller():
+    """Measured: a caller that captured the launcher's output kept its pipe open
+    until the editor was closed, because the started process inherits the handles."""
+    window_line = next(line for line in launcher.splitlines()
+                       if line.startswith('if "%WV_MODE%"=="window" start'))
+    assert window_line.endswith('>nul 2>nul')
 
 
 def test_the_launcher_reports_a_package_that_is_missing_the_editor():
@@ -69,10 +101,65 @@ def test_the_launcher_reports_a_package_that_is_missing_the_editor():
 
 def test_the_launcher_still_announces_the_parts_it_always_did():
     # ASCII only, so the launcher's own (Chinese) file name cannot appear in it.
-    assert launcher.isascii()
+    assert launcher_bytes.decode('ascii')
     for part in ('WordVideo\\WordVideo.exe', 'WordVideoEditor\\WordVideoEditor.exe',
                  'ffmpeg', 'temp'):
         assert part in launcher
+
+
+# --------------------------------------------- the launcher, actually executed
+def stub_package(tmp_path):
+    """A package whose two executables are ``cmd.exe``.
+
+    Not a stand-in for a build: it is what makes the *dispatch* observable.  The
+    launcher forwards its arguments verbatim, so ``cmd.exe`` echoing them back is
+    evidence about which door opened - and the doors are handed different argument
+    lists, which is exactly what the two tests below rely on.  The window door
+    cannot be run this way (it would open a real console window in the test suite);
+    it is measured against the built package by ``verify_member_package.py``.
+    """
+    import shutil
+    for relative in ('WordVideo/WordVideo.exe', 'WordVideoEditor/WordVideoEditor.exe'):
+        target = tmp_path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(Path(os.environ['SystemRoot']) / 'System32' / 'cmd.exe', target)
+    shutil.copy2(PACKAGING / 'launcher' / builder.LAUNCHER_NAME,
+                 tmp_path / builder.LAUNCHER_NAME)
+    return tmp_path
+
+
+def run_stub_launcher(stub, arguments=(), timeout=120):
+    environment, _ = verify.clean_environment(stub)
+    return subprocess.run([environment['ComSpec'], '/c', builder.LAUNCHER_NAME]
+                          + [str(item) for item in arguments],
+                          cwd=str(stub), env=environment, capture_output=True, text=True,
+                          encoding='utf-8', errors='replace', timeout=timeout)
+
+
+def test_an_ordinary_argument_reaches_the_cli_door(tmp_path):
+    stub = stub_package(tmp_path)
+    result = run_stub_launcher(stub, ['/c', 'echo', 'cli-door'])
+    assert 'cli-door' in result.stdout
+    assert result.returncode == 0
+    assert (stub / 'temp').is_dir()          # TEMP was pointed inside the package
+
+
+def test_the_editor_switch_reaches_the_editor_door_with_its_own_arguments(tmp_path):
+    """If ``--editor`` fell through to the CLI, ``cmd.exe --editor /c echo ...``
+    would fail on ``--editor`` as a command and print nothing."""
+    stub = stub_package(tmp_path)
+    result = run_stub_launcher(stub, ['--editor', '/c', 'echo', 'editor-door'])
+    assert 'editor-door' in result.stdout
+    assert result.returncode == 0
+
+
+def test_a_doctor_call_is_not_turned_into_a_window(tmp_path):
+    """The regression this whole dispatch exists for: an agent's
+    ``单词视频.cmd doctor`` must never open a window and sit there."""
+    stub = stub_package(tmp_path)
+    result = run_stub_launcher(stub, ['/c', 'echo', 'doctor-called'])
+    assert 'doctor-called' in result.stdout
+    assert 'WV_MODE' not in result.stdout
 
 
 # ------------------------------------------------------------ the editor entry
@@ -135,6 +222,40 @@ def test_the_entry_never_writes_to_stdout_which_a_windowed_build_does_not_have()
         stripped = line.strip()
         assert not stripped.startswith('print(') or 'file=sys.stderr' in stripped
         assert 'sys.stdout.write' not in stripped
+
+
+def test_the_window_hands_back_the_console_handles_it_inherited(tmp_path):
+    """Measured in the package: a caller that captured the launcher's output waited
+    for the member to close the editor, because the started process held the pipe's
+    write end.  Run in a child process, so the handles being closed are not the
+    test's own."""
+    marker = tmp_path / 'closed.json'
+    script = ('import json, sys\n'
+              'sys.path.insert(0, %r)\n'
+              'from desktop.__main__ import release_inherited_console\n'
+              'closed = release_inherited_console()\n'
+              'open(%r, "w", encoding="utf-8").write(json.dumps(closed))\n'
+              % (str(ROOT), str(marker)))
+    result = subprocess.run([sys.executable, '-c', script], capture_output=True, text=True,
+                            timeout=120)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(marker.read_text(encoding='utf-8')) == [-10, -11, -12]
+
+
+def test_only_the_interactive_path_gives_up_its_console():
+    """A driven run writes its report to stderr when the caller gave it one, and the
+    verifier reads that; the release must stay on the window path."""
+    call = entry_source.index('release_inherited_console()', entry_source.index('def _run('))
+    assert call > entry_source.index('if args.export:', entry_source.index('def _run('))
+
+
+def test_the_startup_number_is_taken_before_the_import():
+    """Otherwise "how long until the member sees a window" silently becomes "window
+    plus import plus first preview", which is how a slow render gets reported as a
+    slow editor."""
+    run = entry_source[entry_source.index('def _run('):]
+    assert run.index('window_shown_seconds = ') < run.index('run_import(window, args)')
+    assert 'seconds_to_window=window_shown_seconds' in run
 
 
 # -------------------------------------------------------------- the two builds
@@ -221,6 +342,33 @@ def test_the_scanned_package_still_has_to_carry_the_editor(tmp_path):
     missing = builder.package_layout_problems(tmp_path) + builder.editor_layout_problems(tmp_path)
     assert result['errors'] == 0
     assert any(item.startswith(builder.EDITOR_DIR) for item in missing)
+
+
+def test_the_library_document_template_is_allowed_in_both_frozen_apps(tmp_path):
+    """Found the hard way: the allowance named only the CLI's ``_internal``, so the
+    editor's byte-identical copy was reported as "document material" and the entire
+    package refused to publish after ten minutes of building."""
+    for app in (builder.APP_DIR, builder.EDITOR_DIR):
+        allowed = tmp_path / app / '_internal' / 'docx' / 'templates' / 'default.docx'
+        allowed.parent.mkdir(parents=True)
+        allowed.write_bytes(b'PK\x03\x04' + b'\x00' * 32)
+    result = builder.scan_package(tmp_path)
+    assert result['findings'] == []
+    assert set(result['evidence']['allowances']) == {
+        'WordVideo/_internal/docx/templates/default.docx',
+        'WordVideoEditor/_internal/docx/templates/default.docx'}
+
+
+def test_a_member_document_inside_either_frozen_app_is_still_flagged(tmp_path):
+    """The allowance is one path shape, not "anything with .docx in _internal"."""
+    for app in (builder.APP_DIR, builder.EDITOR_DIR):
+        member = tmp_path / app / '_internal' / 'words.docx'
+        member.parent.mkdir(parents=True, exist_ok=True)
+        member.write_bytes(b'PK\x03\x04' + b'\x00' * 32)
+    findings = builder.scan_package(tmp_path)['findings']
+    assert [item['path'] for item in findings] == [
+        'WordVideo/_internal/words.docx', 'WordVideoEditor/_internal/words.docx']
+    assert {item['rule'] for item in findings} == {'forbidden-extension'}
 
 
 # ----------------------------------------------------------- the verification
