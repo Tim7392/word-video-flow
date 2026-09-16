@@ -81,6 +81,10 @@
 
 | **Tim 决定：暂停生产，专做软件（2026-09-16）** | 已交付 **201-250、251-300** 两批 v2 正式批次（各 172 文件、独立验收 PASS、累计 **312/20000** 次请求）即为当前产出边界；**不再开新批次消耗额度**，火力转到软件：W05（协调器/CLI/幂等与收据）、W06（成员编辑器）、W09（打包与资源硬化）、W10（旧字幕适配）。已写入 `AGENTS.md`。**零网络的本地验证跑不算生产**（local provider、坏样本矩阵、导入对照照常进行） |
 
+| **A-6：拆分 + 每角色样式覆盖（已合并 `184c38b`）** | 版本决定 **`wv-project@3`**（@1/@2 原样加载、`to_dict()` 逐字不变；带覆盖必须是 @3；`ClearStyle` 不回退版本；@4 仍拒）。① `SplitClip(clip_id, at_ticks, new_clip_id='')` + `can_split() → SplitCheck(ok, code, reason)`（UI 按钮态）；`SPLITTABLE_ROLES=('background','intro')`，per-record 角色与文字层 `SPLIT_NOT_APPLICABLE`、链接 `CLIP_BOUND`、越界 `INVALID_TIME`，全部带 `object_path`；有 source 的按源网格切、两段相接不造媒体。② `Project.styles`（只写改动字段、**font/font_name 拒绝**以守住字体解析链）+ `SetStyle/ClearStyle` + `RenderPlan.styles/style_table()`。③ **证据阶段发现的真实陷阱**：`LayoutSurface` 有自己的中性默认（english=240），喂**裸覆盖**会静默丢掉未覆盖角色 → 新增 `application/styles.py::merged_styles/style_fonts` 作为**画布与导出器唯一合并入口**。实测：english 450→800 后布局盒 225px/0.21/0.47 → **400px/0.38/0.84**、320×180 字幕带平均亮度 **0.63429 → 0.66995**、**TTS 调用 3 次 → 0 次**。集成回归 **534 passed / 4 分 31 秒** |
+| H0 裁决：多段图层（回答 B 的提问） | **背景支持多段**（否则 W06 的"拆分"成了永远导不出的死按钮）：按计划 item 顺序落段、各段用自己的源窗口、**循环行为在段内保留**、草稿 `背景` 轨每 item 一条可编辑 segment；**单 item 情形必须与今天逐字节一致**（回归红线）；段间洞/重叠结构化拒绝。**片头明确拒绝多段**（拆片头对产品无意义），投影入口给结构化错误并指向具体 item，不静默只画第一段。已派 B |
+| **B-4 进度（任务 1、2 完成）** | ① **50 词整批导入 + 归档长跑对照全过（零网络零 TTS）**：导入扫描 32 个 cache 根、plan **150/150**、硬链接 150 条（重复导入 `published_new=0/reused=150`、字节不变）；导出 94.6s → 1920×1080/60fps/h265、`total_frames=10956`、tracks {01:100,02:50,03:50,04:50,05:50}、layout 153 placements 无溢出；`accept_range --cleaning legacy --pixels all` **PASS**（integrity files=324、151 像素探针 0 问题、包络 r=1.0）；与归档对照：标量差异 `{}`、50 词逐字段相等、**五轨 SRT 逐字节相同**、归档 172 条 sha256 全对。**TTS 调用 0 双锁**：断网子进程 + 无凭据跑通，另有计数假 route 断言 `calls == []`。② **报错可诊断化**：`prepared_speech`/混音越界现在报**词号、角色、文件、计划秒 vs 实际秒、差值、倍率**与可执行提示（"复用已有音频请走 provider.kind=local"），5 项反例测试（含"第二个词出错必须报 word 2"、"失败不发布产物也不留 complete.json"） |
+
 ### 待决/风险（不阻塞当前开发）
 - GitHub owner/repo 仍未提供 → 只本地提交。
 - 预览档位（720p30/540p30）未批准冻结，实测后再请 Tim 确认。
