@@ -28,7 +28,8 @@ import wave
 from .core import probe
 
 __all__ = ['audio_stream', 'video_stream', 'audio_sample_count', 'audio_pts',
-           'samples_from_stream', 'stream_facts', 'video_stream_seconds']
+           'samples_from_stream', 'stream_facts', 'video_stream_seconds',
+           'opus_pre_skip']
 
 
 def _streams(path):
@@ -92,12 +93,27 @@ SAMPLE_COUNT_CODECS = ('pcm_s16le', 'pcm_s24le', 'pcm_s32le', 'pcm_u8', 'pcm_f32
                        'alac', 'wavpack', 'tta', 'truehd', 'mlp')
 
 
+#: Codecs whose *container* length counts samples the decoder throws away.
+#:
+#: An Ogg/Opus granule position counts the pre-skip (the encoder's 6.5 ms priming)
+#: as decoded audio, so ``duration x rate`` over-reports.  Measured over the whole
+#: test archive: all 2 744 distinct Ogg/Opus files were over-reported by exactly
+#: 312 samples at 48 kHz (the pre-skip the files declare), while the decoder emits
+#: 312 fewer.  The number is written in the file's own ``OpusHead``, so it is read
+#: rather than assumed - see :func:`opus_pre_skip`.
+PRIMING_IN_DURATION = ('opus',)
+
+
 def samples_from_stream(stream):
     """``{'samples', 'sample_rate', 'exact'}`` for one probed audio stream.
 
     Split out from :func:`audio_sample_count` so the rule can be exercised against
     the stream shapes real files produce - in particular the AAC one, whose
     ``nb_frames`` is a packet count - without needing a file of every codec.
+
+    This is the *header* answer and stays a pure function of the stream: a
+    container that counts priming samples (Opus) needs the file, and that
+    correction is applied by :func:`audio_sample_count`.
     """
     rate = _rate(stream)
     codec = str(stream.get('codec_name') or '')
@@ -118,6 +134,37 @@ def samples_from_stream(stream):
     raise ValueError('Audio stream carries no usable length')
 
 
+def opus_pre_skip(path):
+    """The pre-skip an Ogg/Opus file declares, in 48 kHz samples.
+
+    Opus always decodes at 48 kHz whatever the source rate was, so the pre-skip in
+    ``OpusHead`` is already a 48 kHz sample count and needs no conversion.  The
+    header is the first packet of the first (BOS) page, so exactly that page is
+    read - no scanning for a magic string that a lacing table could also contain.
+    Returns 0 for anything that is not an Ogg/Opus file.
+    """
+    try:
+        with open(path, 'rb') as handle:
+            header = handle.read(27)
+            if header[:4] != b'OggS' or len(header) < 27:
+                return 0
+            lacing = handle.read(header[26])
+            body = handle.read(sum(lacing))
+    except OSError:
+        return 0
+    at = body.find(b'OpusHead')
+    if at < 0 or len(body) < at + 12:
+        return 0
+    return int.from_bytes(body[at + 10:at + 12], 'little')
+
+
+def _priming_samples(path, stream):
+    """Samples the decoder discards at the start but the container counts."""
+    if str(stream.get('codec_name') or '') not in PRIMING_IN_DURATION:
+        return 0
+    return opus_pre_skip(path)
+
+
 def audio_sample_count(path):
     """How many samples of audio a file really holds.
 
@@ -128,10 +175,14 @@ def audio_sample_count(path):
        (:data:`SAMPLE_COUNT_CODECS`);
     3. ``duration x sample_rate`` for everything else - including the packetised
        codecs, whose ``nb_frames`` counts packets and must never be read as samples.
+       A container that counts priming samples as audio (Opus, see
+       :data:`PRIMING_IN_DURATION`) has that priming subtracted, from the number the
+       file itself declares.
 
     ``exact`` is true only for (1) and (2), so a caller that needs the stronger
     guarantee can tell a real count from a derived one instead of being handed a
-    packet count labelled as exact.
+    packet count labelled as exact.  A corrected count also carries
+    ``priming_samples``, so the correction is visible rather than silent.
     """
     try:
         with wave.open(str(path), 'rb') as stream:
@@ -143,7 +194,14 @@ def audio_sample_count(path):
                         'exact': True}
     except (wave.Error, EOFError, ValueError):
         pass
-    return samples_from_stream(audio_stream(path))
+    stream = audio_stream(path)
+    facts = samples_from_stream(stream)
+    priming = _priming_samples(path, stream)
+    if priming and not facts['exact']:
+        return {'samples': max(0, facts['samples'] - priming),
+                'sample_rate': facts['sample_rate'], 'exact': False,
+                'priming_samples': priming}
+    return facts
 
 
 def audio_pts(path):

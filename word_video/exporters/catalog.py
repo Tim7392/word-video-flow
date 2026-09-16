@@ -16,7 +16,9 @@ Two rules make it exact rather than approximate:
   become a plan.
 """
 from dataclasses import dataclass
+from fractions import Fraction
 import json
+import math
 from pathlib import Path
 
 from ..domain.model import MediaInfo
@@ -89,6 +91,27 @@ def save_catalog(assets, path):
     return target
 
 
+def _frame_rate(text):
+    """``'30000/1001'`` as an exact :class:`~fractions.Fraction`, or None."""
+    number, _, denominator = str(text or '').partition('/')
+    try:
+        top, bottom = int(number), int(denominator or 1)
+    except ValueError:
+        return None
+    if top <= 0 or bottom <= 0:
+        return None
+    return Fraction(top, bottom)
+
+
+def _stream_seconds(stream):
+    """A stream's own duration in seconds, or None when it publishes none."""
+    try:
+        seconds = float(stream.get('duration'))
+    except (TypeError, ValueError):
+        return None
+    return seconds if math.isfinite(seconds) and seconds > 0 else None
+
+
 def measure(asset):
     """Probe one asset into a :class:`MediaInfo` on its own grid."""
     from ..media import duration, has_audio, probe
@@ -103,18 +126,31 @@ def measure(asset):
             raise CatalogError('asset %s has no usable audio' % asset.asset_id)
         return MediaInfo(asset.asset_id, int(facts['samples']), 1,
                          int(facts['sample_rate']))
-    # Picture-only assets (a background, a clip) are measured in their own frames.
+    # Picture-only assets (a background, a clip) are measured in their own frames -
+    # but only while the picture really has one frame grid.  A variable frame rate
+    # clip has none: ffprobe's average rate is then not the rate the frames were
+    # captured at, and dividing the frame count by it was 13.3% short on a two-rate
+    # test clip (20 frames over 1.0 s measured as 0.867 s), which would shorten a
+    # background's loop or an intro's stage without anything saying so.  Such a clip
+    # is measured in milliseconds from its own duration, the same grid the
+    # no-frame-count fallback below already uses.
     streams = [item for item in probe(path).get('streams', [])
                if item.get('codec_type') == 'video']
     if not streams:
         raise CatalogError('asset %s has neither audio nor video' % asset.asset_id)
-    rate = str(streams[0].get('avg_frame_rate') or '0/1')
-    number, _, denominator = rate.partition('/')
-    frames = streams[0].get('nb_frames')
-    if frames and float(number or 0) and float(denominator or 0):
-        return MediaInfo(asset.asset_id, int(float(frames)), int(float(denominator)),
-                         int(float(number)))
-    seconds = finite_number(duration(path), 'asset duration', positive=True)
+    stream = streams[0]
+    frames = stream.get('nb_frames')
+    average = _frame_rate(stream.get('avg_frame_rate'))
+    real = _frame_rate(stream.get('r_frame_rate'))
+    if frames and average and real and average == real:
+        return MediaInfo(asset.asset_id, int(float(frames)), real.denominator,
+                         real.numerator)
+    # The picture's own length, not the container's: a clip whose audio outruns its
+    # picture reports the longer of the two at container level.  Never the frame
+    # count over an average rate - that is the arithmetic this branch exists because
+    # of.
+    seconds = _stream_seconds(stream) or finite_number(
+        duration(path), 'asset duration', positive=True)
     if not seconds:
         raise CatalogError('asset %s has no usable duration' % asset.asset_id)
     return MediaInfo(asset.asset_id, int(round(seconds * 1000)), 1, 1000)
