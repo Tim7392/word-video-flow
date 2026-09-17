@@ -149,3 +149,10 @@ M0 验收/工具脚本复制在 `tools\m0\`。原件一律不动。
 每个任务只报：**改了什么 → 测了什么及实际结果 → 未验证什么 → 下一步/回滚 commit**。
 小改不写长报告；阶段结束一次短汇总。Git 提交小步走；只有改公共接口才更新
 `docs/ARCHITECTURE.md`，用户可见影响才更新 `docs/CHANGELOG.md`。
+
+## Antigravity 作为可跟进 worker（Tim 2026-09-18 要求，H0 已落地）
+- **入口**：`D:\1\1-AI_workflow\word_video_flow\tools\agy_bridge.py`（包住官方 CLI `agy`，默认模型 `gemini-3.8-flash-high`）。
+- **为什么不用 DSH 原生子代理**：`agy` 没有 ACP/协议模式；且 DSH 的 `subagent-acp`/`codex`/`claude-code`/`dsh-sdk` **都是一次性**后端（无 `prepareContinuable`）⇒ 接上也**不能跟进**。
+- **持续跟进用法**：`--worker <名字>` 即一条会话（后续调用自动 `--conversation <id>`）；`--list-workers` 查看；`--forget-worker` 重开。状态在 `<允许根>\.agy-bridge\workers\*.json`，会话本体在 Antigravity 侧，跨重启不丢。
+- **边界（硬）**：默认允许根 = `D:\1\1-AI_workflow\antigravity`（它自己的工作树）；`--allow-edits` 另有 `AGY_BRIDGE_EDIT_ROOTS` 约束；它**不 push、不改 main**，产物要我复核后合并。
+- **它写的报告**：`D:\1\1-AI_workflow\antigravity\reports\*.md`；协作板 `...\antigravity\COLLAB.md`（任务队列 + 回执）。

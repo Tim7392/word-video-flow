@@ -255,3 +255,5 @@ PID 16876）。未做合并、未推送。
 
 
 
+
+| **Antigravity 接入：ACP 路线证否 + "可持续跟进 worker"落地（2026-09-18）** | Tim 要求"把它接成可持续跟进的子代理"。H0 查得：gy（Antigravity CLI v1.2.4 @ `C:\Users\Administrator\.gemini\bin\agy.exe`）**无 ACP/协议服务模式**（`remote-control` 是官方客户端远程控制、`mcp` 是它去连别人的 MCP）；而 DSH 的 ACP 后端**本身是一次性**的（源码实测 `prepareContinuable` 在 `subagent-acp`/`codex`/`claude-code`/`dsh-sdk` 里均为 **0** 次，只有 in-process 的 `spawn`/`fork` 有）⇒ **走 ACP 给不了"跟进"**，且还要额外写协议外壳 + 改全局 DSH 配置。**改为在桥接里实现会话续接**：`tools\agy_bridge.py` 新增 `--worker <名字>`（一个 worker=一条 agy 会话，后续调用自动带 `--conversation <id>`）、`--list-workers`、`--forget-worker`，状态原子落盘到 `<允许根>\.agy-bridge\workers\<名字>.json`。**H0 亲跑验收**：第 1 轮给暗号 4173（`continued=False`）→ 第 2 轮同一 worker 追问 **`continued=True` 且答出 4173**、会话 id 一致；dry-run 确认命令含 `--conversation`；`--list-workers` 显示 `turns=2`；**反面对照** `--forget-worker` 后答 `NO_IDEA`（证明续接是真会话）。同轮还按 Antigravity 的 13 条对抗发现修复桥接并逐条自测（越界/缺参 exit 2、211KB 长提示改走落盘指针、并发 160 次原子写 0 异常、强杀后 agy 孤儿=0、emoji 回归通过），模型按 Tim 指示固定 `gemini-3.8-flash-high` |
