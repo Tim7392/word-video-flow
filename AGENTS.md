@@ -162,6 +162,13 @@ M0 验收/工具脚本复制在 `tools\m0\`。原件一律不动。
   `dsh plugin --profile web add` 装到 profile（`link:` 到检出里的 `packages\subagent\subagent-acp`）。
 - **① 已实测**：把补丁写进活的 web profile 后（`patchReload: live`），新建子代理能看到 `antigravity` 工具并调用成功，
   原始返回 `ANTIGRAVITY-TOOL-OK`（真实 agy 调用，见 `docs/STATUS.md`）。
+- **① 的权限面（重要，别当"跑通就万事大吉"）**：默认**不给编辑权限**。headless 下 agy 遇到需要 `command` 权限的工具
+  （写文件、跑命令）会**自动拒绝**，而且仍然是 **exit 0 + `status: SUCCESS` + 空 response**，原因只写在 stderr。
+  所以：桥接把 stderr 尾巴落进 JSON（`result.stderr_tail`），ACP 外壳把**空答案判为失败**
+  （发诊断 chunk + 回 JSON-RPC error，DSH 才会记成 error）。要让它真能改文件，得在 profile 的 env 里加
+  `AGY_ACP_ALLOW_EDITS: '1'`（会走桥接的 `--allow-edits` + `AGY_BRIDGE_EDIT_ROOTS` 双重约束）；**H0 故意默认不开**。
+- **回归测试**（非仓库工具，手动跑）：`& <锁定 venv>\python.exe -m pytest -q D:\1\1-AI_workflow\word_video_flow\tools\tests`
+  —— 默认 5 passed / 2 skipped（离线）；加 `AGY_ACP_E2E=1` 会真调 agy 跑 2 条（正常作答 + headless 拒绝路径）。
 - **为什么 ① 不能"跟进"**：这是 DSH 的架构边界，不是接线问题——可跟进子代理由 continuation manager
   **自己造 in-process agent**（`packages/subagent/subagent/src/continuation.ts` → `continuation-activation.ts` 的
   `ctx.agents.create/resume`），provider 只能提供 `seed`；ACP/codex/claude-code/dsh-sdk 四个外部后端
