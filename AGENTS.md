@@ -168,12 +168,18 @@ M0 验收/工具脚本复制在 `tools\m0\`。原件一律不动。
   （发诊断 chunk + 回 JSON-RPC error，DSH 才会记成 error）。要让它真能改文件，得在 profile 的 env 里加
   `AGY_ACP_ALLOW_EDITS: '1'`（会走桥接的 `--allow-edits` + `AGY_BRIDGE_EDIT_ROOTS` 双重约束）；**H0 故意默认不开**。
 - **回归测试**（非仓库工具，手动跑）：`& <锁定 venv>\python.exe -m pytest -q D:\1\1-AI_workflow\word_video_flow\tools\tests`
-  —— 默认 5 passed / 2 skipped（离线）；加 `AGY_ACP_E2E=1` 会真调 agy 跑 2 条（正常作答 + headless 拒绝路径）。
-- **为什么 ① 不能"跟进"**：这是 DSH 的架构边界，不是接线问题——可跟进子代理由 continuation manager
-  **自己造 in-process agent**（`packages/subagent/subagent/src/continuation.ts` → `continuation-activation.ts` 的
-  `ctx.agents.create/resume`），provider 只能提供 `seed`；ACP/codex/claude-code/dsh-sdk 四个外部后端
-  **都没有 `prepareContinuable`**（实测源码 0 次）⇒ 外部引擎永远只能是一次性。
-  **要跟进就用 ②**，或让 H0 当中间人转达。
+  —— 默认 **11 passed / 2 skipped**（离线）；加 `AGY_ACP_E2E=1` 真调 agy 跑 2 条（正常作答 + headless 拒绝路径）= **13 passed**。
+- **多代理对抗性审查（Tim 2026-09-18 要求：对抗性审查必须多 Agent）**：走 Antigravity 原生 subagent 框架——
+  角色定义放**全局** `C:\Users\Administrator\.gemini\config\agents\<name>.md`（`subagent: true` +
+  `tools: [view_file, grep_search, run_command]`），由主代理用 `invoke_subagent` 并行拉起；
+  **工作区形式 `.agents/agents/` 在本工作树实测不生效**（原因未查明）。已建 4 角色：
+  `adv-protocol`（线协议）、`adv-lifecycle`（取消/回收）、`adv-semantics`（静默成功）、`adv-boundary`（权限越界）。
+  **派工铁律（踩过）**：子代理提示里必须写明"**只许杀你自己启动的进程，禁止 `Stop-Process`/`taskkill` 未知 PID**"——
+  上一轮 `adv-semantics` 清理"泄漏进程"时把编排者 `agy.exe` 杀了，swarm 死在中途；子代理结论仍可从
+  `~/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript_full.jsonl` 捞回来。
+- **边界（硬，2026-09-18 修正）**：默认允许根 = `D:\1\1-AI_workflow\antigravity`；桥接会校验 `--cwd`/`--add-dir` 落在允许根内，
+  ACP 外壳在 `session/new` 也先校验再落盘。但**一旦给了 `--allow-edits`（= 传 `--dangerously-skip-permissions`），
+  agy 本体并不受 `AGY_BRIDGE_EDIT_ROOTS` 限制**——实测它能写到工作树之外。所以 `--allow-edits` **只给可信任务**，
+  别把它当"写窄"。它**不 push、不改 main**，产物要我复核后合并。
 - **持续跟进用法**：`--worker <名字>` 即一条会话（后续调用自动 `--conversation <id>`）；`--list-workers` 查看；`--forget-worker` 重开。状态在 `<允许根>\.agy-bridge\workers\*.json`，会话本体在 Antigravity 侧，跨重启不丢。
-- **边界（硬）**：默认允许根 = `D:\1\1-AI_workflow\antigravity`（它自己的工作树）；`--allow-edits` 另有 `AGY_BRIDGE_EDIT_ROOTS` 约束；它**不 push、不改 main**，产物要我复核后合并。
 - **它写的报告**：`D:\1\1-AI_workflow\antigravity\reports\*.md`；协作板 `...\antigravity\COLLAB.md`（任务队列 + 回执）。
