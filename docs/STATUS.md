@@ -1,5 +1,11 @@
 # STATUS
 
+> **唯一写者（Tim 2026-09-17 约 16:15 决定，覆盖上面的冻结）**：工作**恢复**，由**原会话的 H0 继续指挥**，
+> 开发子代理一律走 **`workflow` 路径 + `openrouter/stealth/union-alpha`**（该路径已验证可用：探针写文件/跑命令/如实回报均核对无误）。
+> **其它会话（含 fork/新建出来的那个）请勿再写本仓库**：两边的 git 身份都是 `H0 <h0@local>`，从提交无法区分谁写的，双写会破坏
+> `DIVISION.md` 的"一个工作树只有一个写者"与合并纪律。`subagent` 工具在本会话内**无法**用 Union Alpha——策略在**首次派发时被写进会话日志**、
+> 之后不再更新（`packages/subagent/tool-subagent/src/index.ts:620` + `model-selection-state.ts:77`），所以 fork/刷新/重启都无效，只有新顶层会话有效。
+
 > **接手先看这里（2026-09-17 暂停点）**：当前**全部工作已暂停并冻结**在 `main = 127d445`。
 > 恢复入口在**文末「暂停点」**：每个分支的下一步、4 个 WIP 提交号、`template.py` 双改的合并顺序、等 Tim 的三件事、
 > 以及"三产物逐字节未变"的复核方法。**派发路由见 `AGENTS.md` 决定 11**：开发/QA 子代理一律走 `openrouter/stealth/union-alpha`
