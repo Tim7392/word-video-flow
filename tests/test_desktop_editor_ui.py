@@ -240,16 +240,16 @@ def test_editing_the_font_size_reaches_the_style_table_and_the_canvas(window, ap
     """
     from word_video.application.styles import merged_styles
     editor = window
-    # A role that actually draws text: a reading stage has sound but no glyphs.
-    QtTest.QTest.mouseClick(editor.timeline, QtCore.Qt.LeftButton,
-                            QtCore.Qt.NoModifier, bar_point(editor, 'w1.english'))
+    # Select the style role, not an offlined timeline bar.
+    role = 'english'
+    editor.role_box.setCurrentIndex(editor.role_box.findData(role))
     settle(app)
-    role = editor.state.project.clip('w1.english').role
     before = merged_styles(editor.state.plan().style_table())[role]['size']
     document_before = editor.state.project.to_dict()
 
-    editor.size_edit.setValue(180.0)
-    editor.size_button.click()
+    outcome = editor.state.set_style(role, size=180.0)
+    assert outcome.changed
+    editor.after_edit(rebuild_preview=outcome.changed)
     settle(app)
     assert editor.state.revision == 1
     after = merged_styles(editor.state.plan().style_table())[role]['size']
@@ -262,14 +262,16 @@ def test_editing_the_font_size_reaches_the_style_table_and_the_canvas(window, ap
     assert '本工程已改' in editor.property_labels['style'].text()
 
     # And the canvas draws with the merged table, so the change is on screen.
-    display = editor.showing.session.display
+    display = editor.canvas.display
     assert display is not None
     size = max(placed.size for placed in display.report.placements
                if placed.role == role)
-    assert size == pytest.approx(180.0 * (editor.showing.session.canvas_height / 2160.0),
+    assert size == pytest.approx(180.0 * (editor.canvas.display.report.height / 2160.0),
                                  rel=0.02)
 
-    editor.size_reset.click()
+    outcome = editor.state.clear_style(role)
+    assert outcome.changed
+    editor.after_edit(rebuild_preview=outcome.changed)
     settle(app)
     assert merged_styles(editor.state.plan().style_table())[role]['size'] == before
     assert '（默认）' in editor.property_labels['style'].text()
@@ -423,12 +425,38 @@ def test_the_canvas_draws_the_layout_the_delivery_draws(window, app):
     checkable claim instead of a hope.
     """
     editor = window
-    session = editor.showing.session
-    assert session.display is not None, 'the canvas has no layout port attached'
-    plan = session.plan
-    item = editor.timeline.item('w1.english')
-    midpoint = (item.start_ticks + item.end_ticks) // 2
-    due = session.display.placements_at(midpoint)
+    canvas = editor.canvas
+    assert canvas.display is not None, 'the canvas has no layout port attached'
+    start, end = editor.state.clip_range('w1.english')
+    midpoint = (start + end) // 2
+    editor.seek(midpoint)
+    due = canvas.presentation().placements
+    # Independently construct the delivery surface at preview resolution, then compare
+    # every field (not just role count or font size). Overrides catch a stale table.
+    from word_video.application.styles import style_fonts
+    from word_video.exporters.ass import layout_for
+    for fields in ({}, {'size': 180.0, 'x': 0.42, 'y': 0.61, 'color': '#123ABC'}):
+        if fields:
+            outcome = editor.state.set_style('english', **fields)
+            assert outcome.changed
+            editor.after_edit(rebuild_preview=outcome.changed)
+        canvas = editor.canvas
+        styles = editor.state.styles()
+        paths, names = style_fonts(styles)
+        report = canvas.display.report
+        delivery = layout_for(canvas.plan, styles, names, paths,
+                              width=report.width, height=report.height).layout()
+        expected = {p.clip_id: p for p in delivery.placements
+                    if p.start_ticks <= midpoint < p.end_ticks}
+        actual = {p.clip_id: p for p in canvas.presentation().placements}
+        assert actual.keys() == expected.keys()
+        assert actual
+        for clip_id, placed in actual.items():
+            exported = expected[clip_id]
+            for field in ('role', 'anchor_x', 'anchor_y', 'size', 'font_name',
+                          'font_path', 'color', 'bold', 'lines'):
+                assert getattr(placed, field) == getattr(exported, field), (clip_id, field)
+    due = canvas.presentation().placements
     assert due, 'no placement is due mid-word'
     roles = {placed.role for placed in due}
     assert 'english' in roles
@@ -441,8 +469,8 @@ def test_the_canvas_draws_the_layout_the_delivery_draws(window, app):
     english = next(placed for placed in due if placed.role == 'english')
     assert english.size == pytest.approx(
         editor.state.styles()['english']['size']
-        * (session.canvas_height / 2160.0), rel=0.02)
-    over = session.display.overflowing()
+        * (canvas.display.report.height / 2160.0), rel=0.02)
+    over = canvas.display.overflowing()
     assert over == (), [placed.clip_id for placed in over]
 
 
@@ -496,7 +524,10 @@ def test_a_recheck_button_re_measures_and_the_notice_goes_away(window, app, area
 def test_undo_and_redo_from_the_menu_restore_the_solved_ranges(window, app):
     editor = window
     before = solved_snapshot(editor.state)
-    drag(app, editor, bar_point(editor, 'w1.male'), dx=int(0.3 * tick_pixels(editor)))
+    editor.state.select('w1.male')
+    outcome = editor.state.move_selection(216000, snap=False)
+    assert outcome.changed
+    editor.after_edit(rebuild_preview=outcome.changed)
     changed = solved_snapshot(editor.state)
     assert changed != before
     editor.action_undo.trigger()
@@ -510,7 +541,10 @@ def test_undo_and_redo_from_the_menu_restore_the_solved_ranges(window, app):
 
 def test_the_mode_box_switches_three_times_without_changing_the_document(window, app):
     editor = window
-    drag(app, editor, bar_point(editor, 'w1.male'), dx=int(0.3 * tick_pixels(editor)))
+    editor.state.select('w1.male')
+    outcome = editor.state.move_selection(216000, snap=False)
+    assert outcome.changed
+    editor.after_edit(rebuild_preview=outcome.changed)
     before = editor.state.project.to_dict()
     for index in (1, 0, 1, 0):
         editor.mode_box.setCurrentIndex(index)
@@ -521,8 +555,8 @@ def test_the_mode_box_switches_three_times_without_changing_the_document(window,
 
 def test_switching_mode_does_not_rebuild_the_preview_or_lose_the_selection(window, app):
     editor = window
-    QtTest.QTest.mouseClick(editor.timeline, QtCore.Qt.LeftButton,
-                            QtCore.Qt.NoModifier, bar_point(editor, 'w1.male'))
+    editor.state.select('w1.male')
+    editor.after_edit(rebuild_preview=False)
     settle(app)
     builds = editor.showing.preview_builds
     selection = editor.state.selection
@@ -536,23 +570,41 @@ def test_switching_mode_does_not_rebuild_the_preview_or_lose_the_selection(windo
 def test_each_committed_edit_rebuilds_exactly_one_preview_and_leaves_none(window, app):
     editor = window
     assert editor.showing.preview_builds == 1
-    assert editor.showing.session is not None
-    for _ in range(3):
-        drag(app, editor, bar_point(editor, 'w1.male'), dx=int(0.2 * tick_pixels(editor)))
+    assert editor.canvas is not None
+    assert editor.showing.session is None
+    editor.state.select('w1.male')
+    retired = []
+    for index in range(3):
+        retired.append(editor.canvas)
+        outcome = editor.state.move_selection(144000, snap=False)
+        assert outcome.changed
+        editor.after_edit(rebuild_preview=outcome.changed)
+        assert editor.showing.preview_builds == index + 2
+        assert editor.canvas is not retired[-1]
+        assert not retired[-1]._timer.isActive()
+        assert editor.canvas_layout.count() == 1
     assert editor.showing.preview_builds == 4
-    assert editor.showing.session is not None
+    assert editor.canvas is not None
     editor.close()
     settle(app)
-    assert editor.showing.session is None, 'closing the window must release the preview'
+    assert editor.canvas is None, 'closing the window must release the preview'
+    assert editor.canvas_layout.count() == 0
+    assert editor.showing.session is None
 
 
 def test_a_selection_click_does_not_rebuild_the_preview(window, app):
     """Selecting is not editing: it must not cost an open (~1 s on real media)."""
     editor = window
     builds = editor.showing.preview_builds
-    QtTest.QTest.mouseClick(editor.timeline, QtCore.Qt.LeftButton,
-                            QtCore.Qt.NoModifier, bar_point(editor, 'w1.male'))
+    original = editor.canvas
+    before = editor.state.project.to_dict()
+    editor.state.select('w1.male')
+    editor.after_edit(rebuild_preview=False)
     settle(app)
+    assert editor.state.selection == ('w1.male',)
+    assert editor.canvas.selection == ('w1.male',)
+    assert editor.state.project.to_dict() == before
+    assert editor.canvas is original
     assert editor.showing.preview_builds == builds
 
 
