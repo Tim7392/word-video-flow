@@ -123,10 +123,44 @@ def test_serialized_bold_and_argb(bg, role):
 
 @pytest.mark.parametrize('role,size,expected', [
     ('title', 315, 9 * 126 / 94), ('subtitle', 240, 7 * 93 / 72),
-    ('footer', 210, 6 * 69 / 51), ('english', 450, 13),
-    ('phonetic', 174, 5), ('meaning', 210, 6), ('countdown', 675, 20)])
-def test_sample_coefficients_and_uncalibrated_defaults(role, size, expected):
+    ('footer', 210, 6 * 69 / 51), ('english', 450, 17.19209636996632),
+    ('phonetic', 174, 6.6476105963869765), ('meaning', 210, 8.022978305984282),
+    ('countdown', 675, 25.78814455494948)])
+def test_measured_and_unit_derived_defaults(role, size, expected):
     assert draft_text_size(size, role) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize('role', ['english', 'phonetic', 'meaning', 'countdown'])
+@pytest.mark.parametrize('factor', [.5, 1, 1.5])
+def test_teaching_serialized_size_uses_inferred_unit(exports, role, factor):
+    # Independent physical evidence, not an expectation calling the adapter itself.
+    unit = (315 * 94 / (9 * 126) + 240 * 72 / (7 * 93)
+            + 210 * 51 / (6 * 69)) / 3
+    label = {.5: 'smaller', 1: 'base', 1.5: 'larger'}[factor]
+    assert exports[label][role][0]['size'] == pytest.approx(
+        default_styles()[role]['size'] * factor / unit, rel=1e-12)
+
+
+@pytest.mark.parametrize('role', tuple(default_styles()))
+@pytest.mark.parametrize('convert,bad', [
+    (draft_text_size, 5e-324),  # finite positive input, division underflows to zero
+    (style_size, 1.7976931348623157e308),  # multiplication overflows to infinity
+    (draft_text_size, 10 ** 1000), (style_size, 10 ** 1000),
+])
+def test_conversion_rejects_numeric_range_overflow(role, convert, bad):
+    with pytest.raises(ValueError, match='finite.*positive'):
+        convert(bad, role)
+
+
+@pytest.mark.parametrize('role', tuple(default_styles()))
+@pytest.mark.parametrize('value', [1e-100, .01, 1, 17.25, 1000, 1e100])
+def test_reverse_round_trip_is_finite_positive(role, value):
+    import math
+    converted = style_size(value, role)
+    assert math.isfinite(converted) and converted > 0
+    result = draft_text_size(converted, role)
+    assert math.isfinite(result) and result > 0
+    assert result == pytest.approx(value, rel=1e-12, abs=0)
 
 
 def test_countdown_animation_override_reaches_keyframes(bg):

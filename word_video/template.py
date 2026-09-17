@@ -26,49 +26,89 @@ FONT_ROLES = ('heading', 'footer', 'bold', 'heavy', 'arial')
 # RGB distance <=46 from #FFFF99, >=3 pixels per row. title/subtitle/footer ink height: cover 94/72/51 px,
 # video 126/93/69 px; centres: cover 70.5/193.5/1009, video 84.5/203/1017.
 # For each layer: new draft_size = old draft_size * video_height / cover_height;
-# reference px per unit = style_size / new draft_size. No cross-face averaging.
+# reference px per unit = style_size / new draft_size (2160-high style canvas).
 # Sample faces: title/subtitle XQguzidianZJ, footer XQzhaopaitizj; source styles
 # and original sizes 9/7/6 are in the adjacent word_video_manifest.json.
 # These are one-sample linear fits, NOT post-change Jianying measurements.
 # Fresh B5-final/draft readback: 12.0638297872/9.0416666667/8.1176470588;
 # that verifies JSON serialization only, NOT post-change ink heights.
 # TextStyle 0.3.0 writes floats unchanged; the old integer quantisation claim was
-# incorrect. Font substitutions and teaching layers still need physical samples.
-# Teaching/countdown coefficients below preserve the original default sizes;
-# they are explicitly UNCALIBRATED, not a guessed application of the gold fit.
-_DRAFT_PX_PER_UNIT = {
+# incorrect. Font substitutions still need physical samples.
+#
+# Derivation of the shared unit coefficient (H0, 2026-09-17). For the same text
+# and face at matched ink height, k1080 = style_size * 1080/2160 / draft_size.
+# To match the old cover to the video, first use d_new = d_old * ink_video /
+# ink_cover. Our stored k2160 = 2*k1080 = style_size / d_new, i.e.
+# style_size * ink_cover / (d_old * ink_video). The face's ink/em ratio cancels
+# between the two renders: this is a unit conversion, not a font metric.
+# Two faces (XQguzidianZJ, XQzhaopaitizj) give k2160 = 26.1111111111 /
+# 26.5437788018 / 25.8695652174 (title/subtitle/footer; ~26.11/26.54/25.87).
+# Their ~2.6% spread supports one unit scale, allowing ink measurement error.
+# Leaving teaching text on the old 13/5/6 integers keeps two scales inside one
+# draft; the derived unit enlarges that text by about 1.32x. The shared unit is
+# the arithmetic mean of the three measured values:
+#     _UNIT_PX_PER_UNIT = (315*94/(9*126) + 240*72/(7*93) + 210*51/(6*69)) / 3
+#                       = 26.17481837678191
+# 教学层为推导值、未直接实测; countdown is also derived, not directly measured.
+# Direct teaching calibration needs a Jianying-generated cover with all three
+# teaching lines visible, compared against the same text/font in our renderer.
+_MEASURED_PX_PER_UNIT = {
     'title': 315 * 94 / (9 * 126),
     'subtitle': 240 * 72 / (7 * 93),
     'footer': 210 * 51 / (6 * 69),
-    'english': 450 / 13,
-    'phonetic': 174 / 5,
-    'meaning': 210 / 6,
-    'countdown': 675 / 20,
 }
+_UNIT_PX_PER_UNIT = sum(_MEASURED_PX_PER_UNIT.values()) / 3
+
+_DRAFT_PX_PER_UNIT = dict(_MEASURED_PX_PER_UNIT,
+                          english=_UNIT_PX_PER_UNIT, phonetic=_UNIT_PX_PER_UNIT,
+                          meaning=_UNIT_PX_PER_UNIT, countdown=_UNIT_PX_PER_UNIT)
 
 
 def _positive(value):
     try:
         value = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: an int too large for float (e.g. 10**1000) is just as
+        # out of range as inf; both refuse, neither silently narrows.
         raise ValueError('Text size must be finite and positive') from None
     if not math.isfinite(value) or value <= 0:
         raise ValueError('Text size must be finite and positive')
     return value
 
 
+def _unit_convert(value, role, to_draft):
+    """Convert once through the role unit, refusing out-of-range results.
+
+    Both directions are one float multiply/divide, so either can leave the
+    finite positive float range: 5e-324 / k underflows to 0.0 and max_float * k
+    overflows to inf. Both are refused by name, never clamped - a silently
+    zeroed or infinite size would draw nothing (or nothing sane) and the member
+    could not tell why.
+    """
+    value = _positive(value)
+    unit = _DRAFT_PX_PER_UNIT[role]
+    result = value / unit if to_draft else value * unit
+    if not (math.isfinite(result) and result > 0):
+        raise ValueError(
+            'Text size %r converts to %r for role %s, outside the finite '
+            'positive float range; refusing instead of clamping'
+            % (value, result, role))
+    return result
+
+
 def draft_text_size(size, role):
     """Single style-size -> draft-size mapping, after project overrides merge.
 
-    Role is required: the three measured layers must not calibrate other faces.
-    Legacy ``draft_size`` fields are not an independent rendering authority.
+    Role selects its measured coefficient or the shared derived unit; unknown
+    roles are rejected. Legacy ``draft_size`` fields are not an independent
+    rendering authority.
     """
-    return _positive(size) / _DRAFT_PX_PER_UNIT[role]
+    return _unit_convert(size, role, True)
 
 
 def style_size(draft_size, role):
     """Exact inverse, shared with future import consumers (no rounding/clamping)."""
-    return _positive(draft_size) * _DRAFT_PX_PER_UNIT[role]
+    return _unit_convert(draft_size, role, False)
 
 
 def draft_text_style(style, role):
@@ -263,7 +303,9 @@ def default_styles(overrides=None):
     arial, arial_name, _ = font('arial', 'bold')
     heading, heading_name, _ = font('heading', 'bold')
     footer, footer_name, _ = font('footer', 'bold')
-    # Size in px relative to a 2160-high canvas; draft_size retains source units.
+    # Size in px relative to a 2160-high canvas; draft_size retains source units
+    # and is legacy metadata only - the draft exporter maps through the role
+    # units (measured furniture, derived teaching layer), see the block above.
     # ASS/draft rendering differences must be checked on the first physical sample.
     return {
         'english': dict(font=bold, font_name=bold_name, size=450,
