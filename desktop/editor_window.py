@@ -6,9 +6,8 @@ Layout, and why
   delivery's background plus the placements B's ``LayoutSurface`` publishes.  Tim's
   direction (2026-09-17) is that the editor previews the **template's text effect**, not
   the delivery: no video decode, no segment proxies, no audio device, no mixer, and
-  repaints only when something can actually differ.  The video canvas of W04
-  (:mod:`desktop.preview_canvas`) and the continuous session (:mod:`preview.session`)
-  are kept in the tree and still tested, but the window no longer builds them;
+  repaints only when something can actually differ. The retired video canvas has
+  been removed; continuous-session engine tests remain independent of this window;
 * the **property panel** edits a style role independently of clip selection through
   :class:`~desktop.editor_model.EditorState`: size, color and normalized position
   use A's existing commands; fonts remain read-only;
@@ -20,8 +19,7 @@ Layout, and why
 
 The editable timeline ("模拟剪映" drag/trim/split/bind) is **offlined**: A's commands
 still exist and are still tested, and editing proper happens in 剪映 on the delivered
-draft, which is the requirement that matters.  ``desktop/timeline_widget.py`` is kept in
-the tree, unused by the window.
+draft, which is the requirement that matters. The unused timeline widget is removed.
 
 The window owns no edit logic.  Everything it does to the project it does by
 calling one method on the state, and every message it shows comes from
@@ -169,8 +167,8 @@ class EditorWindow(QtWidgets.QMainWindow):
 
         bottom = QtWidgets.QSplitter(QtCore.Qt.Vertical)
         # The editable timeline is offlined (Tim 2026-09-17: 不做可编辑的时间线模拟剪映,
-        # 只做模板/文字效果预览).  ``desktop/timeline_widget.py`` and its tests are kept
-        # in the tree, but the window no longer builds one: drag/trim/split/bind are not
+        # 只做模板/文字效果预览). The unused widget and gesture tests are removed:
+        # drag/trim/split/bind are not
         # offered, and nothing repaints a few hundred bars at 20-60 Hz while a delivery
         # is being encoded.
         self.timeline = None
@@ -485,43 +483,6 @@ class EditorWindow(QtWidgets.QMainWindow):
         self.on_playhead_moved(ticks)
 
     # --------------------------------------------------------------- edits
-    def on_clip_selected(self, clip_id, additive):
-        if not self._require_state():
-            return
-        if additive:
-            self.state.toggle(clip_id)
-        else:
-            self.state.select(clip_id)
-        self.after_edit(rebuild_preview=False)
-
-    def on_selection_cleared(self):
-        if not self._require_state():
-            return
-        self.state.clear_selection()
-        self.after_edit(rebuild_preview=False)
-
-    def on_clips_moved(self, clip_ids, delta_ticks):
-        if not self._require_state():
-            return
-        self.state.set_selection(clip_ids)
-        outcome = self.state.move_selection(delta_ticks, snap=False, clip_ids=clip_ids)
-        self.last_outcome = outcome
-        self.after_edit(reason=self._describe(outcome, '移动'))
-
-    def on_clip_trimmed(self, clip_id, edge, ticks):
-        if not self._require_state():
-            return
-        outcome = self.state.trim(clip_id, edge, ticks, snap=False)
-        self.last_outcome = outcome
-        self.after_edit(reason=self._describe(outcome, '修剪'))
-
-    def on_split_requested(self, clip_id, at_ticks):
-        if not self._require_state():
-            return
-        outcome = self.state.split_at_ticks(clip_id, at_ticks)
-        self.last_outcome = outcome
-        self.after_edit(reason=self._describe(outcome, '拆分'))
-
     def _apply_style(self, **fields):
         if not self._require_state():
             return

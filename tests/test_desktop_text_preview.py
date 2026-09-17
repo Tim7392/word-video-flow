@@ -28,6 +28,7 @@ from desktop.text_preview import TextPreview                   # noqa: E402
 from preview.still import StillFrames                          # noqa: E402
 from test_editor_support import tiny_folder                    # noqa: E402
 from test_preview_support import scratch, write_test_video     # noqa: E402
+from desktop.text_draw import draw_placements
 
 from word_video.domain.plan import PlanItem, RenderPlan        # noqa: E402
 from word_video.domain.model import MediaSlice                 # noqa: E402
@@ -168,6 +169,69 @@ def test_playing_advances_the_position_and_stops_at_the_end(app):
         app.processEvents()
 
 
+# -- migrated drawing contracts from the retired video canvas -----------------
+SENTINEL = QtGui.QColor(1, 2, 3)
+
+
+def painted_pixels(image):
+    return sum(1 for y in range(image.height()) for x in range(image.width())
+               if image.pixel(x, y) != SENTINEL.rgb())
+
+
+def draw_text_image(preview):
+    image = QtGui.QImage(320, 180, QtGui.QImage.Format_RGB32)
+    image.fill(SENTINEL)
+    painter = QtGui.QPainter(image)
+    try:
+        draw_placements(painter, preview.presentation().placements,
+                        QtCore.QRect(0, 0, 320, 180), preview.cache)
+    finally:
+        painter.end()
+    return image
+
+
+def test_text_is_drawn_from_the_layout_geometry_not_remeasured(app):
+    from word_video.template import default_styles
+    path = next((s.get('font') for s in default_styles().values() if s.get('font')), None)
+    assert path, 'no usable font resolved; text drawing coverage must not be skipped'
+    placed = Placement('layer.title', 0, TICKS_PER_SECOND)
+    placed.font_path, placed.size = path, 20
+    placed.lines = (Line('上', 0.5, 0.2, 0.1, 0.1, 16.0),
+                    Line('下', 0.5, 0.3, 0.1, 0.1, 16.0))
+    preview = TextPreview(display=FakeDisplay([placed]), plan=plan_of())
+    try:
+        assert preview.presentation().placements == (placed,)
+        image = draw_text_image(preview)
+        assert painted_pixels(image) > 0, 'no glyph reached the canvas'
+        assert preview.diagnostics()['fonts_loaded'] == 1
+        assert preview.diagnostics()['last_text_error'] == ''
+        # Changing only the published baseline must move the painted glyphs by the
+        # same pixels: Qt metrics must not replace the layout's baseline.
+        placed.lines = tuple(Line(l.text, l.x, l.y, l.width, l.height, l.baseline + 10)
+                             for l in placed.lines)
+        shifted = draw_text_image(preview)
+        original_points = {(x, y) for y in range(170) for x in range(320)
+                           if image.pixel(x, y) != SENTINEL.rgb()}
+        shifted_points = {(x, y) for y in range(180) for x in range(320)
+                          if shifted.pixel(x, y) != SENTINEL.rgb()}
+        assert shifted_points == {(x, y + 10) for x, y in original_points}
+    finally:
+        preview.stop()
+        preview.close()
+
+
+def test_a_placement_with_no_font_file_is_reported_not_drawn_in_a_substitute(app):
+    placed = Placement('x', 0, TICKS_PER_SECOND, text='hi')
+    preview = TextPreview(display=FakeDisplay([placed]), plan=plan_of())
+    try:
+        image = draw_text_image(preview)
+        assert preview.diagnostics()['last_text_error'] == 'placement x has no font file'
+        assert painted_pixels(image) == 0, 'text was drawn without a font file'
+    finally:
+        preview.stop()
+        preview.close()
+
+
 # -- the still --------------------------------------------------------------
 def test_the_still_is_cached_by_source_identity_and_a_changed_source_invalidates_it(tmp_path):
     source = write_test_video(tmp_path / 'background.mp4', seconds=1.0, fps=FPS,
@@ -211,6 +275,10 @@ def test_a_missing_or_unreadable_background_is_explained_not_blank(app, tmp_path
         assert stills.wait(timeout=60.0) is True
         assert 'ffmpeg' in stills.error() or '抽帧' in stills.error()
         assert stills.stats()['failed']
+        preview.background_paths = {'layer:background': str(broken)}
+        preview.set_content(plan_of(background=True), FakeDisplay([]), stills)
+        assert preview.presentation().preparing == stills.error()
+        assert preview.diagnostics()['still_error'] == stills.error()
     finally:
         preview.stop()
         preview.close()
