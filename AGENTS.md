@@ -104,6 +104,11 @@ M0 验收/工具脚本复制在 `tools\m0\`。原件一律不动。
     **字体：模板默认带字体名字（+ 文件哈希），导出模板时可用显式开关把字体文件一起打包**；使用端按名字/哈希解析，
     **找不到或哈希不符就结构化拒绝并给出修法，绝不静默替换**（"字体不静默替换"底线不变）；**工程级 override 仍不允许点名字体**（只有模板可以）。
     **成员包必须自带默认样式所需字体**——现有默认样式引用的是本机路径与剪映缓存字体，别的机器上不存在，这是"别人能不能用"的前提。
+11. **派发路由（Tim 2026-09-17 明确）**：**所有开发/QA 子代理一律走 `openrouter` / `stealth/union-alpha`（Union Alpha）**；
+    H0 仍在当前模型上做指挥（派工、复核、合并、验收、对外汇报）。**操作事实（H0 实测，别重复踩）**：子代理模型白名单由
+    `$DSH_HOME/settings.yaml` 的 `subagent-model-selection.allowedModels` 决定，而它是**"会话创建时"捕获的权威快照**
+    （源码 `packages/subagent/tool-subagent/src/model-selection.ts:134`：*Selection authority captured for this Session*）——
+    **改配置后必须新开会话（或 fork）才生效；刷新页面无效**（实测 3 次 `child LLM route "openrouter/stealth/union-alpha" is not allowed for this Session`）。
 
 **TTS 授权（Tim 2026-09-16 明确）**：初期真实 TTS 额度 **20000 = 次请求**；**Q03 是 Q00 的后续授权**，
 即允许本机真实调用（火山）TTS，按次请求口径计量。授权只放开"真实调用"这一项：

@@ -231,5 +231,8 @@ PID 16876）。未做合并、未推送。
 **当下安全状态**：两批正式产物 `out\production\*` **未动**；TTS 额度仍 **312/20000**（本轮零调用、零网络）；
 受保护路径（旧核心 / 归档 / 剪映草稿）只读未改；磁盘 **D 21.7GB / C 4.7GB**。
 
-**恢复口令**：基线不变（`main = d874546`），按上表把三个 WIP 分支接着做完 → H0 合并（先 B 后 C 处理 `template.py`）→
+**恢复口令**：基线不变（`main = d4ec987`），按上表把三个 WIP 分支接着做完 → H0 合并（先 B 后 C 处理 `template.py`）→
 跑全量套件 + H0 自己的编辑器实测 + "三产物逐字节未变"复核（`out\tim4` 那套对照仍可复用）。
+
+| **子代理路由改 Union Alpha（Tim 2026-09-17 指示）+ 白名单快照诊断** | Tim 指示："接下来你用 Union Alpha 做你的子代理，你指挥 Union Alpha 的子代理干活"。H0 查明：**Union Alpha = `openrouter/stealth/union-alpha`**（`settings.yaml` 的 `agent-default-model`；OpenRouter stealth 模型，262144 上下文 / 131072 输出，`openai-completions` + `max_tokens`）。H0 的子代理目录只有两条（`deepseek-official/deepseek-v4-flash`、`xiaomi-token-plan-cn/mimo-v2.5-pro`），因为 `subagent-model-selection.enabled: true` 且 `allowedModels` 只列了这两条。Tim 在 GUI 勾选后 `settings.yaml` 第 72-73 行**确已出现** `provider: openrouter / model: stealth/union-alpha`，但**探针仍被拒**（`child LLM route "openrouter/stealth/union-alpha" is not allowed for this Session`，共试 3 次），**刷新页面也无效**。根因（源码 `packages/subagent/tool-subagent/src/model-selection.ts:134` 注释）：**白名单是"会话创建时"捕获的权威快照**，会话存续期内不重读配置 ⇒ **必须新开会话（或 fork）才生效**。已写入 `AGENTS.md` 决定 11，供新会话的 H0 自动继承。**未验证**：新会话里 Union Alpha 是否真能派（待新会话探针）；**未做**：H0 未改任何全局配置（只读诊断） |
+
