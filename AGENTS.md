@@ -150,9 +150,23 @@ M0 验收/工具脚本复制在 `tools\m0\`。原件一律不动。
 小改不写长报告；阶段结束一次短汇总。Git 提交小步走；只有改公共接口才更新
 `docs/ARCHITECTURE.md`，用户可见影响才更新 `docs/CHANGELOG.md`。
 
-## Antigravity 作为可跟进 worker（Tim 2026-09-18 要求，H0 已落地）
-- **入口**：`D:\1\1-AI_workflow\word_video_flow\tools\agy_bridge.py`（包住官方 CLI `agy`，默认模型 `gemini-3.8-flash-high`）。
-- **为什么不用 DSH 原生子代理**：`agy` 没有 ACP/协议模式；且 DSH 的 `subagent-acp`/`codex`/`claude-code`/`dsh-sdk` **都是一次性**后端（无 `prepareContinuable`）⇒ 接上也**不能跟进**。
+## Antigravity 接入（Tim 2026-09-18 要求，H0 已落地；两条路各有用途）
+- **入口（两条）**：① DSH 原生子代理工具 `antigravity`（一次性派工，H0 和任何子代理都能直接调）；
+  ② `D:\1\1-AI_workflow\word_video_flow\tools\agy_bridge.py`（可跟进 worker，H0 派长任务用）。
+  两者共用同一个 CLI：官方 `agy`，默认模型 `gemini-3.8-flash-high`。
+- **① 原生子代理怎么接的**：`agy` 没有 ACP 服务模式，所以 H0 写了一个 **ACP 外壳**
+  `tools\agy_acp.py`（stdio ndjson、`initialize`/`session/new`/`session/prompt`/`session/cancel`），
+  由 DSH 自带的通用后端 `@deepseek-ai/dsh-subagent-acp` 拉起；外壳再调 `agy_bridge.py` 执行。
+  配置在 `$DSH_HOME\profiles\web\cordis.patch.yml`（两行 insert：`subagent-acp-agy` + `tool-subagent-antigravity`，
+  `backgroundMode: one-shot`、`maxDepth: provider-managed`），依赖用
+  `dsh plugin --profile web add` 装到 profile（`link:` 到检出里的 `packages\subagent\subagent-acp`）。
+- **① 已实测**：把补丁写进活的 web profile 后（`patchReload: live`），新建子代理能看到 `antigravity` 工具并调用成功，
+  原始返回 `ANTIGRAVITY-TOOL-OK`（真实 agy 调用，见 `docs/STATUS.md`）。
+- **为什么 ① 不能"跟进"**：这是 DSH 的架构边界，不是接线问题——可跟进子代理由 continuation manager
+  **自己造 in-process agent**（`packages/subagent/subagent/src/continuation.ts` → `continuation-activation.ts` 的
+  `ctx.agents.create/resume`），provider 只能提供 `seed`；ACP/codex/claude-code/dsh-sdk 四个外部后端
+  **都没有 `prepareContinuable`**（实测源码 0 次）⇒ 外部引擎永远只能是一次性。
+  **要跟进就用 ②**，或让 H0 当中间人转达。
 - **持续跟进用法**：`--worker <名字>` 即一条会话（后续调用自动 `--conversation <id>`）；`--list-workers` 查看；`--forget-worker` 重开。状态在 `<允许根>\.agy-bridge\workers\*.json`，会话本体在 Antigravity 侧，跨重启不丢。
 - **边界（硬）**：默认允许根 = `D:\1\1-AI_workflow\antigravity`（它自己的工作树）；`--allow-edits` 另有 `AGY_BRIDGE_EDIT_ROOTS` 约束；它**不 push、不改 main**，产物要我复核后合并。
 - **它写的报告**：`D:\1\1-AI_workflow\antigravity\reports\*.md`；协作板 `...\antigravity\COLLAB.md`（任务队列 + 回执）。
