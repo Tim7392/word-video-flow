@@ -13,52 +13,86 @@ the family name used by ASS is read out of the chosen file instead of being
 hardcoded: a style naming a family that is not inside ``fontsdir`` makes libass
 draw nothing at all.
 """
+import math
 import struct
 from pathlib import Path
 
 FONT_ROLES = ('heading', 'footer', 'bold', 'heavy', 'arial')
 
-#: How many pixels of the 2160-high reference canvas one Jianying draft text unit is
-#: worth.  **Calibrated against a physical sample, not guessed** (B-9):
-#:
-#: * sample: the delivered 251-300 draft, opened in Jianying 11.4, which rendered its
-#:   own ``draft_cover.jpg`` at 1920x1080 (kept at
-#:   ``runtime/tmp/A/drafts/production-251-300/draft_cover.jpg``; our side is frame 0
-#:   of the delivered ``0251-0300/video/video.mp4``);
-#: * measured ink heights of the three furniture layers - title 94 / subtitle 72 /
-#:   footer 51 px in Jianying against 126 / 93 / 69 px in our own frame for the same
-#:   strings and fonts (ratio 1.34 / 1.29 / 1.35);
-#: * the drafts were writing ``size / 35``; the ratio says the unit is ``size / 26``
-#:   (13 px at 1080).  The three layers span two faces, and a font's own ink-per-em
-#:   ratio cancels out of that comparison (ours = size * H/2160 * r, theirs =
-#:   draft_size * k * r), so the constant belongs to the *unit*, not to a face;
-#: * the measurement pins k to 25.6..26.4 px per unit; any value in (25.3, 28.0]
-#:   rounds those three layers to the same integers, so 26 is both the middle of the
-#:   measured range and stable against measurement noise.
-#:
-#: One unit is an integer in Jianying's own field, so a style size quantises to
-#: +/-1 unit = at most ~2% of ink height; the three calibrated layers land within
-#: 1.5% of our video after this mapping.
-DRAFT_REFERENCE_PX_PER_UNIT = 26.0
+# B5 physical evidence (1920x1080): runtime/tmp/A/drafts/production-251-300/
+# draft_cover.jpg, versus runtime/tmp/B/calib/ours-frame0.png, extracted from
+# out/production/251-300/wv-b76c0d0ea16030c203876e93/0251-0300/video/video.mp4.
+# Re-measured with runtime/tmp/B/calib/measure_runs.py (row gap <=4):
+# RGB distance <=46 from #FFFF99, >=3 pixels per row. title/subtitle/footer ink height: cover 94/72/51 px,
+# video 126/93/69 px; centres: cover 70.5/193.5/1009, video 84.5/203/1017.
+# For each layer: new draft_size = old draft_size * video_height / cover_height;
+# reference px per unit = style_size / new draft_size. No cross-face averaging.
+# Sample faces: title/subtitle XQguzidianZJ, footer XQzhaopaitizj; source styles
+# and original sizes 9/7/6 are in the adjacent word_video_manifest.json.
+# These are one-sample linear fits, NOT post-change Jianying measurements.
+# Fresh B5-final/draft readback: 12.0638297872/9.0416666667/8.1176470588;
+# that verifies JSON serialization only, NOT post-change ink heights.
+# TextStyle 0.3.0 writes floats unchanged; the old integer quantisation claim was
+# incorrect. Font substitutions and teaching layers still need physical samples.
+# Teaching/countdown coefficients below preserve the original default sizes;
+# they are explicitly UNCALIBRATED, not a guessed application of the gold fit.
+_DRAFT_PX_PER_UNIT = {
+    'title': 315 * 94 / (9 * 126),
+    'subtitle': 240 * 72 / (7 * 93),
+    'footer': 210 * 51 / (6 * 69),
+    'english': 450 / 13,
+    'phonetic': 174 / 5,
+    'meaning': 210 / 6,
+    'countdown': 675 / 20,
+}
 
 
-def draft_text_size(size):
-    """The text size to write into a Jianying draft for a style ``size``.
+def _positive(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        raise ValueError('Text size must be finite and positive') from None
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError('Text size must be finite and positive')
+    return value
 
-    The single implementation of ``size -> draft_size``: the draft exporter calls it
-    for every text layer (so a project's own size reaches the draft) and the preset
-    below uses it instead of carrying a second, hand-kept number.
+
+def draft_text_size(size, role):
+    """Single style-size -> draft-size mapping, after project overrides merge.
+
+    Role is required: the three measured layers must not calibrate other faces.
+    Legacy ``draft_size`` fields are not an independent rendering authority.
     """
-    return max(1, int(round(float(size) / DRAFT_REFERENCE_PX_PER_UNIT)))
+    return _positive(size) / _DRAFT_PX_PER_UNIT[role]
 
 
-def style_size(draft_size):
-    """The inverse of :func:`draft_text_size`, for reading a draft back in.
+def style_size(draft_size, role):
+    """Exact inverse, shared with future import consumers (no rounding/clamping)."""
+    return _positive(draft_size) * _DRAFT_PX_PER_UNIT[role]
 
-    An importer that finds ``size`` in a Jianying draft needs our own style size to
-    store it: the two directions live here together so they cannot drift apart.
+
+def draft_text_style(style, role):
+    """Map a merged project style once, for the draft exporter only.
+
+    Returns TextStyle and ClipSettings keyword dictionaries. Font copying and
+    candidate_pulse keyframe serialization stay with the draft library adapter.
+    ``draft_size`` is legacy metadata: project ``size`` is the single authority.
     """
-    return max(1, int(round(float(draft_size) * DRAFT_REFERENCE_PX_PER_UNIT)))
+    color = style['color'].lstrip('#')
+    # Match the unchanged ASS exporter: #AARRGGBB ignores leading alpha.
+    # This fixes RGB channel shifting, not transparency support; that capability
+    # needs a separate cross-output decision, not a draft-only new default.
+    if len(color) == 8:
+        color = color[2:]
+    rgb = tuple(int(color[i:i+2], 16) / 255 for i in (0, 2, 4))
+    # NO ink-centre correction yet. The original sample's centres differ by
+    # +14/+9.5/+8 px (title/subtitle/footer). A font-bbox model predicts offsets
+    # but has not been checked in Jianying after resizing, with auto-wrapping or
+    # teaching/countdown text. Preserve explicit project anchors until measured.
+    return (dict(size=draft_text_size(style['size'], role), bold=style['bold'],
+                 color=rgb, align=1, auto_wrapping=True, max_line_width=.9),
+            dict(transform_x=float(style['x']) * 2 - 1,
+                 transform_y=1 - float(style['y']) * 2))
 
 
 # (font file name, Jianying effect id) in preference order per role.

@@ -1,4 +1,4 @@
-﻿"""Create genuinely editable drafts without importing the Windows UI controller."""
+"""Create genuinely editable drafts without importing the Windows UI controller."""
 import importlib
 import importlib.metadata
 import importlib.util
@@ -17,7 +17,7 @@ import wave
 from .domain.errors import ProjectError
 from .media import (atomic_json, duration, executable, resolve_intro_audio, run,
                     wav_duration)
-from .template import default_styles, text_events
+from .template import default_styles, draft_text_style, text_events
 
 #: How many prepared files are padded at once.  Each one is a separate ffmpeg that
 #: only writes a small PCM file, so the cost is the process, not the work: 151 of
@@ -276,11 +276,10 @@ def export_draft(manifest, output_dir):
             if not text:
                 continue
             style = styles[name]
-            rgb = tuple(int(style['color'][i:i+2], 16)/255 for i in (1,3,5))
+            text_style, clip_settings = draft_text_style(style, name)
             segment = lib.text.TextSegment(text, lib.timer.Timerange(us(start), us(end)-us(start)),
-                style=lib.text.TextStyle(size=style['draft_size'], bold=style['bold'], color=rgb,
-                                         align=1, auto_wrapping=True, max_line_width=.9),
-                clip_settings=lib.video.ClipSettings(transform_x=style['x']*2-1, transform_y=1-style['y']*2),
+                style=lib.text.TextStyle(**text_style),
+                clip_settings=lib.video.ClipSettings(**clip_settings),
                 shadow=lib.text.TextShadow(alpha=.2, diffuse=15, distance=5, angle=-45))
             if name=='countdown' and style.get('animation')=='candidate_pulse':
                 # Candidate pulse only; original encrypted preset is not yet identified.
