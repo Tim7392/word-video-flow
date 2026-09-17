@@ -9,10 +9,9 @@ Layout, and why
   repaints only when something can actually differ.  The video canvas of W04
   (:mod:`desktop.preview_canvas`) and the continuous session (:mod:`preview.session`)
   are kept in the tree and still tested, but the window no longer builds them;
-* the **property panel** edits the selected clip through
-  :class:`~desktop.editor_model.EditorState`, which goes to A's commands.  A field
-  the member cannot change yet (the font size of a role, say) is *shown read-only*
-  rather than faked;
+* the **property panel** edits a style role independently of clip selection through
+  :class:`~desktop.editor_model.EditorState`: size, color and normalized position
+  use A's existing commands; fonts remain read-only;
 * the **notices panel** is where a refusal lands, with a button per repair.  There
   is no dialog that only says 确定;
 * the **delivery panel** holds what is not document content: background, intro
@@ -113,11 +112,6 @@ class EditorWindow(QtWidgets.QMainWindow):
         self._build_menus()
         if folder is not None:
             self.attach(folder, state)
-        self._timer = QtCore.QTimer(self)
-        # 20 Hz: the canvas pulls at 60 Hz for the picture, and a position label
-        # does not need to be redrawn three times per displayed frame.
-        self._timer.setInterval(50)
-        self._timer.timeout.connect(self._tick)
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
@@ -147,6 +141,22 @@ class EditorWindow(QtWidgets.QMainWindow):
         self.transport.addWidget(self.position_label)
         self.transport.addWidget(self.state_label, 1)
         picture_box.addLayout(self.transport)
+        seek_row = QtWidgets.QHBoxLayout()
+        self.seek_edit = QtWidgets.QDoubleSpinBox()
+        self.seek_edit.setDecimals(3)
+        self.seek_edit.setRange(0, 100000)
+        self.seek_edit.setSuffix(' s')
+        self.seek_button = QtWidgets.QPushButton('定位')
+        self.seek_button.clicked.connect(
+            lambda: self.seek(self.state.ticks_from_seconds(self.seek_edit.value(), snap=False))
+            if self.state is not None else None)
+        self.progress_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.progress_slider.setRange(0, 0)
+        self.progress_slider.valueChanged.connect(lambda ms: self.seek(ms * 720))
+        seek_row.addWidget(self.seek_edit)
+        seek_row.addWidget(self.seek_button)
+        seek_row.addWidget(self.progress_slider, 1)
+        picture_box.addLayout(seek_row)
         top.addWidget(picture)
 
         side = QtWidgets.QTabWidget()
@@ -175,41 +185,14 @@ class EditorWindow(QtWidgets.QMainWindow):
     def _build_property_panel(self):
         panel = QtWidgets.QWidget()
         form = QtWidgets.QFormLayout(panel)
-        self.property_labels = {}
-        for key, title in (('clip', '片段'), ('role', '角色'), ('word', '词'),
-                           ('range', '时间'), ('duration', '时长'),
-                           ('text', '文本'), ('source', '媒体'),
-                           ('style', '字体/字号（只读）')):
-            label = QtWidgets.QLabel('—')
-            label.setWordWrap(True)
-            label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-            self.property_labels[key] = label
-            form.addRow(title, label)
-        self.start_edit = QtWidgets.QDoubleSpinBox()
-        self.start_edit.setDecimals(3)
-        self.start_edit.setRange(0.0, 100000.0)
-        self.start_edit.setSuffix(' s')
-        self.end_edit = QtWidgets.QDoubleSpinBox()
-        self.end_edit.setDecimals(3)
-        self.end_edit.setRange(0.001, 100000.0)
-        self.end_edit.setSuffix(' s')
-        form.addRow('起始', self.start_edit)
-        form.addRow('结束', self.end_edit)
-        self.apply_button = QtWidgets.QPushButton('应用时间（经 A 的命令）')
-        self.apply_button.clicked.connect(self.on_apply_time)
-        form.addRow(self.apply_button)
-        self.speed_edit = QtWidgets.QDoubleSpinBox()
-        self.speed_edit.setDecimals(3)
-        self.speed_edit.setRange(0.5, 2.0)
-        self.speed_edit.setSingleStep(0.05)
-        self.speed_edit.setValue(1.0)
-        self.speed_button = QtWidgets.QPushButton('应用速度（只作用于本片段）')
-        self.speed_button.clicked.connect(self.on_apply_speed)
-        form.addRow('速度', self.speed_edit)
-        form.addRow(self.speed_button)
-        # The font size IS editable now (A's SetStyle); it was read-only while the
-        # project had no style layer, and the label says where it applies so a
-        # member does not read it as this clip's private property.
+        self.role_box = QtWidgets.QComboBox()
+        self.role_box.currentIndexChanged.connect(self._update_property_panel)
+        form.addRow('样式角色', self.role_box)
+        label = QtWidgets.QLabel('—')
+        label.setWordWrap(True)
+        label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.property_labels = {'style': label}
+        form.addRow('字体（只读）/当前样式', label)
         self.size_edit = QtWidgets.QDoubleSpinBox()
         self.size_edit.setDecimals(1)
         self.size_edit.setRange(1.0, 2000.0)
@@ -218,20 +201,30 @@ class EditorWindow(QtWidgets.QMainWindow):
         self.size_button.clicked.connect(self.on_apply_size)
         self.size_reset = QtWidgets.QPushButton('恢复默认字号/样式')
         self.size_reset.clicked.connect(self.on_clear_style)
-        form.addRow('字号', self.size_edit)
+        form.addRow('字号（1..2000 px，2160 高设计尺度）', self.size_edit)
         form.addRow(self.size_button)
+        self.color_edit = QtWidgets.QLineEdit()
+        self.color_edit.setPlaceholderText('#RRGGBB')
+        self.color_button = QtWidgets.QPushButton('应用颜色（该角色的全部片段）')
+        self.color_button.clicked.connect(self.on_apply_color)
+        form.addRow('颜色（#RRGGBB）', self.color_edit)
+        form.addRow(self.color_button)
+        self.x_edit = QtWidgets.QDoubleSpinBox()
+        self.y_edit = QtWidgets.QDoubleSpinBox()
+        for edit in (self.x_edit, self.y_edit):
+            edit.setDecimals(16)
+            edit.setRange(0.0, 1.0)
+            edit.setSingleStep(0.01)
+        form.addRow('位置 x（0..1，画布宽度比例）', self.x_edit)
+        form.addRow('位置 y（0..1，画布高度比例）', self.y_edit)
+        hint = QtWidgets.QLabel('文字块中心坐标，与 LayoutSurface 相同：左上 (0,0)，'
+                                '右下 (1,1)。点击应用后立即预览。')
+        hint.setWordWrap(True)
+        form.addRow(hint)
+        self.position_button = QtWidgets.QPushButton('应用位置（该角色的全部片段）')
+        self.position_button.clicked.connect(self.on_apply_position)
+        form.addRow(self.position_button)
         form.addRow(self.size_reset)
-        self.bind_button = QtWidgets.QPushButton('显式跟随…（绑定到另一片段）')
-        self.bind_button.clicked.connect(self.on_bind)
-        self.unbind_button = QtWidgets.QPushButton('解绑（改为绝对位置）')
-        self.unbind_button.clicked.connect(self.on_unbind)
-        self.restore_button = QtWidgets.QPushButton('恢复语音长度（取消截断）')
-        self.restore_button.clicked.connect(self.on_restore_length)
-        self.split_button = QtWidgets.QPushButton('在播放头处拆分')
-        self.split_button.clicked.connect(self.on_split_at_playhead)
-        for button in (self.bind_button, self.unbind_button, self.restore_button,
-                       self.split_button):
-            form.addRow(button)
         self.mode_box = QtWidgets.QComboBox()
         self.mode_box.addItems(['模板模式', '高级模式'])
         self.mode_box.currentIndexChanged.connect(self.on_mode_changed)
@@ -395,13 +388,15 @@ class EditorWindow(QtWidgets.QMainWindow):
         self.canvas = widget
         self.canvas.set_selection(self.state.selection)
         self.canvas_layout.addWidget(self.canvas)
+        self.canvas.changed.connect(self._tick)
+        with QtCore.QSignalBlocker(self.progress_slider):
+            self.progress_slider.setRange(0, plan.total_ticks // 720)
+        self.seek_edit.setMaximum(plan.total_ticks / 720000.0)
         self.canvas.set_position(position or 0)
-        self._timer.start()
         self.state_label.setText('文字预览已就绪 · %s · 画布 %dx%d'
                                  % (plan.project_id, canvas[0], canvas[1]))
 
     def close_preview(self):
-        self._timer.stop()
         if self.canvas is not None:
             self.canvas.stop()
             self.canvas_layout.removeWidget(self.canvas)
@@ -437,18 +432,16 @@ class EditorWindow(QtWidgets.QMainWindow):
             return None
 
     def _tick(self):
-        """Read the preview's own numbers for the label and the playhead.
-
-        The window's 20 Hz timer only *reads*: the text preview advances its clock and
-        repaints on its own low-frequency timer while playing, and does nothing at all
-        while paused.
-        """
+        """Update transport on preview events; no second polling timer while idle."""
         if self.canvas is None:
             return
         presentation = self.canvas.presentation()
         if presentation is None:
             return
         self.showing.position_ticks = presentation.position_ticks
+        self.play_button.setText('暂停' if presentation.playing else '播放')
+        with QtCore.QSignalBlocker(self.progress_slider):
+            self.progress_slider.setValue(presentation.position_ticks // 720)
         self.position_label.setText('%.3fs · %s' % (presentation.position_seconds,
                                                     presentation.state))
         # The canvas draws "preparing" itself; the label repeats it because a member
@@ -529,82 +522,41 @@ class EditorWindow(QtWidgets.QMainWindow):
         self.last_outcome = outcome
         self.after_edit(reason=self._describe(outcome, '拆分'))
 
-    def on_apply_time(self):
+    def _apply_style(self, **fields):
         if not self._require_state():
             return
-        clip_id = self._selected_id()
-        if not clip_id:
+        role = self.role_box.currentData()
+        if role is None:
             return
-        start = self.state.ticks_from_seconds(self.start_edit.value(), snap=False)
-        end = self.state.ticks_from_seconds(self.end_edit.value(), snap=False)
-        first = self.state.trim(clip_id, 'start', start, snap=False)
-        if first.changed:
-            self.state.trim(clip_id, 'end', end, snap=False)
-        self.after_edit(reason='已按面板时间修剪')
-
-    def on_apply_speed(self):
-        clip_id = self._selected_id()
-        if not clip_id:
-            return
-        self.state.set_media(clip_id, speed=float(self.speed_edit.value()))
-        self.after_edit(reason='已应用速度（只作用一次）')
-
-    def on_restore_length(self):
-        clip_id = self._selected_id()
-        if not clip_id:
-            return
-        outcome = self.state.trim_to_source_length(clip_id)
-        self.after_edit(reason=self._describe(outcome, '恢复语音长度'))
+        outcome = self.state.set_style(role, **fields)
+        self.last_outcome = outcome
+        self.after_edit(rebuild_preview=outcome.changed,
+                        reason=self._describe(outcome, '样式'))
 
     def on_apply_size(self):
-        """Set the selected role's font size through A's ``SetStyle``."""
-        clip_id = self._selected_id()
-        if not clip_id:
+        self._apply_style(size=float(self.size_edit.value()))
+
+    def on_apply_color(self):
+        import re
+        color = self.color_edit.text().strip()
+        if not re.fullmatch(r'#[0-9a-fA-F]{6}', color):
+            self.status.showMessage('颜色须为 #RRGGBB，例如 #FFFFFF')
             return
-        clip = self.state.project.clip(clip_id)
-        outcome = self.state.set_style(clip.role, size=float(self.size_edit.value()))
-        self.after_edit(reason=self._describe(outcome, '字号'))
+        self._apply_style(color=color.upper())
+
+    def on_apply_position(self):
+        self._apply_style(x=float(self.x_edit.value()), y=float(self.y_edit.value()))
 
     def on_clear_style(self):
-        clip_id = self._selected_id()
-        if not clip_id:
+        if not self._require_state():
             return
-        clip = self.state.project.clip(clip_id)
-        outcome = self.state.clear_style(clip.role)
-        self.after_edit(reason=self._describe(outcome, '恢复默认样式'))
-
-    def on_unbind(self):
-        clip_id = self._selected_id()
-        if not clip_id:
+        role = self.role_box.currentData()
+        if role is None:
             return
-        outcome = self.state.unbind_start(clip_id)
-        self.after_edit(reason=self._describe(outcome, '解绑'))
-
-    def on_bind(self):
-        clip_id = self._selected_id()
-        if not clip_id or not self._require_state():
-            return
-        options = [item.id for item in self.state.project.clips if item.id != clip_id]
-        if not options:
-            return
-        chosen, accepted = QtWidgets.QInputDialog.getItem(
-            self, '显式跟随', '让 %s 从哪个片段的结束端点开始？' % clip_id, options, 0, False)
-        if not accepted or not chosen:
-            return
-        outcome = self.state.bind_start(clip_id, chosen, edge='end')
-        self.after_edit(reason=self._describe(outcome, '绑定'))
-
-    def on_split_at_playhead(self):
-        """Split the selected layer at the playhead.
-
-        The timeline is offlined, so there is no snapping grid to consult; the playhead
-        the text preview reports is the instant the member is looking at.
-        """
-        clip_id = self._selected_id()
-        if not clip_id:
-            return
-        outcome = self.state.split_at_ticks(clip_id, self.showing.position_ticks)
-        self.after_edit(reason=self._describe(outcome, '拆分'))
+        outcome = self.state.clear_style(role)
+        self.last_outcome = outcome
+        self.after_edit(rebuild_preview=outcome.changed,
+                        reason=self._describe(outcome, '恢复默认样式'))
 
     def on_mode_changed(self, index):
         if not self._require_state():
@@ -672,57 +624,32 @@ class EditorWindow(QtWidgets.QMainWindow):
         self.status.showMessage('已保存 %s（rev %d）' % (path, self.state.revision))
         return path
 
-    def _selected_id(self):
-        if not self.state.selection:
-            self.status.showMessage('先在时间线上点选一个片段')
-            return ''
-        return self.state.selection[0]
-
     # ------------------------------------------------------------- panels
     def _update_property_panel(self):
         if self.state is None:
             return
-        clip_id = self.state.selection[0] if self.state.selection else ''
-        clip = self.state.project.clip(clip_id) if clip_id else None
-        labels = self.property_labels
-        if clip is None:
-            for key in ('clip', 'role', 'word', 'range', 'duration', 'text', 'source',
-                        'style'):
-                labels[key].setText('—')
-            return
-        record = self.state.project.record(clip.record_id) if clip.record_id else None
-        found = self.state.clip_range(clip.id)
-        labels['clip'].setText('%s%s' % (clip.id, '（已选中 %d 个）' % len(self.state.selection)
-                                         if len(self.state.selection) > 1 else ''))
-        labels['role'].setText(notices.role_label(clip.role))
-        labels['word'].setText('%s（%s）' % (record.word, record.id) if record else '—')
-        labels['range'].setText('%.3fs → %.3fs' % (found[0] / 720000.0, found[1] / 720000.0)
-                                if found else '未求解')
-        labels['duration'].setText('%.3fs' % ((found[1] - found[0]) / 720000.0)
-                                   if found else '—')
-        labels['text'].setText(clip.text or '—')
-        labels['source'].setText('%s · 源 %d..%d · %.3fx · %.1fdB'
-                                 % (clip.source.asset_id, clip.source.source_start,
-                                    clip.source.source_end, clip.source.speed,
-                                    clip.source.gain_db) if clip.source else '无媒体')
-        labels['style'].setText(self._style_text(clip.role))
-        if found:
-            self.start_edit.setValue(found[0] / 720000.0)
-            self.end_edit.setValue(found[1] / 720000.0)
-        if clip.source:
-            self.speed_edit.setValue(float(clip.source.speed))
-        style = self.state.styles().get(clip.role) or {}
-        if style.get('size'):
+        styles = self.state.styles()
+        roles = list(styles)
+        if [self.role_box.itemData(i) for i in range(self.role_box.count())] != roles:
+            role = self.role_box.currentData()
+            # Populating the selector is not an edit and must not recurse or rebuild.
+            with QtCore.QSignalBlocker(self.role_box):
+                self.role_box.clear()
+                for key in roles:
+                    self.role_box.addItem(notices.role_label(key), key)
+                self.role_box.setCurrentIndex(roles.index(role) if role in roles else 0)
+        role = self.role_box.currentData()
+        style = styles.get(role) or {}
+        for widget in (self.size_edit, self.size_button, self.color_edit,
+                       self.color_button, self.x_edit, self.y_edit,
+                       self.position_button, self.size_reset):
+            widget.setEnabled(bool(style))
+        self.property_labels['style'].setText(self._style_text(role))
+        if style:
             self.size_edit.setValue(float(style['size']))
-        self.size_edit.setEnabled(bool(style))
-        self.size_button.setEnabled(bool(style))
-        self.size_reset.setEnabled(clip.role in self.state.styles())
-        check = self.state.split_check(clip.id)
-        self.split_button.setEnabled(bool(check and check.ok))
-        self.split_button.setToolTip('' if (check is None or check.ok)
-                                     else '%s：%s' % (check.code, check.reason))
-        self.split_button.setText('在播放头处拆分' if (check is None or check.ok)
-                                  else '该片段不可拆分（%s）' % (check.code or 'N/A'))
+            self.color_edit.setText(style['color'])
+            self.x_edit.setValue(float(style['x']))
+            self.y_edit.setValue(float(style['y']))
 
     def _style_text(self, role):
         """The resolved style of a role, and whether it is the default or an override.

@@ -72,6 +72,8 @@ class TextPresentation:
 class TextPreview(QtWidgets.QWidget):
     """The template preview: background still, text layer, a playhead."""
 
+    changed = QtCore.Signal()
+
     def __init__(self, display=None, plan=None, *, stills=None, parent=None,
                  play_hz=DEFAULT_PLAY_HZ):
         super().__init__(parent)
@@ -143,6 +145,7 @@ class TextPreview(QtWidgets.QWidget):
         self._refresh_still()
         if changed or self._still_image is None:
             self.update()
+        self.changed.emit()
         return self._position_ticks
 
     def play(self):
@@ -155,6 +158,7 @@ class TextPreview(QtWidgets.QWidget):
         self._playing = True
         self._timer.start()
         self.update()
+        self.changed.emit()
         return self
 
     def pause(self):
@@ -163,6 +167,7 @@ class TextPreview(QtWidgets.QWidget):
         self._started_wall = None
         self._timer.stop()
         self.update()
+        self.changed.emit()
         return self
 
     def toggle(self):
@@ -191,6 +196,7 @@ class TextPreview(QtWidgets.QWidget):
         self._position_ticks = position
         self._refresh_still()
         self.update()
+        self.changed.emit()
 
     # -- the still -------------------------------------------------------
     def _refresh_still(self):
